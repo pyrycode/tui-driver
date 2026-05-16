@@ -207,30 +207,21 @@ func run() error {
 		}
 	}()
 
-	var thinkingVerb string
-	if err := waitUntil(rootCtx, func() bool {
-		stripped := ansiRe.ReplaceAll(rb.snapshot(), nil)
-		v, _, ok := matchSpinner(stripped)
-		if ok && thinkingVerb == "" {
-			thinkingVerb = v
-		}
-		return ok
-	}); err != nil {
-		return fmt.Errorf("wait thinking: %w", err)
-	}
-	tr.recordTransition("thinking-detected")
-	logger.Printf("thinking-detected verb=%q", thinkingVerb)
-
-	// Wait for BOTH: spinner-gone AND assistant event with stop_reason==end_turn.
-	// The two events can arrive in either order.
+	// Terminate on JSONL end_turn. Spinner observation is opportunistic: the
+	// slow path emits thinking-detected → spinner-gone; the fast path skips
+	// both (trivial prompts can resolve before the spinner renders, and even
+	// when it does render, finding #8 currently blocks regex match). The
+	// thinkingObserved && !spinnerGone guard preserves slow-path log order.
 	var (
-		spinnerGone   bool
-		gotEndTurn    bool
-		assistantText string
+		thinkingObserved bool
+		thinkingVerb     string
+		spinnerGone      bool
+		gotEndTurn       bool
+		assistantText    string
 	)
 	probe := time.NewTicker(statePollInterval)
 	defer probe.Stop()
-	for !(spinnerGone && gotEndTurn) {
+	for !(gotEndTurn && (!thinkingObserved || spinnerGone)) {
 		select {
 		case <-rootCtx.Done():
 			return fmt.Errorf("wait termination: %w", context.Cause(rootCtx))
@@ -242,13 +233,18 @@ func run() error {
 				logger.Printf("end-turn-detected")
 			}
 		case <-probe.C:
-			if !spinnerGone {
-				stripped := ansiRe.ReplaceAll(rb.snapshot(), nil)
-				if _, _, ok := matchSpinner(stripped); !ok {
-					spinnerGone = true
-					tr.recordTransition("spinner-gone")
-					logger.Printf("spinner-gone")
-				}
+			stripped := ansiRe.ReplaceAll(rb.snapshot(), nil)
+			v, _, ok := matchSpinner(stripped)
+			switch {
+			case ok && !thinkingObserved:
+				thinkingVerb = v
+				thinkingObserved = true
+				tr.recordTransition("thinking-detected")
+				logger.Printf("thinking-detected verb=%q", thinkingVerb)
+			case !ok && thinkingObserved && !spinnerGone:
+				spinnerGone = true
+				tr.recordTransition("spinner-gone")
+				logger.Printf("spinner-gone")
 			}
 		}
 	}
