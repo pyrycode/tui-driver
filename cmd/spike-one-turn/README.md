@@ -12,13 +12,18 @@ hybrid JSONL + TUI architecture decided 2026-05-16. See
 3. Reads the PTY master into a 4 KB rolling buffer, mirroring raw bytes to
    stderr so a human watching the spike sees claude's UI live.
 4. Waits for the idle prompt (`❯` glyph present and no `✻` spinner).
-5. Snapshots `~/.claude/projects/<encoded-cwd>/`.
+5. Opens the session JSONL claude already created during startup (newest
+   `*.jsonl` in `~/.claude/projects/<encoded-cwd>/`) and records its current
+   byte size — a 1 s retry covers a fresh-cwd race.
 6. Writes `What is 2+2?\r` to the PTY master.
-7. Starts the JSONL tailer: polls the snapshotted directory at 100 ms for a new
-   `*.jsonl` file (up to a 5 s deadline), then tails it line-by-line.
+7. Starts the JSONL tailer: seeks the recorded offset and tails appended lines.
 8. Waits for the thinking spinner regex (`✻ <verb> for <Ns>|<Nm Ns>`).
 9. Waits for BOTH: the spinner regex stops matching, AND a JSONL line arrives
-   with `type=="assistant"` and `message.stop_reason=="end_turn"`.
+   with `type=="assistant"` and `message.stop_reason=="end_turn"`. The parser
+   silently skips any event lacking a `message` map or whose `type` is not
+   `assistant` (covers `permission-mode`, `file-history-snapshot`, `user`,
+   `attachment`, `ai-title`, `system`, `last-prompt`, and unknown future
+   envelopes).
 10. Concatenates every `content[].text` block on that record.
 11. Prints `SUCCESS: <assistant text>` to stdout.
 12. SIGTERMs `claude`, races a 3 s timer against `cmd.Wait()`, SIGKILLs if
@@ -56,10 +61,11 @@ Stderr contains the raw claude UI bytes interleaved with the state log lines.
 
 ```
 idle-detected
+session-jsonl-opened path=<path> offset=<bytes>
 prompt-written
 thinking-detected verb="<captured>"
 spinner-gone
-result-event-received          # the end_turn assistant event; name kept per AC
+end-turn-detected              # assistant event with stop_reason=="end_turn"
 assistant-text-extracted len=<n>
 shutdown-signalled
 ```
@@ -92,8 +98,9 @@ state-machine waiter exits via the watchdog inactivity deadline.
 |-----|---------------|-------------------|--------------------------|------------------------|-------|---------|
 |  1  | 0.408 ms      | never fired       | n/a                      | n/a                    | 5.0 s | FAIL — `jsonl-tailer-error: no new JSONL file appeared within 5s` |
 |  2  | 0.158 ms      | never fired       | n/a                      | n/a                    | 60.6 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` |
+|  3  | 0.857 ms      | never fired       | n/a                      | n/a                    | 60.6 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` (post-#3 fix; JSONL side now clean — see finding #8 for the new shape) |
 
-Both runs failed before any thinking-state observation. Run 1 hit the JSONL-tailer's 5-second deadline; run 2 hit the main state-machine watchdog's 60-second inactivity deadline. The architecture's failure-handling worked correctly in both cases.
+Run 1 hit the JSONL-tailer's 5-second deadline; runs 2 and 3 hit the main state-machine watchdog's 60-second inactivity deadline. The architecture's failure-handling worked correctly in all cases.
 
 **The architecture is sound — implementation has bugs that the empirical run exposed.** Detail in `Surprises / findings` below.
 
@@ -101,9 +108,11 @@ Both runs failed before any thinking-state observation. Run 1 hit the JSONL-tail
 
 | Verb (captured) | Run(s) | Notes |
 |-----------------|--------|-------|
-| (none)          | —      | Spinner never observed on the PTY across either run — see surprise #2 in findings. |
+| (none)          | 1, 2   | Spinner not observed in the raw PTY bytes in the earliest runs — see surprise #2. |
+| `Skedaddling`   | 3      | Appears as `✻ Skedaddling…` (ellipsis form, no `for Ns` counter — regex doesn't match). |
+| `Baked`         | 3      | Appears as `✻ Baked for 1s` but with a CSI cursor-forward between glyph and verb that the ANSI strip removes — see surprise #8. |
 
-Known-good verbs from the operator's prior observation (NOT used as a regex whitelist): "Baked", "Whipped up", "Cooking". Empirically observed in the spike: zero, because the trivial prompt completed faster than the spinner could be drawn.
+Known-good verbs from the operator's prior observation (NOT used as a regex whitelist): "Baked", "Whipped up", "Cooking". The spike's regex still captures zero verbs because of the strip/whitespace and ellipsis-form issues above.
 
 ## Surprises / findings
 
@@ -162,6 +171,20 @@ This was a wrong hypothesis on my part — I'd guessed at the bug from the timin
 ### 6. Watchdog architecture works correctly
 
 The two-tier watchdog (60s inactivity, 30s spinner-freeze) caught the wedge cleanly. Run 1's JSONL-tailer used its own 5s deadline (which fired correctly). Run 2 made it past the JSONL-tailer (file existed) but stalled in the state machine; the 60s inactivity watchdog fired exactly when expected.
+
+### 8. Spinner DOES render — the regex misses it after ANSI strip (post-#3 observation)
+
+Originally finding #2 hypothesised that `claude` never draws a spinner for trivial prompts. Run 3 (post-ticket-#3 fix) refines that: the spinner glyph **is** in the PTY output. The raw bytes around it look like:
+
+```
+\x1b[38;2;153;153;153m✻\x1b[1CBaked for 1s\x1b[39m
+```
+
+That `\x1b[1C` is a CSI cursor-forward-1 — claude positions the cursor with a control sequence instead of writing a literal space. The single-pass ANSI strip (`\x1b\[[0-9;?]*[a-zA-Z]`) treats cursor moves the same as colour codes and removes them. The stripped buffer reads `✻Baked for 1s` with no whitespace between glyph and verb, so `✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s` does not match. `thinking-detected` is never logged, the state machine sits at `prompt-written`, and the 60 s inactivity watchdog fires.
+
+Note the JSONL side is fully healthy in this run — the `assistant` event with `stop_reason=end_turn` and `content[].text == "4"` arrives within ~1 s of `prompt-written` and is queued in the event channel — it just never gets dequeued because the state machine is blocked upstream.
+
+**Fix shape for the spike:** belongs in ticket #4 (`thinking-detected` should be optional, not a required gate). A separate small change to the spinner matcher (either treat `✻` followed by the verb with zero-or-more whitespace, or normalise CSI cursor moves into spaces before stripping) would *also* let this be detected — but that's not required if #4 makes the gate optional. Out of scope for #3.
 
 ### 7. ANSI / encoded-cwd / claude-version notes
 

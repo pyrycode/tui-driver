@@ -14,7 +14,7 @@ One-line summary per evergreen doc. Cross-reference target — keep it terse.
 
 ## Features
 
-(none yet — the only code is the throwaway spike in `cmd/spike-one-turn/`; see `codebase/1.md` for ticket-level details)
+(none yet — the only code is the throwaway spike in `cmd/spike-one-turn/`; see the per-ticket notes under `codebase/` for what each ticket touched)
 
 ## Per-ticket notes
 

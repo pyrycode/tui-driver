@@ -3,9 +3,9 @@
 // Sequence:
 //
 //	allocate PTY → spawn `claude` → wait for ❯ (idle)
-//	→ snapshot ~/.claude/projects/<encoded-cwd>/ JSONL listing
+//	→ open the session JSONL claude already created at startup and record its size
 //	→ write "What is 2+2?\r"
-//	→ start JSONL tailer (poll for the new *.jsonl file)
+//	→ start JSONL tailer (seek to recorded offset, then tail appended lines)
 //	→ wait for the ✻ spinner regex (thinking)
 //	→ wait for BOTH: spinner gone AND assistant event with stop_reason=="end_turn"
 //	→ concatenate every content[].text on that record → SUCCESS: <text>
@@ -41,9 +41,9 @@ import (
 const (
 	rollingBufferCap   = 4096
 	statePollInterval  = 50 * time.Millisecond
-	jsonlPollInterval  = 100 * time.Millisecond
 	jsonlTailInterval  = 50 * time.Millisecond
-	jsonlFirstFileWait = 5 * time.Second
+	sessionFileWait    = 1 * time.Second
+	sessionFilePoll    = 100 * time.Millisecond
 	watchdogTick       = 1 * time.Second
 	inactivityLimit    = 60 * time.Second
 	spinnerFreezeLimit = 30 * time.Second
@@ -180,12 +180,14 @@ func run() error {
 	tr.recordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
-	// Snapshot the JSONL directory AFTER idle, BEFORE writing the prompt —
-	// this makes the new session file unambiguous.
-	preSnapshot, err := snapshotJSONL(projDir)
+	// Open the session JSONL claude already wrote during its startup sequence
+	// and record its size; the tailer will seek to this offset so we only see
+	// lines appended in response to our prompt.
+	sessionPath, startOffset, err := openSessionJSONL(projDir)
 	if err != nil {
-		return fmt.Errorf("snapshot projects dir: %w", err)
+		return fmt.Errorf("open session jsonl: %w", err)
 	}
+	logger.Printf("session-jsonl-opened path=%s offset=%d", sessionPath, startOffset)
 
 	if _, err := ptmx.Write([]byte(promptText)); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
@@ -193,13 +195,11 @@ func run() error {
 	tr.recordTransition("prompt-written")
 	logger.Printf("prompt-written")
 
-	// JSONL tailer: started AFTER writePrompt so the new file is the one we
-	// pick up (the spec note on race-avoidance).
 	eventCh := make(chan map[string]any, 32)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if terr := tailJSONL(rootCtx, logger, projDir, preSnapshot, eventCh); terr != nil {
+		if terr := tailJSONL(rootCtx, logger, sessionPath, startOffset, eventCh); terr != nil {
 			if !errors.Is(terr, context.Canceled) {
 				logger.Printf("jsonl-tailer-error err=%v", terr)
 				cancelCause(terr)
@@ -238,8 +238,8 @@ func run() error {
 			if !gotEndTurn && isEndTurn(ev) {
 				assistantText = extractAssistantText(ev)
 				gotEndTurn = true
-				tr.recordTransition("result-event-received")
-				logger.Printf("result-event-received")
+				tr.recordTransition("end-turn-detected")
+				logger.Printf("end-turn-detected")
 			}
 		case <-probe.C:
 			if !spinnerGone {
@@ -424,41 +424,90 @@ func encodeCwd(cwd string) string {
 	return b.String()
 }
 
-func snapshotJSONL(dir string) (map[string]struct{}, error) {
-	out := make(map[string]struct{})
+// openSessionJSONL finds the session JSONL claude wrote during its startup
+// sequence (the file already exists by the time we hit idle) and returns its
+// absolute path plus current byte size. The tailer seeks to that offset before
+// reading, so we ignore the startup envelopes and only see lines appended in
+// response to the prompt.
+//
+// "Current session" = the *.jsonl entry with the largest ModTime. claude has
+// just been spawned and is touching its log; older session files in the same
+// directory have stale mtimes.
+//
+// A brief retry absorbs the case where idle-detected wins a race against
+// claude's first JSONL write (or against the directory's creation on a fresh
+// cwd). After sessionFileWait the absence is treated as a genuine error.
+func openSessionJSONL(dir string) (path string, offset int64, err error) {
+	deadline := time.Now().Add(sessionFileWait)
+	for {
+		path, err = newestJSONL(dir)
+		if err == nil {
+			info, statErr := os.Stat(path)
+			if statErr != nil {
+				return "", 0, fmt.Errorf("stat session jsonl: %w", statErr)
+			}
+			return path, info.Size(), nil
+		}
+		if !errors.Is(err, errNoSessionJSONL) {
+			return "", 0, err
+		}
+		if time.Now().After(deadline) {
+			return "", 0, fmt.Errorf("no session JSONL appeared in %s within %s after idle", dir, sessionFileWait)
+		}
+		time.Sleep(sessionFilePoll)
+	}
+}
+
+var errNoSessionJSONL = errors.New("no session jsonl")
+
+func newestJSONL(dir string) (string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return out, nil // claude has never run from this cwd before — fine.
+			return "", errNoSessionJSONL
 		}
-		return nil, err
+		return "", fmt.Errorf("read projects dir: %w", err)
 	}
+	var (
+		bestName  string
+		bestMtime time.Time
+	)
 	for _, e := range entries {
-		if n := e.Name(); strings.HasSuffix(n, ".jsonl") {
-			out[n] = struct{}{}
+		n := e.Name()
+		if !strings.HasSuffix(n, ".jsonl") {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil {
+			continue
+		}
+		if bestName == "" || info.ModTime().After(bestMtime) {
+			bestName = n
+			bestMtime = info.ModTime()
 		}
 	}
-	return out, nil
+	if bestName == "" {
+		return "", errNoSessionJSONL
+	}
+	return filepath.Join(dir, bestName), nil
 }
 
 func tailJSONL(
 	ctx context.Context,
 	logger *log.Logger,
-	dir string,
-	snapshot map[string]struct{},
+	path string,
+	startOffset int64,
 	out chan<- map[string]any,
 ) error {
-	sessionPath, err := waitForNewJSONL(ctx, dir, snapshot)
-	if err != nil {
-		return err
-	}
-	logger.Printf("jsonl-file-discovered path=%s", sessionPath)
-
-	f, err := os.Open(sessionPath)
+	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open session jsonl: %w", err)
 	}
 	defer f.Close()
+
+	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+		return fmt.Errorf("seek session jsonl: %w", err)
+	}
 
 	reader := bufio.NewReader(f)
 	var partial []byte
@@ -481,12 +530,20 @@ func tailJSONL(
 				logger.Printf("jsonl-parse-warning err=%v", jerr)
 				continue
 			}
-			if t, _ := obj["type"].(string); t == "assistant" {
-				select {
-				case out <- obj:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
+			// Filter: only assistant events with a message object can carry
+			// stop_reason. Everything else (permission-mode, file-history-snapshot,
+			// attachment, ai-title, system, last-prompt, user, and future
+			// envelopes) is silently ignored.
+			if _, ok := obj["message"].(map[string]any); !ok {
+				continue
+			}
+			if t, _ := obj["type"].(string); t != "assistant" {
+				continue
+			}
+			select {
+			case out <- obj:
+			case <-ctx.Done():
+				return ctx.Err()
 			}
 		} else if rerr == io.EOF {
 			// EOF with no newline → keep the partial bytes and wait for more.
@@ -497,37 +554,6 @@ func tailJSONL(
 			}
 		} else {
 			return fmt.Errorf("read session jsonl: %w", rerr)
-		}
-	}
-}
-
-func waitForNewJSONL(ctx context.Context, dir string, snapshot map[string]struct{}) (string, error) {
-	deadline := time.Now().Add(jsonlFirstFileWait)
-	for {
-		if err := ctx.Err(); err != nil {
-			return "", err
-		}
-		entries, err := os.ReadDir(dir)
-		if err != nil && !os.IsNotExist(err) {
-			return "", fmt.Errorf("read projects dir: %w", err)
-		}
-		for _, e := range entries {
-			n := e.Name()
-			if !strings.HasSuffix(n, ".jsonl") {
-				continue
-			}
-			if _, found := snapshot[n]; found {
-				continue
-			}
-			return filepath.Join(dir, n), nil
-		}
-		if time.Now().After(deadline) {
-			return "", fmt.Errorf("watchdog: no new JSONL file appeared within %s", jsonlFirstFileWait)
-		}
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(jsonlPollInterval):
 		}
 	}
 }
