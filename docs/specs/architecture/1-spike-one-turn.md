@@ -80,7 +80,7 @@ The spike is sequential. Each step is a "block until condition OR watchdog timeo
 4. `waitThinking(ctx) error` — poll the rolling buffer for the spinner regex; on first match, log `thinking-detected verb=<captured>`. Start tracking the spinner's time-tail integer for the freeze watchdog.
 5. `waitTerminationBoth(ctx, jsonlCh) (assistantText, error)` — wait until BOTH:
    - the spinner regex no longer matches the rolling buffer (log `spinner-gone`), AND
-   - a JSONL event arrives with `type=="assistant"` and `message.stop_reason=="end_turn"` (log `result-event-received` — keep the historical log token even though it's an `end_turn` event; the README explains the divergence)
+   - a JSONL event arrives with `type=="assistant"` and `message.stop_reason=="end_turn"` (log `end-turn-detected`)
 
    The two events can arrive in either order. Once both have fired, extract the assistant text from the `end_turn` event's `message.content[].text` (concatenated) and log `assistant-text-extracted len=<n>`.
 6. Print `SUCCESS: <assistant text>` to stdout.
@@ -122,7 +122,7 @@ Do NOT use `fsnotify`. Polling at 100 ms is sufficient, deterministic, and avoid
 
 Two deadlines, both enforced from the main goroutine on a 1 Hz ticker:
 
-- **Per-state inactivity (60 s):** maintain `lastTransitionAt time.Time`. Bump on every logged state event (`idle-detected`, `prompt-written`, `thinking-detected`, `spinner-gone`, `result-event-received`, `assistant-text-extracted`). If `time.Since(lastTransitionAt) > 60s`, abort with `watchdog: stuck in state <currentState> for 60s`.
+- **Per-state inactivity (60 s):** maintain `lastTransitionAt time.Time`. Bump on every logged state event (`idle-detected`, `prompt-written`, `thinking-detected`, `spinner-gone`, `end-turn-detected`, `assistant-text-extracted`). If `time.Since(lastTransitionAt) > 60s`, abort with `watchdog: stuck in state <currentState> for 60s`.
 - **Spinner counter freeze (30 s):** only active while the spinner regex is matching. Maintain `lastSpinnerProgressAt time.Time`. Recompute the total spinner seconds (`m*60 + s`) from the regex capture every tick; bump when strictly greater than the previous reading. If `time.Since(lastSpinnerProgressAt) > 30s` while the spinner is still visible, abort with `watchdog: spinner counter frozen at <prev>s for 30s`.
 
 Watchdog errors must be distinguishable in stderr — prefix the log line with `watchdog:` so README post-mortems can grep cleanly.
@@ -150,7 +150,7 @@ idle-detected
 prompt-written
 thinking-detected verb=<captured-verb>
 spinner-gone
-result-event-received           # the end_turn assistant event; name kept per AC
+end-turn-detected               # assistant event with stop_reason=="end_turn"
 assistant-text-extracted len=<n>
 shutdown-signalled
 ```
