@@ -88,54 +88,97 @@ state-machine waiter exits via the watchdog inactivity deadline.
 
 ## Observed timings
 
-To be filled in after first-runs. One row per run; record wall-clock deltas
-between adjacent transitions.
+| Run | idle → prompt | prompt → thinking | thinking → spinner-gone | spinner-gone → result | total | outcome |
+|-----|---------------|-------------------|--------------------------|------------------------|-------|---------|
+|  1  | 0.408 ms      | never fired       | n/a                      | n/a                    | 5.0 s | FAIL — `jsonl-tailer-error: no new JSONL file appeared within 5s` |
+|  2  | 0.158 ms      | never fired       | n/a                      | n/a                    | 60.6 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` |
 
-| Run | idle → prompt | prompt → thinking | thinking → spinner-gone | spinner-gone → result | total |
-|-----|---------------|-------------------|--------------------------|------------------------|-------|
-|  1  |               |                   |                          |                        |       |
-|  2  |               |                   |                          |                        |       |
-|  3  |               |                   |                          |                        |       |
+Both runs failed before any thinking-state observation. Run 1 hit the JSONL-tailer's 5-second deadline; run 2 hit the main state-machine watchdog's 60-second inactivity deadline. The architecture's failure-handling worked correctly in both cases.
 
-The log lines emitted with `log.LstdFlags|log.Lmicroseconds` give the
-timestamps directly — compute deltas from the stderr capture.
+**The architecture is sound — implementation has bugs that the empirical run exposed.** Detail in `Surprises / findings` below.
 
 ## Observed thinking verbs
 
-The verb after `✻` is per-prompt randomized. Record every value seen here so
-post-spike work can decide if a verb dictionary is ever worth maintaining
-(spec § *Out of Scope* — not yet).
-
 | Verb (captured) | Run(s) | Notes |
 |-----------------|--------|-------|
-|                 |        |       |
+| (none)          | —      | Spinner never observed on the PTY across either run — see surprise #2 in findings. |
 
-Known-good verbs from the operator's prior observation (NOT used as a regex
-whitelist): "Baked", "Whipped up", "Cooking".
+Known-good verbs from the operator's prior observation (NOT used as a regex whitelist): "Baked", "Whipped up", "Cooking". Empirically observed in the spike: zero, because the trivial prompt completed faster than the spinner could be drawn.
 
 ## Surprises / findings
 
-Open log. Fill in after each run with anything that didn't match the spec's
-expectations. Suggested categories:
+### 1. The session JSONL file is created during claude *startup*, not at first user turn
 
-- **JSONL schema variants** — fields that appeared/disappeared across the
-  spec-captured shape `{type, message:{stop_reason, content:[…]}}`.
-- **Intermediate assistant events** — anything between
-  `assistant`+`tool_use` and `assistant`+`end_turn` for a simple math question
-  (the spec predicts none for `What is 2+2?` — note if a tool call shows up).
-- **ANSI quirks** — places where the single-pass `\x1b\[[0-9;?]*[a-zA-Z]`
-  strip wasn't enough.
-- **`❯` during thinking** — the spec assumes `❯` may appear concurrently with
-  the spinner due to input-line redraw; document either way.
-- **Spinner pauses mid-prompt** — would false-positive the 30 s freeze
-  watchdog; note any sighting.
-- **`os.Getwd()` casing on macOS** — case-insensitive HFS+/APFS sometimes
-  resolves `WorkSpace` vs `Workspace` differently depending on how the path
-  was reached. The spike's encoding uses whatever `os.Getwd()` returns and
-  should agree with claude's; document if they diverge.
-- **claude version** at run time: `claude --version`.
+The spike's logic ("snapshot the projects/ dir, then poll for a *new* `.jsonl` file post-prompt") was based on the assumption that the session JSONL doesn't exist until the user's first message is processed. Empirical observation: claude writes at least two events (`permission-mode` and `file-history-snapshot`) into the session JSONL *during its startup sequence*, before the user has typed anything. By the time the spike snapshots the directory, the file already exists.
 
-(empty)
+Inspecting the actual JSONL file from run 2 (session `ced8f502-009a-4d15-8a69-cf5b8f19e724`), the event sequence was:
+
+| Idx | type | role | stop_reason | notes |
+|-----|------|------|-------------|-------|
+| 0 | `permission-mode` | — | — | written at claude startup |
+| 1 | `file-history-snapshot` | — | — | written at claude startup |
+| 2 | `user` | `user` | — | content: `"What is 2+2?"` — the prompt DID get through |
+| 3 | `attachment` | — | — | claude metadata |
+| 4 | `attachment` | — | — | claude metadata |
+| 5 | `ai-title` | — | — | claude metadata |
+| 6 | `assistant` | `assistant` | `end_turn` | content: `"4"` — claude responded correctly |
+| 7 | `system` | — | — | claude metadata |
+| 8 | `last-prompt` | — | — | claude metadata |
+| 9 | `ai-title` | — | — | claude metadata |
+| 10 | `permission-mode` | — | — | claude metadata |
+
+**Fix shape for the spike:** instead of "look for a new file post-prompt," the JSONL-discovery logic should either (a) read the file's mtime/size pre-prompt, then poll for *appended bytes* post-prompt, or (b) discover the file via the spike's own controlled session-id (pass `claude --session-id <known-uuid>` if claude supports it, or read claude's stdout for the session-id banner).
+
+### 2. The thinking spinner may never appear for trivial prompts
+
+Both runs failed to observe the `✻ <verb> for <Ns>` spinner anywhere in the PTY output. The spike's state machine waits for `thinking-detected` before falling through to JSONL polling, so this gap blocks happy-path progression.
+
+Likely cause: claude responded with a single token (`"4"`) in well under 100 ms — faster than the spinner UI can fade in. The spinner is presumably a TUI affordance for *slow* completions, not a guaranteed visual element of every turn.
+
+**Fix shape for the spike:** make `thinking-detected` optional, not a required gate. The state machine should accept either:
+- Spinner appears → spinner disappears → JSONL `end_turn` (the slow path the spike was designed for)
+- JSONL `end_turn` arrives before any spinner is observed (the fast path that just happened for both runs)
+
+The current state-machine requirement that `thinking-detected` fires before JSONL is checked is the actual blocker, not the JSONL discovery alone.
+
+### 3. There is no separate `result` envelope event in the JSONL
+
+The spec's AC mentions waiting for "a JSONL `result` event." There is none. The end-of-turn marker is `stop_reason=end_turn` embedded in the `assistant` message itself (event 6 above). The spike's named log line `result-event-received` is named for an event that doesn't exist; should be renamed to `end-turn-detected` or similar.
+
+### 4. JSONL schema has many more event types than the spec predicted
+
+The spec described the shape as `{type, message:{stop_reason, content:[…]}}`. Actual schema (from run 2) has these `type` values: `permission-mode`, `file-history-snapshot`, `user`, `attachment`, `ai-title`, `assistant`, `system`, `last-prompt`. Of these, only `user` and `assistant` carry a `message` object; the others are claude-internal metadata.
+
+**Fix shape:** the JSONL parser should `continue` on any unrecognized `type`, and key only on `type=="assistant"` + `message.stop_reason=="end_turn"` for end-of-turn. Treat all other event types as noise for spike purposes.
+
+### 5. Idle-detection was actually correct (corrects my earlier hypothesis)
+
+The 0.158–0.408 ms gap between `idle-detected` and `prompt-written` initially looked like a race — `❯` matching the placeholder hint (`❯ Try "fix typecheck errors"`) before claude was actually ready. The JSONL evidence contradicts this: claude DID receive the prompt and DID respond, which means it was genuinely ready when `idle-detected` fired.
+
+So `❯` is in fact a usable idle indicator even though it also appears in the welcome-banner placeholder. The placeholder is dimmed and gets cleared on first keystroke; claude accepts input from the moment `❯` is rendered.
+
+This was a wrong hypothesis on my part — I'd guessed at the bug from the timing alone before reading the JSONL. **Useful lesson: when the JSONL evidence is available, read it before theorizing about PTY-level races.** Same shape as the [[vault: instruction-design#Claudian's Inferred-Signal-Over-Authoritative-State Tendency (2026-05-16)]] pattern.
+
+### 6. Watchdog architecture works correctly
+
+The two-tier watchdog (60s inactivity, 30s spinner-freeze) caught the wedge cleanly. Run 1's JSONL-tailer used its own 5s deadline (which fired correctly). Run 2 made it past the JSONL-tailer (file existed) but stalled in the state machine; the 60s inactivity watchdog fired exactly when expected.
+
+### 7. ANSI / encoded-cwd / claude-version notes
+
+- **claude version at runtime:** v2.1.143 (`Claude Code v2.1.143` in the welcome banner; matches the spike's environment)
+- **encoded-cwd:** `/Users/juhanailmoniemi/.claude/projects/-Users-juhanailmoniemi-WorkSpace-Projects-tui-driver/` — both `/` and `.` in the cwd became `-`, casing preserved (`WorkSpace` stayed `WorkSpace`)
+- **ANSI quirks:** no apparent strip failures; the `\x1b\[[0-9;?]*[a-zA-Z]` strip handled the welcome-banner sequences cleanly. The raw stderr-mirroring during the spike was readable when decoded as a terminal would render it (boxed banner appeared correctly via `cat` of the captured bytes — for the curious, `cat /tmp/spike-run1.err`).
+- **`❯` during thinking:** not observed (no thinking state visible)
+- **Spinner pauses mid-prompt:** not observed (no spinner at all)
+
+## Follow-up tickets the spike's findings justify
+
+Concrete tickets to file (none filed yet — operator decides priority):
+
+1. **Fix JSONL discovery: tail existing file for appended lines** (the architectural problem behind findings #1 + #3 + #4). Likely `size:s`.
+2. **Make `thinking-detected` optional in the state machine** (finding #2). Either accept fast-path JSONL arrival without spinner, OR add an early "fast-response detected" branch. `size:xs` once the JSONL fix lands.
+3. **Reframe the state-log lines + AC** — `result-event-received` → `end-turn-detected`; drop the architectural assumption that a separate `result` envelope exists. Documentation-shaped; could fold into ticket 1 above.
+4. **(Maybe) Add a "first successful end-to-end turn" verification ticket** — re-run the spike after fixes 1+2 land, fill in this README's empty timings and verb rows for a real success path.
 
 ## Why no automated tests
 
