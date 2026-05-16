@@ -20,16 +20,18 @@ Where `claude` writes its session JSONL and what the records look like, as obser
 
 Example: cwd `/Users/jhi/Workspace/Projects/.pyrycode-worktrees/architect-1` → `-Users-jhi-Workspace-Projects--pyrycode-worktrees-architect-1`.
 
-## Discovering the new file
+## Discovering the session file
 
-`claude` creates the session file only after the first prompt is received. Strategy:
+`claude` creates the session file **during its startup sequence**, before the first user prompt — it writes `permission-mode` and `file-history-snapshot` envelopes into the JSONL before any user input has been read (verified in ticket [#3](../codebase/3.md)). The discovery strategy is therefore:
 
-1. Snapshot the directory's `*.jsonl` filenames **after idle, before writing the prompt**.
-2. After writing the prompt, poll the directory at 100 ms intervals.
-3. The new file is the one NOT in the snapshot.
-4. 5 s deadline before treating absence as an error.
+1. **After `idle-detected`, before writing the prompt**, pick the newest `*.jsonl` entry in the directory (`max(ModTime)`). claude just spawned and is touching the active log, so the freshly-mtimed file is unambiguous in practice.
+2. Stat the file to read its current byte `Size()`. This is the offset to seek to before tailing — everything written before that offset is claude's own startup chatter, which the spike has no use for.
+3. After writing the prompt, open the file, `Seek(offset, SeekStart)`, and tail with a 50 ms EOF backoff. Lines appended in response to the prompt arrive here.
+4. 1 s deadline on the discovery retry — covers the fresh-cwd race where `~/.claude/projects/<encoded-cwd>/` is created concurrently with the spike's idle detection, without masking a genuine absence.
 
-Polling is sufficient — do NOT pull in `fsnotify` for this. Implemented in `cmd/spike-one-turn/main.go` (`snapshotJSONL` + `waitForNewJSONL`).
+Polling is sufficient — do NOT pull in `fsnotify` for this. Implemented in `cmd/spike-one-turn/main.go` (`openSessionJSONL` + `tailJSONL`).
+
+> **Historical note.** Spike #1 originally snapshotted the directory and waited for a *new* file to appear post-prompt; that approach was based on the pre-empirical assumption that the JSONL is created lazily at first turn. It isn't. The "wait for a new file" path was deleted in ticket #3.
 
 ## Turn lifecycle in JSONL
 
@@ -51,16 +53,20 @@ Each line is one JSON object. The **interactive** `claude` mode does NOT emit a 
 
 ## Observed top-level `type` values
 
-In a single real session, the spike author saw these top-level `type` values (orientation, not enumeration):
+Captured from a single 11-event session JSONL during ticket [#3](../codebase/3.md) (orientation, not enumeration):
 
-- `ai-title`
-- `queue-operation`
-- `user`
-- `attachment`
-- `assistant`
-- `last-prompt`
+- `permission-mode` (claude startup)
+- `file-history-snapshot` (claude startup)
+- `user` (the prompt the spike wrote)
+- `attachment` (claude metadata)
+- `ai-title` (claude metadata)
+- `assistant` (the response; carries `stop_reason`)
+- `system` (claude metadata)
+- `last-prompt` (claude metadata)
 
-The library currently cares about `assistant` only. The set is likely to grow with new `claude` versions.
+Of these, only `user` and `assistant` carry a `message` object; everything else is a claude-internal envelope with no `message` field. The set is likely to grow with new `claude` versions.
+
+**Parser rule for consumers.** Filter to `obj["message"] is map[…] AND obj["type"] == "assistant"`. This is narrower than "skip every unrecognised type" but tolerates every envelope above (and every future one) with a single positive condition — the spike uses exactly this filter.
 
 ## Caveats
 
@@ -71,4 +77,4 @@ The library currently cares about `assistant` only. The set is likely to grow wi
 
 - [ADR-0001 — Hybrid JSONL + TUI](../decisions/0001-hybrid-jsonl-tui.md)
 - [System overview](system-overview.md)
-- Code: `cmd/spike-one-turn/main.go` — `projectsDir`, `encodeCwd`, `tailJSONL`, `isEndTurn`, `extractAssistantText`
+- Code: `cmd/spike-one-turn/main.go` — `projectsDir`, `encodeCwd`, `openSessionJSONL`, `newestJSONL`, `tailJSONL`, `isEndTurn`, `extractAssistantText`
