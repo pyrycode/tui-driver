@@ -1,0 +1,557 @@
+// Spike: drive one interactive `claude` turn end-to-end through a PTY.
+//
+// Sequence:
+//
+//	allocate PTY → spawn `claude` → wait for ❯ (idle)
+//	→ snapshot ~/.claude/projects/<encoded-cwd>/ JSONL listing
+//	→ write "What is 2+2?\r"
+//	→ start JSONL tailer (poll for the new *.jsonl file)
+//	→ wait for the ✻ spinner regex (thinking)
+//	→ wait for BOTH: spinner gone AND assistant event with stop_reason=="end_turn"
+//	→ concatenate every content[].text on that record → SUCCESS: <text>
+//	→ SIGTERM (3 s grace) → SIGKILL → close PTY → wg.Wait
+//
+// This file is spike-quality: single binary, no public API. The reusable
+// primitives are deliberately not extracted yet — they settle after the spike
+// surfaces friction. See cmd/spike-one-turn/README.md for the empirical log.
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/creack/pty"
+)
+
+const (
+	rollingBufferCap   = 4096
+	statePollInterval  = 50 * time.Millisecond
+	jsonlPollInterval  = 100 * time.Millisecond
+	jsonlTailInterval  = 50 * time.Millisecond
+	jsonlFirstFileWait = 5 * time.Second
+	watchdogTick       = 1 * time.Second
+	inactivityLimit    = 60 * time.Second
+	spinnerFreezeLimit = 30 * time.Second
+	shutdownGrace      = 3 * time.Second
+
+	promptText = "What is 2+2?\r"
+
+	ptyRows = 40
+	ptyCols = 120
+)
+
+// spinnerRe matches the thinking indicator. The verb (group 1) is 1–2 words and
+// varies per prompt — capture it for the empirical log; do NOT depend on any
+// specific value. Time-tail is `Ns` or `Nm Ns` (groups 2,3).
+var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
+
+// CSI sequences in claude's output wrap the spinner and prompt glyphs in color
+// codes. A single-pass strip is enough for regex matching at spike fidelity.
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
+
+// idleGlyph is the UTF-8 encoding of ❯ — claude's input-line prompt marker.
+var idleGlyph = []byte("\xe2\x9d\xaf")
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "spike failed: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
+	startedAt := time.Now()
+
+	projDir, err := projectsDir()
+	if err != nil {
+		return fmt.Errorf("resolve projects dir: %w", err)
+	}
+	logger.Printf("projects-dir path=%s", projDir)
+
+	rootCtx, cancelCause := context.WithCancelCause(context.Background())
+	defer cancelCause(errors.New("run: returning"))
+
+	rb := &rollingBuffer{}
+	tr := newTracker()
+	tr.recordTransition("start")
+
+	cmd := exec.Command("claude")
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		return fmt.Errorf("pty.Start: %w", err)
+	}
+	if err := pty.Setsize(ptmx, &pty.Winsize{Rows: ptyRows, Cols: ptyCols}); err != nil {
+		// Non-fatal — claude will still draw, just possibly clipped.
+		logger.Printf("warning: pty.Setsize: %v", err)
+	}
+
+	cmdExited := make(chan error, 1)
+	go func() { cmdExited <- cmd.Wait() }()
+
+	var wg sync.WaitGroup
+
+	var shutdownOnce sync.Once
+	shutdown := func() {
+		shutdownOnce.Do(func() {
+			logger.Printf("shutdown-signalled")
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+			select {
+			case <-cmdExited:
+			case <-time.After(shutdownGrace):
+				_ = cmd.Process.Signal(syscall.SIGKILL)
+				<-cmdExited
+			}
+			_ = ptmx.Close()
+			cancelCause(errors.New("shutdown"))
+			wg.Wait()
+		})
+	}
+	defer shutdown()
+
+	// PTY reader: drains the master fd into the rolling buffer and mirrors
+	// raw output to stderr so a human watching the spike sees what claude does.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 4096)
+		for {
+			n, rerr := ptmx.Read(buf)
+			if n > 0 {
+				chunk := buf[:n]
+				rb.append(chunk)
+				_, _ = os.Stderr.Write(chunk)
+			}
+			if rerr != nil {
+				return
+			}
+		}
+	}()
+
+	// Watchdog: 1 Hz inactivity + spinner-freeze enforcement.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(watchdogTick)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-rootCtx.Done():
+				return
+			case <-ticker.C:
+				snap := rb.snapshot()
+				stripped := ansiRe.ReplaceAll(snap, nil)
+				verb, total, ok := matchSpinner(stripped)
+				_ = verb
+				tr.observeSpinner(ok, total)
+				if werr := tr.checkWatchdog(); werr != nil {
+					logger.Printf("%v", werr)
+					cancelCause(werr)
+					return
+				}
+			}
+		}
+	}()
+
+	// --- linear state machine ---
+
+	if err := waitUntil(rootCtx, func() bool {
+		return isIdle(rb.snapshot())
+	}); err != nil {
+		return fmt.Errorf("wait idle: %w", err)
+	}
+	tr.recordTransition("idle-detected")
+	logger.Printf("idle-detected")
+
+	// Snapshot the JSONL directory AFTER idle, BEFORE writing the prompt —
+	// this makes the new session file unambiguous.
+	preSnapshot, err := snapshotJSONL(projDir)
+	if err != nil {
+		return fmt.Errorf("snapshot projects dir: %w", err)
+	}
+
+	if _, err := ptmx.Write([]byte(promptText)); err != nil {
+		return fmt.Errorf("write prompt: %w", err)
+	}
+	tr.recordTransition("prompt-written")
+	logger.Printf("prompt-written")
+
+	// JSONL tailer: started AFTER writePrompt so the new file is the one we
+	// pick up (the spec note on race-avoidance).
+	eventCh := make(chan map[string]any, 32)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if terr := tailJSONL(rootCtx, logger, projDir, preSnapshot, eventCh); terr != nil {
+			if !errors.Is(terr, context.Canceled) {
+				logger.Printf("jsonl-tailer-error err=%v", terr)
+				cancelCause(terr)
+			}
+		}
+	}()
+
+	var thinkingVerb string
+	if err := waitUntil(rootCtx, func() bool {
+		stripped := ansiRe.ReplaceAll(rb.snapshot(), nil)
+		v, _, ok := matchSpinner(stripped)
+		if ok && thinkingVerb == "" {
+			thinkingVerb = v
+		}
+		return ok
+	}); err != nil {
+		return fmt.Errorf("wait thinking: %w", err)
+	}
+	tr.recordTransition("thinking-detected")
+	logger.Printf("thinking-detected verb=%q", thinkingVerb)
+
+	// Wait for BOTH: spinner-gone AND assistant event with stop_reason==end_turn.
+	// The two events can arrive in either order.
+	var (
+		spinnerGone   bool
+		gotEndTurn    bool
+		assistantText string
+	)
+	probe := time.NewTicker(statePollInterval)
+	defer probe.Stop()
+	for !(spinnerGone && gotEndTurn) {
+		select {
+		case <-rootCtx.Done():
+			return fmt.Errorf("wait termination: %w", context.Cause(rootCtx))
+		case ev := <-eventCh:
+			if !gotEndTurn && isEndTurn(ev) {
+				assistantText = extractAssistantText(ev)
+				gotEndTurn = true
+				tr.recordTransition("result-event-received")
+				logger.Printf("result-event-received")
+			}
+		case <-probe.C:
+			if !spinnerGone {
+				stripped := ansiRe.ReplaceAll(rb.snapshot(), nil)
+				if _, _, ok := matchSpinner(stripped); !ok {
+					spinnerGone = true
+					tr.recordTransition("spinner-gone")
+					logger.Printf("spinner-gone")
+				}
+			}
+		}
+	}
+
+	tr.recordTransition("assistant-text-extracted")
+	logger.Printf("assistant-text-extracted len=%d", len(assistantText))
+
+	fmt.Printf("SUCCESS: %s\n", assistantText)
+
+	logger.Printf("complete elapsed=%s", time.Since(startedAt).Round(time.Millisecond))
+	return nil
+}
+
+// --- rolling buffer ---
+
+type rollingBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (r *rollingBuffer) append(p []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.buf = append(r.buf, p...)
+	if len(r.buf) > rollingBufferCap {
+		fresh := make([]byte, rollingBufferCap)
+		copy(fresh, r.buf[len(r.buf)-rollingBufferCap:])
+		r.buf = fresh
+	}
+}
+
+func (r *rollingBuffer) snapshot() []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]byte, len(r.buf))
+	copy(out, r.buf)
+	return out
+}
+
+// --- pattern matching ---
+
+func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
+	m := spinnerRe.FindSubmatch(stripped)
+	if m == nil {
+		return "", 0, false
+	}
+	var minutes int
+	if len(m[2]) > 0 {
+		minutes, _ = strconv.Atoi(string(m[2]))
+	}
+	seconds, _ := strconv.Atoi(string(m[3]))
+	return string(m[1]), minutes*60 + seconds, true
+}
+
+// isIdle: ❯ glyph is present AND spinner regex does not match. The TUI redraws
+// the input line below the spinner during thinking, so ❯ alone is not enough.
+func isIdle(snap []byte) bool {
+	stripped := ansiRe.ReplaceAll(snap, nil)
+	if !bytes.Contains(stripped, idleGlyph) {
+		return false
+	}
+	return !spinnerRe.Match(stripped)
+}
+
+// --- tracker (state + watchdog bookkeeping) ---
+
+type tracker struct {
+	mu                    sync.Mutex
+	currentState          string
+	lastTransitionAt      time.Time
+	lastSpinnerProgressAt time.Time
+	lastSpinnerTotal      int
+	spinnerActive         bool
+}
+
+func newTracker() *tracker { return &tracker{} }
+
+func (t *tracker) recordTransition(state string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.currentState = state
+	t.lastTransitionAt = time.Now()
+}
+
+// observeSpinner is called from the watchdog tick with whether the spinner
+// regex matched right now and its total-seconds reading. It manages the
+// freeze-detection bookkeeping: progress is "strictly greater than the
+// previous reading" while the spinner is continuously visible.
+func (t *tracker) observeSpinner(visible bool, totalSeconds int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := time.Now()
+	if !visible {
+		t.spinnerActive = false
+		t.lastSpinnerTotal = 0
+		return
+	}
+	if !t.spinnerActive {
+		t.spinnerActive = true
+		t.lastSpinnerTotal = totalSeconds
+		t.lastSpinnerProgressAt = now
+		return
+	}
+	if totalSeconds > t.lastSpinnerTotal {
+		t.lastSpinnerTotal = totalSeconds
+		t.lastSpinnerProgressAt = now
+	}
+}
+
+func (t *tracker) checkWatchdog() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := time.Now()
+	if !t.lastTransitionAt.IsZero() && now.Sub(t.lastTransitionAt) > inactivityLimit {
+		return fmt.Errorf("watchdog: stuck in state %s for %s",
+			t.currentState, now.Sub(t.lastTransitionAt).Round(time.Second))
+	}
+	if t.spinnerActive && now.Sub(t.lastSpinnerProgressAt) > spinnerFreezeLimit {
+		return fmt.Errorf("watchdog: spinner counter frozen at %ds for %s",
+			t.lastSpinnerTotal, now.Sub(t.lastSpinnerProgressAt).Round(time.Second))
+	}
+	return nil
+}
+
+// --- generic predicate wait ---
+
+func waitUntil(ctx context.Context, predicate func() bool) error {
+	if predicate() {
+		return nil
+	}
+	ticker := time.NewTicker(statePollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-ticker.C:
+			if predicate() {
+				return nil
+			}
+		}
+	}
+}
+
+// --- JSONL discovery + tailing ---
+
+// projectsDir resolves $HOME/.claude/projects/<encoded-cwd>/ at runtime.
+// The encoding is byte-by-byte: '/' and '.' become '-', everything else passes
+// through. Adjacent '/' and '.' therefore produce '--' (non-reversible).
+func projectsDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".claude", "projects", encodeCwd(cwd)), nil
+}
+
+func encodeCwd(cwd string) string {
+	var b strings.Builder
+	b.Grow(len(cwd))
+	for i := 0; i < len(cwd); i++ {
+		c := cwd[i]
+		if c == '/' || c == '.' {
+			b.WriteByte('-')
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+func snapshotJSONL(dir string) (map[string]struct{}, error) {
+	out := make(map[string]struct{})
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return out, nil // claude has never run from this cwd before — fine.
+		}
+		return nil, err
+	}
+	for _, e := range entries {
+		if n := e.Name(); strings.HasSuffix(n, ".jsonl") {
+			out[n] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
+func tailJSONL(
+	ctx context.Context,
+	logger *log.Logger,
+	dir string,
+	snapshot map[string]struct{},
+	out chan<- map[string]any,
+) error {
+	sessionPath, err := waitForNewJSONL(ctx, dir, snapshot)
+	if err != nil {
+		return err
+	}
+	logger.Printf("jsonl-file-discovered path=%s", sessionPath)
+
+	f, err := os.Open(sessionPath)
+	if err != nil {
+		return fmt.Errorf("open session jsonl: %w", err)
+	}
+	defer f.Close()
+
+	reader := bufio.NewReader(f)
+	var partial []byte
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunk, rerr := reader.ReadBytes('\n')
+		if len(chunk) > 0 {
+			partial = append(partial, chunk...)
+		}
+		if rerr == nil {
+			line := bytes.TrimRight(partial, "\r\n")
+			partial = partial[:0]
+			if len(line) == 0 {
+				continue
+			}
+			var obj map[string]any
+			if jerr := json.Unmarshal(line, &obj); jerr != nil {
+				logger.Printf("jsonl-parse-warning err=%v", jerr)
+				continue
+			}
+			if t, _ := obj["type"].(string); t == "assistant" {
+				select {
+				case out <- obj:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		} else if rerr == io.EOF {
+			// EOF with no newline → keep the partial bytes and wait for more.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(jsonlTailInterval):
+			}
+		} else {
+			return fmt.Errorf("read session jsonl: %w", rerr)
+		}
+	}
+}
+
+func waitForNewJSONL(ctx context.Context, dir string, snapshot map[string]struct{}) (string, error) {
+	deadline := time.Now().Add(jsonlFirstFileWait)
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil && !os.IsNotExist(err) {
+			return "", fmt.Errorf("read projects dir: %w", err)
+		}
+		for _, e := range entries {
+			n := e.Name()
+			if !strings.HasSuffix(n, ".jsonl") {
+				continue
+			}
+			if _, found := snapshot[n]; found {
+				continue
+			}
+			return filepath.Join(dir, n), nil
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("watchdog: no new JSONL file appeared within %s", jsonlFirstFileWait)
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(jsonlPollInterval):
+		}
+	}
+}
+
+// --- assistant-event helpers ---
+
+func isEndTurn(ev map[string]any) bool {
+	msg, _ := ev["message"].(map[string]any)
+	stop, _ := msg["stop_reason"].(string)
+	return stop == "end_turn"
+}
+
+func extractAssistantText(ev map[string]any) string {
+	msg, _ := ev["message"].(map[string]any)
+	content, _ := msg["content"].([]any)
+	var b strings.Builder
+	for _, c := range content {
+		cm, _ := c.(map[string]any)
+		if t, _ := cm["type"].(string); t != "text" {
+			continue
+		}
+		if txt, _ := cm["text"].(string); txt != "" {
+			b.WriteString(txt)
+		}
+	}
+	return b.String()
+}
