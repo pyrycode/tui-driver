@@ -63,12 +63,17 @@ Stderr contains the raw claude UI bytes interleaved with the state log lines.
 idle-detected
 session-jsonl-opened path=<path> offset=<bytes>
 prompt-written
-thinking-detected verb="<captured>"
-spinner-gone
+thinking-detected verb="<captured>"   # slow path only — iff spinner observed
+spinner-gone                          # slow path only — iff spinner observed
 end-turn-detected              # assistant event with stop_reason=="end_turn"
 assistant-text-extracted len=<n>
 shutdown-signalled
 ```
+
+On the fast path (trivial prompts where the spinner never renders, or where the
+spinner regex never matches it — see finding #8), `thinking-detected` and
+`spinner-gone` are skipped; `end-turn-detected` fires directly after
+`prompt-written`.
 
 Watchdog trips are prefixed `watchdog:` so `grep '^.*watchdog:' stderr.log`
 finds them cleanly during post-mortems.

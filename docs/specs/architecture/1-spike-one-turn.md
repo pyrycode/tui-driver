@@ -77,12 +77,8 @@ The spike is sequential. Each step is a "block until condition OR watchdog timeo
 1. `waitIdle(ctx) error` — poll the rolling buffer for the `❯` glyph (UTF-8 `\xe2\x9d\xaf`) appearing at-or-near-the-end-of-the-buffer with no active spinner. Log `idle-detected`.
 2. `writePrompt(ptmx, "What is 2+2?\r") error` — single `Write`. Log `prompt-written`.
 3. Start the JSONL tailer goroutine here (the new file will only be created once claude has received the prompt — starting earlier risks racing the directory snapshot).
-4. `waitThinking(ctx) error` — poll the rolling buffer for the spinner regex; on first match, log `thinking-detected verb=<captured>`. Start tracking the spinner's time-tail integer for the freeze watchdog.
-5. `waitTerminationBoth(ctx, jsonlCh) (assistantText, error)` — wait until BOTH:
-   - the spinner regex no longer matches the rolling buffer (log `spinner-gone`), AND
-   - a JSONL event arrives with `type=="assistant"` and `message.stop_reason=="end_turn"` (log `end-turn-detected`)
-
-   The two events can arrive in either order. Once both have fired, extract the assistant text from the `end_turn` event's `message.content[].text` (concatenated) and log `assistant-text-extracted len=<n>`.
+4. **(Opportunistic, not blocking — folded into step 5.)** Inside `waitTerminationBoth`, on the first tick the spinner regex matches the rolling buffer, log `thinking-detected verb=<captured>` and start tracking the spinner's time-tail integer for the freeze watchdog. If the spinner never matches during the turn (fast path — trivial prompt, or finding #8), this step is skipped silently.
+5. `waitTerminationBoth(ctx, jsonlCh) (assistantText, error)` — wait until a JSONL event with `type=="assistant"` and `message.stop_reason=="end_turn"` has arrived (log `end-turn-detected`) AND (the spinner was never observed during this turn OR the spinner regex has stopped matching the rolling buffer). Log `spinner-gone` only if `thinking-detected` was previously logged. The slow path emits `thinking-detected → spinner-gone → end-turn-detected` (with `end-turn-detected` possibly interleaved); the fast path goes straight to `end-turn-detected` after `prompt-written`. Once the termination condition holds, extract the assistant text from the `end_turn` event's `message.content[].text` (concatenated) and log `assistant-text-extracted len=<n>`.
 6. Print `SUCCESS: <assistant text>` to stdout.
 7. Run the shutdown sequence (always, including on error — `defer`).
 
@@ -148,12 +144,14 @@ Required event names (with the watchdog log gated by `watchdog:` prefix as calle
 ```
 idle-detected
 prompt-written
-thinking-detected verb=<captured-verb>
-spinner-gone
+thinking-detected verb=<captured-verb>   # slow path only — iff spinner observed
+spinner-gone                             # slow path only — iff spinner observed
 end-turn-detected               # assistant event with stop_reason=="end_turn"
 assistant-text-extracted len=<n>
 shutdown-signalled
 ```
+
+On the fast path (trivial prompts where the spinner never renders, or where the spinner regex never matches it — see spike #1's README finding #8), `thinking-detected` and `spinner-gone` are skipped entirely; `end-turn-detected` fires directly after `prompt-written`.
 
 One line per event. Free-form key=value tail is fine — these logs are for the README's timing table, not for machine parsing.
 
