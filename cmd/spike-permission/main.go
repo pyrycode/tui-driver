@@ -638,7 +638,14 @@ func runAutoRespond(
 		gotEndTurn         bool
 	)
 
-	// Wait for modal-cleared: !hasModal AND isIdle AND quietFor >= window.
+	// Wait for modal-cleared: !hasModal AND isIdle.
+	// The earlier quietFor >= ptyQuietWindow clause was inherited from
+	// spike-cancel's post-cancel predicate where it makes sense (post-cancel
+	// claude IS quiet); under post-approve, claude is actively producing the
+	// response, and streaming-heavy tool output (e.g. `ls -la /tmp` dot-anim)
+	// kept quietFor under 1.5 s for the full 30 s budget on ~50% of runs.
+	// Modal-gone is the actual signal; quiescence is a proxy that fails under
+	// streaming. See finding #19.
 	clearedDeadline := keystrokeSentAt.Add(modalClearedLimit)
 	ticker := time.NewTicker(statePollInterval)
 	defer ticker.Stop()
@@ -658,7 +665,7 @@ clearedLoop:
 			}
 		case <-ticker.C:
 			snap := rb.snapshot()
-			if !hasModal(snap, pred) && isIdle(snap) && rb.quietFor() >= ptyQuietWindow {
+			if !hasModal(snap, pred) && isIdle(snap) {
 				break clearedLoop
 			}
 			if time.Now().After(clearedDeadline) {
