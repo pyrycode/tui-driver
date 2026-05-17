@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -36,13 +37,14 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/google/uuid"
 )
 
 const (
 	rollingBufferCap   = 4096
 	statePollInterval  = 50 * time.Millisecond
 	jsonlTailInterval  = 50 * time.Millisecond
-	sessionFileWait    = 1 * time.Second
+	sessionFileWait    = 10 * time.Second
 	sessionFilePoll    = 100 * time.Millisecond
 	watchdogTick       = 1 * time.Second
 	inactivityLimit    = 60 * time.Second
@@ -68,13 +70,16 @@ var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
 var idleGlyph = []byte("\xe2\x9d\xaf")
 
 func main() {
-	if err := run(); err != nil {
+	sessionIDFlag := flag.String("session-id", "", "UUID to pin claude's session ID and JSONL filename (default: generate one)")
+	flag.Parse()
+
+	if err := run(*sessionIDFlag); err != nil {
 		fmt.Fprintf(os.Stderr, "spike failed: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(sessionIDFlag string) error {
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
 	startedAt := time.Now()
 
@@ -84,6 +89,14 @@ func run() error {
 	}
 	logger.Printf("projects-dir path=%s", projDir)
 
+	sessionID, jsonlPath, err := resolveSession(sessionIDFlag, projDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		flag.Usage()
+		os.Exit(2)
+	}
+	logger.Printf("session-id-resolved id=%s jsonl=%s", sessionID, jsonlPath)
+
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
 	defer cancelCause(errors.New("run: returning"))
 
@@ -91,7 +104,7 @@ func run() error {
 	tr := newTracker()
 	tr.recordTransition("start")
 
-	cmd := exec.Command("claude")
+	cmd := exec.Command("claude", "--session-id", sessionID)
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 
 	ptmx, err := pty.Start(cmd)
@@ -180,26 +193,28 @@ func run() error {
 	tr.recordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
-	// Open the session JSONL claude already wrote during its startup sequence
-	// and record its size; the tailer will seek to this offset so we only see
-	// lines appended in response to our prompt.
-	sessionPath, startOffset, err := openSessionJSONL(projDir)
-	if err != nil {
-		return fmt.Errorf("open session jsonl: %w", err)
-	}
-	logger.Printf("session-jsonl-opened path=%s offset=%d", sessionPath, startOffset)
-
 	if _, err := ptmx.Write([]byte(promptText)); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
 	}
 	tr.recordTransition("prompt-written")
 	logger.Printf("prompt-written")
 
+	// Wait for the deterministic session JSONL to exist. Interactive claude
+	// under --session-id defers JSONL creation until first input is received
+	// (verified empirically; documented in README finding #9), so we poll
+	// AFTER prompt-written rather than after idle. The file is brand new in
+	// this flow — tail from offset 0 and let the parser filter skip startup
+	// envelopes the same way it does for non-assistant events.
+	if err := openSessionJSONL(jsonlPath); err != nil {
+		return fmt.Errorf("open session jsonl: %w", err)
+	}
+	logger.Printf("session-jsonl-opened path=%s offset=0", jsonlPath)
+
 	eventCh := make(chan map[string]any, 32)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if terr := tailJSONL(rootCtx, logger, sessionPath, startOffset, eventCh); terr != nil {
+		if terr := tailJSONL(rootCtx, logger, jsonlPath, 0, eventCh); terr != nil {
 			if !errors.Is(terr, context.Canceled) {
 				logger.Printf("jsonl-tailer-error err=%v", terr)
 				cancelCause(terr)
@@ -420,72 +435,52 @@ func encodeCwd(cwd string) string {
 	return b.String()
 }
 
-// openSessionJSONL finds the session JSONL claude wrote during its startup
-// sequence (the file already exists by the time we hit idle) and returns its
-// absolute path plus current byte size. The tailer seeks to that offset before
-// reading, so we ignore the startup envelopes and only see lines appended in
-// response to the prompt.
+// resolveSession turns the operator-supplied flag into a normalised session ID
+// and the deterministic JSONL path. Empty flag → generate a fresh v4 UUID;
+// non-empty → must parse as a valid UUID (uuid.Parse accepts hyphenated and
+// non-hyphenated forms; .String() re-emits the canonical lowercase-hyphenated
+// shape that matches claude's filename convention).
 //
-// "Current session" = the *.jsonl entry with the largest ModTime. claude has
-// just been spawned and is touching its log; older session files in the same
-// directory have stale mtimes.
-//
-// A brief retry absorbs the case where idle-detected wins a race against
-// claude's first JSONL write (or against the directory's creation on a fresh
-// cwd). After sessionFileWait the absence is treated as a genuine error.
-func openSessionJSONL(dir string) (path string, offset int64, err error) {
+// The function does not stat jsonlPath — the discovery loop owns that.
+func resolveSession(flagValue string, dir string) (sessionID string, jsonlPath string, err error) {
+	if flagValue == "" {
+		u, gerr := uuid.NewRandom()
+		if gerr != nil {
+			return "", "", fmt.Errorf("generate session id: %w", gerr)
+		}
+		sessionID = u.String()
+	} else {
+		u, perr := uuid.Parse(flagValue)
+		if perr != nil {
+			return "", "", fmt.Errorf("invalid --session-id: %w", perr)
+		}
+		sessionID = u.String()
+	}
+	jsonlPath = filepath.Join(dir, sessionID+".jsonl")
+	return sessionID, jsonlPath, nil
+}
+
+// openSessionJSONL polls the deterministic JSONL path until it appears. The
+// path was pinned up-front via --session-id, so there is no directory scan
+// and no mtime heuristic — pre-existing stale .jsonl files in the same
+// directory are structurally invisible. Interactive claude defers JSONL
+// creation until first input (see README finding #9), so callers should wait
+// until after prompt-written before invoking this.
+func openSessionJSONL(jsonlPath string) error {
 	deadline := time.Now().Add(sessionFileWait)
 	for {
-		path, err = newestJSONL(dir)
+		_, err := os.Stat(jsonlPath)
 		if err == nil {
-			info, statErr := os.Stat(path)
-			if statErr != nil {
-				return "", 0, fmt.Errorf("stat session jsonl: %w", statErr)
-			}
-			return path, info.Size(), nil
+			return nil
 		}
-		if !errors.Is(err, errNoSessionJSONL) {
-			return "", 0, err
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("stat session jsonl: %w", err)
 		}
 		if time.Now().After(deadline) {
-			return "", 0, fmt.Errorf("no session JSONL appeared in %s within %s after idle", dir, sessionFileWait)
+			return fmt.Errorf("session JSONL did not appear at %s within %s", jsonlPath, sessionFileWait)
 		}
 		time.Sleep(sessionFilePoll)
 	}
-}
-
-var errNoSessionJSONL = errors.New("no session jsonl")
-
-func newestJSONL(dir string) (string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", errNoSessionJSONL
-		}
-		return "", fmt.Errorf("read projects dir: %w", err)
-	}
-	var (
-		bestName  string
-		bestMtime time.Time
-	)
-	for _, e := range entries {
-		n := e.Name()
-		if !strings.HasSuffix(n, ".jsonl") {
-			continue
-		}
-		info, ierr := e.Info()
-		if ierr != nil {
-			continue
-		}
-		if bestName == "" || info.ModTime().After(bestMtime) {
-			bestName = n
-			bestMtime = info.ModTime()
-		}
-	}
-	if bestName == "" {
-		return "", errNoSessionJSONL
-	}
-	return filepath.Join(dir, bestName), nil
 }
 
 func tailJSONL(

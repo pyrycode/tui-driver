@@ -7,16 +7,22 @@ hybrid JSONL + TUI architecture decided 2026-05-16. See
 
 ## What it does
 
-1. Allocates a 120×40 PTY via `github.com/creack/pty`.
-2. Spawns `claude` (interactive, no flags) attached to the slave side.
-3. Reads the PTY master into a 4 KB rolling buffer, mirroring raw bytes to
+1. Resolves a session ID — generates a fresh UUIDv4 by default, or accepts one
+   via `-session-id <uuid>` (validated; bad UUID exits 2 before claude spawns).
+   Computes the deterministic JSONL path
+   `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` and logs
+   `session-id-resolved id=<uuid> jsonl=<path>` *before* spawn so an operator
+   can `tail -f` or `claude --resume` from another terminal.
+2. Allocates a 120×40 PTY via `github.com/creack/pty`.
+3. Spawns `claude --session-id <uuid>` attached to the slave side.
+4. Reads the PTY master into a 4 KB rolling buffer, mirroring raw bytes to
    stderr so a human watching the spike sees claude's UI live.
-4. Waits for the idle prompt (`❯` glyph present and no `✻` spinner).
-5. Opens the session JSONL claude already created during startup (newest
-   `*.jsonl` in `~/.claude/projects/<encoded-cwd>/`) and records its current
-   byte size — a 1 s retry covers a fresh-cwd race.
+5. Waits for the idle prompt (`❯` glyph present and no `✻` spinner).
 6. Writes `What is 2+2?\r` to the PTY master.
-7. Starts the JSONL tailer: seeks the recorded offset and tails appended lines.
+7. Polls `os.Stat(jsonlPath)` every 100 ms with a 10 s timeout. Under
+   `--session-id` the file is *not* created during claude startup — it appears
+   only after the prompt lands (see finding #9). On first stat success, tails
+   the file from offset 0.
 8. Waits for the thinking spinner regex (`✻ <verb> for <Ns>|<Nm Ns>`).
 9. Waits for BOTH: the spinner regex stops matching, AND a JSONL line arrives
    with `type=="assistant"` and `message.stop_reason=="end_turn"`. The parser
@@ -57,12 +63,19 @@ SUCCESS: 2 + 2 = 4
 
 Stderr contains the raw claude UI bytes interleaved with the state log lines.
 
+### Optional flags
+
+- `-session-id <uuid>` — pin claude's session ID (and therefore the JSONL filename). Default: an empty value triggers a fresh UUIDv4 at startup. A non-empty value must parse as a valid UUID; otherwise the spike exits non-zero with a usage error. Whether the ID was generated or supplied, it is emitted in the `session-id-resolved` log line **before** `claude` spawns — so an operator can `tail -f <jsonl-path>` or run `claude --resume <id>` from another terminal while the spike runs.
+
+  Use cases: debugging (tail the same JSONL from another shell), parallel post-mortem, deterministic reproduction across runs.
+
 ### Required state log lines (in order)
 
 ```
+session-id-resolved id=<uuid> jsonl=<path>   # fires before pty.Start
 idle-detected
-session-jsonl-opened path=<path> offset=<bytes>
 prompt-written
+session-jsonl-opened path=<path> offset=0    # fires AFTER prompt-written — see finding #9
 thinking-detected verb="<captured>"   # slow path only — iff spinner observed
 spinner-gone                          # slow path only — iff spinner observed
 end-turn-detected              # assistant event with stop_reason=="end_turn"
@@ -73,7 +86,12 @@ shutdown-signalled
 On the fast path (trivial prompts where the spinner never renders, or where the
 spinner regex never matches it — see finding #8), `thinking-detected` and
 `spinner-gone` are skipped; `end-turn-detected` fires directly after
-`prompt-written`.
+`session-jsonl-opened`.
+
+Note the ordering change vs the pre-#7 spike: `session-jsonl-opened` now fires
+**after** `prompt-written`, not after `idle-detected`. The deterministic JSONL
+path (pinned via `--session-id`) does not exist on disk until claude starts
+processing the first input — see finding #9.
 
 Watchdog trips are prefixed `watchdog:` so `grep '^.*watchdog:' stderr.log`
 finds them cleanly during post-mortems.
@@ -99,13 +117,18 @@ state-machine waiter exits via the watchdog inactivity deadline.
 
 ## Observed timings
 
-| Run | idle → prompt | prompt → thinking | thinking → spinner-gone | spinner-gone → result | total | outcome |
-|-----|---------------|-------------------|--------------------------|------------------------|-------|---------|
-|  1  | 0.408 ms      | never fired       | n/a                      | n/a                    | 5.0 s | FAIL — `jsonl-tailer-error: no new JSONL file appeared within 5s` |
-|  2  | 0.158 ms      | never fired       | n/a                      | n/a                    | 60.6 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` |
-|  3  | 0.857 ms      | never fired       | n/a                      | n/a                    | 60.6 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` (post-#3 fix; JSONL side now clean — see finding #8 for the new shape) |
+| Run | spawn → idle | idle → prompt | prompt → jsonl-opened | jsonl-opened → end-turn | total | outcome |
+|-----|--------------|---------------|------------------------|--------------------------|-------|---------|
+|  1  | n/a          | 0.408 ms      | n/a (pre-#7 ordering)  | n/a                      | 5.0 s | FAIL — `jsonl-tailer-error: no new JSONL file appeared within 5s` |
+|  2  | n/a          | 0.158 ms      | n/a (pre-#7 ordering)  | n/a                      | 60.6 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` |
+|  3  | n/a          | 0.857 ms      | n/a (pre-#7 ordering)  | n/a                      | 60.6 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` (post-#3; JSONL side clean — see finding #8) |
+|  4  | n/a          | 0.470 ms      | n/a (pre-#7 ordering)  | n/a                      | 60.7 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` (post-#3 + #4; opened STALE JSONL — see finding #9) |
+|  5  | 303 ms       | 0.079 ms      | 202 ms                 | 2.737 s                  | 3.24 s | **SUCCESS** — `SUCCESS: 4` (post-#7; deterministic --session-id; spinner "Brewing…" rendered briefly but ellipsis-form so #8 still applies) |
+|  6  | 453 ms       | 0.068 ms      | 304 ms                 | 1.565 s                  | 2.32 s | **SUCCESS** — `SUCCESS: 4` (post-#7; operator-supplied `-session-id 9b375373-…`; AC #4 dual-path verification) |
 
-Run 1 hit the JSONL-tailer's 5-second deadline; runs 2 and 3 hit the main state-machine watchdog's 60-second inactivity deadline. The architecture's failure-handling worked correctly in all cases.
+Runs 1-4 all failed in distinct shapes — each surfaced a real bug. Runs 5 and 6 are the first end-to-end successes — Run 5 with a generated UUID, Run 6 with an operator-supplied UUID via `-session-id`. The architecture's failure-handling worked correctly in every failing run; nothing wedged silently.
+
+The column shape changed between Run 4 and Run 5 because #7 reordered the state-log line sequence (`session-id-resolved` now fires before spawn, `session-jsonl-opened` now fires after `prompt-written`). The pre-#7 columns are kept as `n/a` for the earlier runs rather than retroactively rewriting them — the chronological honesty matters more than column uniformity.
 
 **The architecture is sound — implementation has bugs that the empirical run exposed.** Detail in `Surprises / findings` below.
 
@@ -116,6 +139,7 @@ Run 1 hit the JSONL-tailer's 5-second deadline; runs 2 and 3 hit the main state-
 | (none)          | 1, 2   | Spinner not observed in the raw PTY bytes in the earliest runs — see surprise #2. |
 | `Skedaddling`   | 3      | Appears as `✻ Skedaddling…` (ellipsis form, no `for Ns` counter — regex doesn't match). |
 | `Baked`         | 3      | Appears as `✻ Baked for 1s` but with a CSI cursor-forward between glyph and verb that the ANSI strip removes — see surprise #8. |
+| `Brewing`       | 5      | Appears as `✳ Brewing…` then transitions through `✶ Brewing…` → `✻ Brewing…` → `✽ Brewing…` (animation glyph cycles). Ellipsis form, no `for Ns` counter — regex doesn't match. The success path now exists without the spinner regex ever matching — finding #2/#8 lessons hold. |
 
 Known-good verbs from the operator's prior observation (NOT used as a regex whitelist): "Baked", "Whipped up", "Cooking". The spike's regex still captures zero verbs because of the strip/whitespace and ellipsis-form issues above.
 
@@ -198,6 +222,52 @@ Note the JSONL side is fully healthy in this run — the `assistant` event with 
 - **ANSI quirks:** no apparent strip failures; the `\x1b\[[0-9;?]*[a-zA-Z]` strip handled the welcome-banner sequences cleanly. The raw stderr-mirroring during the spike was readable when decoded as a terminal would render it (boxed banner appeared correctly via `cat` of the captured bytes — for the curious, `cat /tmp/spike-run1.err`).
 - **`❯` during thinking:** not observed (no thinking state visible)
 - **Spinner pauses mid-prompt:** not observed (no spinner at all)
+
+### 9. JSONL discovery: mtime heuristic opened a STALE session file; fixed by pinning `--session-id`
+
+Run 4 (post-#3 + #4) failed in a new shape. State log:
+
+```
+2026/05/17 11:09:01.694709 idle-detected
+2026/05/17 11:09:01.695096 session-jsonl-opened path=.../dddf559a-…jsonl offset=63216
+2026/05/17 11:09:01.695179 prompt-written
+2026/05/17 11:10:02.394169 watchdog: stuck in state prompt-written for 1m1s
+```
+
+The spike opened `dddf559a-….jsonl`. Claude's actual session JSONL for this run was `9707673d-….jsonl` (revealed by the `Resume this session with: claude --resume 9707673d-…` banner). Different files. At the moment the spike called `openSessionJSONL` (immediately after `idle-detected`), `9707673d` did NOT yet exist on disk; `newestJSONL` returned whichever existing `.jsonl` was newest at that instant, and prior spike runs had accumulated 4+ stale files in the projects-cwd. Claude's `9707673d` JSONL recorded the correct exchange (`"What is 2+2?"` → `"4"` with `stop_reason=end_turn`) within ~1 s of `prompt-written` — the architecture was fine; the spike just tailed the wrong file.
+
+**Generalizable lesson:** "newest file by mtime" is a common pattern for "find the active file." It is fragile when (a) files of the same shape persist across runs (stale data in the cwd) and (b) the thing being looked for hasn't been created yet at the moment of polling. The robust patterns, in order of preference:
+
+1. **Dictate the identifier** if the tool provides a way to (`--session-id`, `--output-file`, etc.). No race, no discovery logic at all.
+2. **Snapshot baseline + diff** — record state before triggering work; look for what's new after.
+3. **Newest-by-mtime + retry** — fragile, only safe if no stale data is plausible.
+
+Always check the tool's flags for option (1) before implementing (2) or (3).
+
+**Fix shape (this ticket):** claude exposes `--session-id <uuid>` (verified via `claude --help` v2.1.143). The spike now:
+
+- Generates a UUIDv4 at startup (or accepts an operator-supplied one via `-session-id`), spawns `claude --session-id <uuid>`, and computes the deterministic JSONL path `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`.
+- Logs `session-id-resolved id=<uuid> jsonl=<path>` **before** spawning claude, so the operator can `tail -f` or `claude --resume` from another terminal.
+- Polls `os.Stat(jsonlPath)` for up to 10 s instead of scanning the directory. Stale files in the cwd are now structurally invisible.
+
+#### Empirical sub-finding: interactive `claude --session-id` defers JSONL creation until first input
+
+Discovered during this fix's developer iteration: when claude is spawned with `--session-id <uuid>`, the deterministic JSONL path does NOT exist at the moment `❯` (idle) first renders. The file appears only after claude receives the first user input. Confirmed by the spike's stat-poll timing across the developer's iterations.
+
+This contrasts with finding #1 (where plain `claude` writes startup envelopes — `permission-mode`, `file-history-snapshot` — into the JSONL during its boot sequence, *before* any user input). Whether the `--session-id` deferral is intentional or an implementation accident in v2.1.143 is unknown; either way, the spike must accommodate it.
+
+**Implementation consequence:** `openSessionJSONL` is invoked **after** `prompt-written`, not after `idle-detected`. The JSONL tailer therefore starts seeking at offset 0 (the file is brand new) — the parser filter (`continue` on non-assistant types) handles whatever startup envelopes claude writes when it processes the first input.
+
+**Verification status — confirmed by Run 5** (2026-05-17, post-#7 fix):
+
+- `session-id-resolved` fires at T+0 (before claude spawns).
+- `idle-detected` fires at T+303 ms (claude finished startup; `❯` rendered).
+- `prompt-written` fires at T+304 ms (immediately after idle).
+- `session-jsonl-opened path=… offset=0` fires at T+506 ms.
+
+The 202 ms gap between `prompt-written` and `session-jsonl-opened` is the deferral: claude with `--session-id` did not write the JSONL during its startup; the file appeared only after the prompt landed. If the deferral hypothesis were wrong, `os.Stat` would have succeeded immediately after the directory was scanned at startup time, and the gap would have been ≈0. The 202 ms is small but consistent across the spike run (the polling interval is 100 ms — so the true gap is in the [102, 202] ms range, but the sign and the ordering are unambiguous).
+
+The architect's original spec assumed the opposite ordering (poll after idle, before prompt). That ordering would have wedged in `openSessionJSONL` for 10 s and timed out — claude would not start processing input until the spike wrote the prompt, so the JSONL never would have appeared.
 
 ## Follow-up tickets the spike's findings justify
 
