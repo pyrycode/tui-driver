@@ -50,38 +50,62 @@ Implementation consequence: the stat poll runs **after `prompt-written`**, not a
 
 ## Turn lifecycle in JSONL
 
-Each line is one JSON object. The **interactive** `claude` mode does NOT emit a `type:"result"` line (despite what the ticket body said — that's batch-mode behaviour). The turn-terminator in interactive mode is:
+Each line is one JSON object. The **interactive** `claude` mode does NOT emit a `type:"result"` line (despite what the ticket body said — that's batch-mode behaviour). The turn-terminator in interactive mode is `type=="assistant"` with `message.stop_reason=="end_turn"`. Example:
 
 ```json
 {
   "type": "assistant",
   "sessionId": "...",
   "message": {
+    "id": "msg_01W3f…",
     "stop_reason": "end_turn",
     "content": [{"type": "text", "text": "..."}]
   }
 }
 ```
 
-- The final-turn record can contain multiple `text` blocks under `message.content[]`. **Concatenate all of them** to get the assistant's full answer. (Note: `content[]` may also contain non-`text` blocks like tool calls — filter on `content[i].type == "text"`.)
-- Intermediate `assistant` records (before the final one) carry `stop_reason: "tool_use"` for tool calls, or `content[].type == "thinking"` for chain-of-thought. They are NOT the answer; the spike ignores them and waits for `end_turn`.
+### One Anthropic message ⇒ N JSONL lines (msg_id grouping)
+
+A single assistant message is serialised as **one JSONL line per content block**, not one line per message. All lines share the same `message.id` and the same `stop_reason`. Verified in ticket [#9](../codebase/9.md) against three probe prompts: a slow-thinking response splits into two `assistant` lines with the same `msg_id`, both carrying `stop_reason=end_turn` — line 1's `content[]` holds the `thinking` block, line 2's holds the `text` block.
+
+Implications for content extraction:
+
+- **"First `end_turn` line carries the full answer" is wrong.** A line whose only content block is `thinking` will appear with `stop_reason=end_turn` and an empty `text` slot. The spike-one-turn `extractAssistantText` (single-record concatenate) silently returned `""` for these.
+- **The correct rule is msg_id grouping.** Identify the `msg_id` of the **latest** assistant line with `stop_reason=end_turn`; collect every assistant event whose `.message.id == that_id`; walk their `content[]` in JSONL arrival order; concatenate blocks with `type == "text"`. Skip `thinking` and `tool_use` blocks. Implemented in `cmd/spike-multi-turn/main.go` as `extractByMsgID`.
+- **`stop_reason` lives on every delta line of a message**, not only the last one. "First line with `stop_reason=end_turn`" is therefore not a reliable turn-complete signal even in the single-block case — it's reliable iff there is exactly one block. Use msg_id grouping unconditionally.
+
+### Tool-use shapes (observed)
+
+Tool-use turns produce **multiple `assistant` messages with different `msg_id`s**, interleaved with `user(tool_result)` events that the assistant-only parser filter drops automatically. Empirically observed for the prompt `list the files in /tmp` (ticket #9, run 7):
+
+| Idx | type | stop_reason | msg_id | content |
+|-----|------|-------------|--------|---------|
+| 13 | assistant | `tool_use` | `msg_011JC…` | `tool_use` block (Bash call) |
+| 14 | user | — | — | `tool_result` (filtered out by tailer) |
+| 18 | assistant | `end_turn` | `msg_01YEr…` | `text` block (final answer) |
+
+The msg_id grouping rule handles this correctly because it keys on the **latest** `end_turn` msg_id (line 18); the earlier `tool_use`-tagged msg_id is inert noise. Heavier tasks may produce many tool_use lines under a single msg_id with interleaved tool_results — the grouping rule still applies; only the `end_turn` msg_id's content is extracted.
+
+### Turn-complete = JSONL `end_turn` ∧ PTY idle
+
+JSONL `end_turn` says "model done speaking"; the PTY's `❯` glyph says "TUI ready to accept input." Consumers driving multi-turn sessions must wait for both before writing the next prompt — `cmd/spike-multi-turn/main.go` does this with a 250 ms `idleStableWindow` debounce on the `isIdle` half to absorb transient redraw observations.
 
 ## Observed top-level `type` values
 
-Captured from a single 11-event session JSONL during ticket [#3](../codebase/3.md) (orientation, not enumeration):
+Captured from a single 11-event session JSONL during ticket [#3](../codebase/3.md) and corroborated against a 27-line multi-turn run in ticket [#9](../codebase/9.md):
 
-- `permission-mode` (claude startup)
-- `file-history-snapshot` (claude startup)
-- `user` (the prompt the spike wrote)
+- `permission-mode` (claude startup; also fires once after each turn in multi-turn runs)
+- `file-history-snapshot` (claude startup; also fires post-turn)
+- `user` (the prompt the spike wrote, or tool_result events from claude-managed tool runs)
 - `attachment` (claude metadata)
 - `ai-title` (claude metadata)
-- `assistant` (the response; carries `stop_reason`)
-- `system` (claude metadata)
-- `last-prompt` (claude metadata)
+- `assistant` (the response; carries `stop_reason` and `message.id`)
+- `system` (claude metadata; fires once after every turn's `end_turn`)
+- `last-prompt` (claude metadata; in multi-turn runs fires after turns 2+ specifically, not turn 1 — appears to correlate with multi-turn continuation rather than per-turn)
 
-Of these, only `user` and `assistant` carry a `message` object; everything else is a claude-internal envelope with no `message` field. The set is likely to grow with new `claude` versions.
+Of these, only `user` and `assistant` carry a `message` object; everything else is a claude-internal envelope with no `message` field. The set is likely to grow with new `claude` versions. (`queue-operation` was predicted by a pre-spike-#9 probe but did not appear in #9's runs; possibly suppressed by the `--permission-mode bypassPermissions` flag that #9 ran with.)
 
-**Parser rule for consumers.** Filter to `obj["message"] is map[…] AND obj["type"] == "assistant"`. This is narrower than "skip every unrecognised type" but tolerates every envelope above (and every future one) with a single positive condition — the spike uses exactly this filter.
+**Parser rule for consumers.** Filter to `obj["message"] is map[…] AND obj["type"] == "assistant"`. This is narrower than "skip every unrecognised type" but tolerates every envelope above (and every future one) with a single positive condition — both spikes use exactly this filter. `user(tool_result)` events are visible on disk but the filter drops them; that's intentional, since the assistant's final-answer `text` block is what consumers want, not the raw tool I/O.
 
 ## Caveats
 
@@ -92,4 +116,5 @@ Of these, only `user` and `assistant` carry a `message` object; everything else 
 
 - [ADR-0001 — Hybrid JSONL + TUI](../decisions/0001-hybrid-jsonl-tui.md)
 - [System overview](system-overview.md)
-- Code: `cmd/spike-one-turn/main.go` — `projectsDir`, `encodeCwd`, `resolveSession`, `openSessionJSONL`, `tailJSONL`, `isEndTurn`, `extractAssistantText`
+- Code: `cmd/spike-one-turn/main.go` — `projectsDir`, `encodeCwd`, `resolveSession`, `openSessionJSONL`, `tailJSONL`, `isEndTurn`, `extractAssistantText` (single-record content extractor; superseded by msg_id grouping)
+- Code: `cmd/spike-multi-turn/main.go` — `extractByMsgID` (the msg_id-grouped content extractor described above)
