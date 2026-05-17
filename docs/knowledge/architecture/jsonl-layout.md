@@ -100,6 +100,19 @@ When the operator interrupts claude mid-response (ESC keystroke; see [system ove
 
 > **The assistant-only tailer filter (`type=="assistant"`) drops this marker.** The marker has `type=="user"`. Consumers needing JSONL-side cancel acknowledgment must either widen the filter to also pass `user(text)` events upstream, or rely on PTY-side detection (the `❯-reappeared` predicate; see [system overview § Key signals](system-overview.md) for the PTY-quiescence form spike #11 uses). Both are reasonable — the post-spike library should likely surface the JSONL marker as the precise signal and PTY quiescence as a backstop.
 
+### Permission modals (zero JSONL footprint)
+
+When claude wants to invoke a tool that requires permission, it raises a permission-prompt modal on the PTY side (`Bash command … Do you want to proceed?` / `Read file … Do you want to proceed?` with a numbered option list). The modal has **no JSONL footprint at all**. Verified in ticket [#13](../codebase/13.md). Specifically, across observed Probe 1 runs with a 5 s observation window starting at `modal-detected`:
+
+- No new envelope `type` value appears.
+- No new `stop_reason` value appears on any existing envelope.
+- No `assistant` envelope is written while the modal is up — `assistant(stop_reason=tool_use)` is **deferred until after the modal is approved or cancelled**.
+- The only JSONL traffic during the modal-open window is claude's own boot envelopes (`permission-mode`, `file-history-snapshot`, the spike's prompt write as `user`, and `attachment` metadata).
+
+Post-approve, the JSONL stream resumes with the same shape as a non-modal tool-use turn: `assistant(stop_reason=tool_use, thinking)` → `assistant(stop_reason=tool_use, tool_use)` → `user(tool_result)` → `assistant(stop_reason=end_turn, text)`. No new envelope types, no new `stop_reason` values, no acknowledgement of the modal itself. The modal is purely a PTY-side affordance.
+
+Architectural consequence: **modal detection MUST be PTY-side, not JSONL-side.** Consumers cannot subscribe to a JSONL signal to learn that a permission modal is up; they need the rolling-buffer pattern-match predicate (see [system overview § Key signals](system-overview.md) — "Permission modal present" entry). This is structurally analogous to the cancellation signal above (lives in a `user(text)` event the assistant-only filter drops) — both modals and cancellation live on signal paths the existing JSONL tailer filter does not surface. The post-spike `pkg/tuidriver/` API should expose PTY-side state events as a first-class channel separate from the JSONL content stream.
+
 ## Observed top-level `type` values
 
 Captured from a single 11-event session JSONL during ticket [#3](../codebase/3.md) and corroborated against a 27-line multi-turn run in ticket [#9](../codebase/9.md):

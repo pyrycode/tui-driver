@@ -4,13 +4,14 @@ Where things live and how data flows. Update when modules, types, or data flows 
 
 ## Current state
 
-The library proper (`pkg/tuidriver/`) does **not exist yet**. The Go code in the repo is three throwaway spike binaries that exercise every primitive the eventual library will own without committing to an API:
+The library proper (`pkg/tuidriver/`) does **not exist yet**. The Go code in the repo is four throwaway spike binaries that exercise every primitive the eventual library will own without committing to an API:
 
 - `cmd/spike-one-turn/` — single-turn happy path (idle → prompt → spinner → `end_turn` → SUCCESS). See [#1](../codebase/1.md), [#3](../codebase/3.md), [#4](../codebase/4.md), [#7](../codebase/7.md).
 - `cmd/spike-multi-turn/` — three-turn loop (simple text → Bash tool use → slow thinking) with msg_id-grouped content extraction and a `runTurn` per-turn driver. See [#9](../codebase/9.md).
 - `cmd/spike-cancel/` — three-probe cancellation binary (cancel during thinking → cancel during tool-use → recovery turn). Validates ESC as the cancel keystroke, documents the `user(text "[Request interrupted by user]")` JSONL cancellation marker, and verifies the same `--session-id` is recoverable post-cancel. See [#11](../codebase/11.md).
+- `cmd/spike-permission/` — two-session three-probe permission-modal binary (observe modal with no response → auto-respond + complete turn → simulated escalation). First spike to drop `--permission-mode bypassPermissions`. Validates `1\r` as the approve keystroke, documents that permission modals have zero JSONL footprint (detection MUST be PTY-side), and sketches the consumer escalation-callback shape. See [#13](../codebase/13.md).
 
-All three spikes share ~600 LOC of helpers under `// copied from cmd/spike-one-turn/main.go — keep in sync until library extraction` (or `…/spike-multi-turn/main.go`) attribution comments. The duplication is deliberate — every spike binary deletes when `pkg/tuidriver/` lands.
+All four spikes share ~600 LOC of helpers under `// copied from cmd/spike-one-turn/main.go — keep in sync until library extraction` (or `…/spike-multi-turn/main.go` / `…/spike-cancel/main.go`) attribution comments. The duplication is deliberate — every spike binary deletes when `pkg/tuidriver/` lands.
 
 ## Intended modules (post-spike, not yet built)
 
@@ -29,6 +30,12 @@ cmd/spike-cancel/     # throwaway single-file spike (three cancellation probes)
   main.go             # adds runProbe (cancel-thinking/cancel-tool-use/recovery) + sendCancel
                       # + clearInputLine (Ctrl-U) + rollingBuffer.quietFor (PTY-quiescence)
   README.md           # cancellation empirical observations log
+cmd/spike-permission/ # throwaway single-file spike (two sessions, three modal probes)
+  main.go             # adds runSession (per-session orchestrator) + runObserve/runAutoRespond/
+                      # runEscalate + hasModal (literal-text + box-drawing variants) +
+                      # extractModalText (last-dash-run anchor) + extractToolName +
+                      # sendKeystroke (renamed sendCancel) + oscRe
+  README.md           # permission-modal empirical observations log
 docs/
   specs/architecture/ # per-ticket specs from the architect
   knowledge/          # this directory (evergreen)
@@ -90,6 +97,9 @@ Shutdown is a `defer` with a `sync.Once`-guarded body: SIGTERM → 3 s grace rac
 - **Post-cancel readiness (PTY quiescence):** `❯-reappeared` after a cancel is detected via `isIdle(rb.snapshot()) AND rb.quietFor() >= 1500ms`, where `quietFor` is "time since the last byte was appended to the rolling buffer." Directly observes "claude has finished settling" instead of going through a proxy (e.g., "the spinner glyph has rolled out of the buffer"), which is unsound because post-cancel claude doesn't emit enough bytes to roll the 4 KB rolling buffer past the stale spinner glyph. Introduced in `cmd/spike-cancel/main.go`; likely the predicate the library will use post-extraction. See [#11](../codebase/11.md) for the empirical derivation.
 - **Cancellation acknowledged (JSONL side):** a `user`-role event with content `[{type:"text", text:"[Request interrupted by user]"}]` — NOT a new `stop_reason` value. The cancelled assistant message keeps its pre-cancel `stop_reason`. The current assistant-only tailer filter drops this marker; consumers needing JSONL-side acknowledgment must widen the filter or rely on PTY quiescence. See [JSONL layout § Cancellation signal](jsonl-layout.md).
 - **Input-box state across cancels:** post-cancel, claude restores the cancelled prompt as drafted input. The next prompt write must `Ctrl-U` (`0x15`) the input line first; idempotent on an empty input box. See [#11](../codebase/11.md).
+- **Permission modal present (PTY side):** literal-text predicate over the stripped buffer — match any of `Esctocancel`, `Doyouwanttoproceed`, `Do you want to proceed`. Two forms of the "proceed" phrase because claude renders permission-modal text differently per tool: Bash uses `\x1b[1C` (CSI cursor-forward) between words, so the stripped buffer has NO interword spaces; Read uses literal spaces. The dual-form match is mandatory. The cheap "any box-drawing char in the buffer" alternative is false-positive at idle (claude's own input box uses `╭ ╰ │`). Strip both CSI (`ansiRe`) AND OSC (`oscRe = \x1b\][^\x07]*\x07`) before matching; OSC payloads otherwise contaminate the buffer. See [#13](../codebase/13.md). Permission modals have **zero JSONL footprint** — detection MUST be PTY-side; see [JSONL layout § Permission modals (zero JSONL footprint)](jsonl-layout.md).
+- **Modal text extraction:** last `─{20,}` run BEFORE the proceed-marker is the start anchor; the line containing `Esctocancel` is the end anchor. Per-line, strip leading/trailing box-drawing border chars + whitespace, drop empty lines, join with `\n`. Robust across both Bash and Read modal variants (the alternatives — `modalSepRe.Split`, walk-back-N-newlines from the marker — fail for one or the other). Implemented in `cmd/spike-permission/main.go` as `extractModalText`. See [#13](../codebase/13.md).
+- **Approve keystroke (permission modals):** `1\r` (`0x31 0x0d`) — single bulk `pty.Write`, no inter-byte delay. Matches the on-screen `❯1.Yes` numbered default ("Yes, once" — narrowest grant). `y\r`, bare `\r`, and `\x1b[B\r` (down + enter) also work; the down-arrow variant selects option 2 (project- or session-scope grant, tool-dependent) and is ~1 s slower. Library default for "approve once" should be `1\r`; "approve broader scope" is a separate product affordance, not a fallback. Same single-byte single-write semantics as the cancel keystroke — both go through `sendKeystroke` (which is the same body spike #11 introduced as `sendCancel`, renamed because cancel and approve share semantics). See [#13](../codebase/13.md).
 
 ## Related
 
