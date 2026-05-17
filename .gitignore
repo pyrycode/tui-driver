@@ -5,6 +5,7 @@
 *.so
 *.dylib
 tui-driver
+/spike-one-turn
 /bin/
 
 # Test
