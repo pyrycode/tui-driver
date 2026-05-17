@@ -6,6 +6,7 @@
 *.dylib
 tui-driver
 /spike-one-turn
+/spike-cancel
 /bin/
 
 # Test
