@@ -74,7 +74,12 @@ const (
 	sessionFileWait    = 10 * time.Second
 	sessionFilePoll    = 100 * time.Millisecond
 	watchdogTick       = 1 * time.Second
-	inactivityLimit    = 60 * time.Second
+	// inactivityLimit: session-level umbrella watchdog. Must exceed the
+	// largest probe-level ceiling (endTurnAfterApproveLimit = 90 s) or
+	// it becomes the binding constraint during streaming tool responses
+	// post-approve (no state transitions fire between modal-cleared and
+	// end-turn-detected while claude streams). See finding #22.
+	inactivityLimit    = 120 * time.Second
 	spinnerFreezeLimit = 30 * time.Second
 	shutdownGrace      = 3 * time.Second
 
