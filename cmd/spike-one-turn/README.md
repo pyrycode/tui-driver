@@ -118,8 +118,9 @@ state-machine waiter exits via the watchdog inactivity deadline.
 |  3  | n/a          | 0.857 ms      | n/a (pre-#7 ordering)  | n/a                      | 60.6 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` (post-#3; JSONL side clean — see finding #8) |
 |  4  | n/a          | 0.470 ms      | n/a (pre-#7 ordering)  | n/a                      | 60.7 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` (post-#3 + #4; opened STALE JSONL — see finding #9) |
 |  5  | 303 ms       | 0.079 ms      | 202 ms                 | 2.737 s                  | 3.24 s | **SUCCESS** — `SUCCESS: 4` (post-#7; deterministic --session-id; spinner "Brewing…" rendered briefly but ellipsis-form so #8 still applies) |
+|  6  | 453 ms       | 0.068 ms      | 304 ms                 | 1.565 s                  | 2.32 s | **SUCCESS** — `SUCCESS: 4` (post-#7; operator-supplied `-session-id 9b375373-…`; AC #4 dual-path verification) |
 
-Runs 1-4 all failed in distinct shapes — each surfaced a real bug. Run 5 is the first end-to-end success. The architecture's failure-handling worked correctly in every failing run; nothing wedged silently.
+Runs 1-4 all failed in distinct shapes — each surfaced a real bug. Runs 5 and 6 are the first end-to-end successes — Run 5 with a generated UUID, Run 6 with an operator-supplied UUID via `-session-id`. The architecture's failure-handling worked correctly in every failing run; nothing wedged silently.
 
 The column shape changed between Run 4 and Run 5 because #7 reordered the state-log line sequence (`session-id-resolved` now fires before spawn, `session-jsonl-opened` now fires after `prompt-written`). The pre-#7 columns are kept as `n/a` for the earlier runs rather than retroactively rewriting them — the chronological honesty matters more than column uniformity.
 
