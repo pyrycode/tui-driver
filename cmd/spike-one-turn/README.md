@@ -5,6 +5,19 @@ hybrid JSONL + TUI architecture decided 2026-05-16. See
 [ticket #1](https://github.com/pyrycode/tui-driver/issues/1) and
 `docs/specs/architecture/1-spike-one-turn.md`.
 
+## Status
+
+**Spike complete (2026-05-17).** Hybrid JSONL + TUI architecture empirically
+validated end-to-end across Runs 5 + 6 — generated-UUID and
+operator-supplied-UUID paths both produce `SUCCESS: 4`. All three fix tickets
+the spike findings justified
+([#3](https://github.com/pyrycode/tui-driver/issues/3),
+[#4](https://github.com/pyrycode/tui-driver/issues/4),
+[#7](https://github.com/pyrycode/tui-driver/issues/7)) merged. Empirical
+knowledge captured in the *Observed timings* / *Observed thinking verbs* /
+*Surprises* sections below; the next tui-driver work item is library
+extraction into `pkg/tuidriver/` consumed by `pyry acp`.
+
 ## What it does
 
 1. Resolves a session ID — generates a fresh UUIDv4 by default, or accepts one
@@ -167,6 +180,8 @@ Inspecting the actual JSONL file from run 2 (session `ced8f502-009a-4d15-8a69-cf
 
 **Fix shape for the spike:** instead of "look for a new file post-prompt," the JSONL-discovery logic should either (a) read the file's mtime/size pre-prompt, then poll for *appended bytes* post-prompt, or (b) discover the file via the spike's own controlled session-id (pass `claude --session-id <known-uuid>` if claude supports it, or read claude's stdout for the session-id banner).
 
+**Resolved by [#3](https://github.com/pyrycode/tui-driver/issues/3)** (parser tolerates non-`assistant` event types — superseded later by [#7](https://github.com/pyrycode/tui-driver/issues/7), which adopted option (b) via `--session-id <uuid>`).
+
 ### 2. The thinking spinner may never appear for trivial prompts
 
 Both runs failed to observe the `✻ <verb> for <Ns>` spinner anywhere in the PTY output. The spike's state machine waits for `thinking-detected` before falling through to JSONL polling, so this gap blocks happy-path progression.
@@ -179,15 +194,21 @@ Likely cause: claude responded with a single token (`"4"`) in well under 100 ms 
 
 The current state-machine requirement that `thinking-detected` fires before JSONL is checked is the actual blocker, not the JSONL discovery alone.
 
+**Resolved by [#4](https://github.com/pyrycode/tui-driver/issues/4)** — `thinking-detected` is now optional; state machine accepts JSONL `end_turn` arrival without prior spinner observation. Runs 5 + 6 successfully traverse the fast path without the spinner regex ever matching.
+
 ### 3. There is no separate `result` envelope event in the JSONL
 
 The spec's AC mentions waiting for "a JSONL `result` event." There is none. The end-of-turn marker is `stop_reason=end_turn` embedded in the `assistant` message itself (event 6 above). The spike's named log line `result-event-received` is named for an event that doesn't exist; should be renamed to `end-turn-detected` or similar.
+
+**Resolved by [#3](https://github.com/pyrycode/tui-driver/issues/3)** — log line renamed to `end-turn-detected`; state machine keys on `type=="assistant" && message.stop_reason=="end_turn"`.
 
 ### 4. JSONL schema has many more event types than the spec predicted
 
 The spec described the shape as `{type, message:{stop_reason, content:[…]}}`. Actual schema (from run 2) has these `type` values: `permission-mode`, `file-history-snapshot`, `user`, `attachment`, `ai-title`, `assistant`, `system`, `last-prompt`. Of these, only `user` and `assistant` carry a `message` object; the others are claude-internal metadata.
 
 **Fix shape:** the JSONL parser should `continue` on any unrecognized `type`, and key only on `type=="assistant"` + `message.stop_reason=="end_turn"` for end-of-turn. Treat all other event types as noise for spike purposes.
+
+**Resolved by [#3](https://github.com/pyrycode/tui-driver/issues/3)** — parser silently skips events lacking a `message` map or whose `type` is not `assistant`.
 
 ### 5. Idle-detection was actually correct (corrects my earlier hypothesis)
 
@@ -269,14 +290,22 @@ The 202 ms gap between `prompt-written` and `session-jsonl-opened` is the deferr
 
 The architect's original spec assumed the opposite ordering (poll after idle, before prompt). That ordering would have wedged in `openSessionJSONL` for 10 s and timed out — claude would not start processing input until the spike wrote the prompt, so the JSONL never would have appeared.
 
-## Follow-up tickets the spike's findings justify
+## Follow-up tickets the spike's findings justified
 
-Concrete tickets to file (none filed yet — operator decides priority):
+All filed and merged. Captured here as a record of the empirical-iteration
+loop the spike drove:
 
-1. **Fix JSONL discovery: tail existing file for appended lines** (the architectural problem behind findings #1 + #3 + #4). Likely `size:s`.
-2. **Make `thinking-detected` optional in the state machine** (finding #2). Either accept fast-path JSONL arrival without spinner, OR add an early "fast-response detected" branch. `size:xs` once the JSONL fix lands.
-3. **Reframe the state-log lines + AC** — `result-event-received` → `end-turn-detected`; drop the architectural assumption that a separate `result` envelope exists. Documentation-shaped; could fold into ticket 1 above.
-4. **(Maybe) Add a "first successful end-to-end turn" verification ticket** — re-run the spike after fixes 1+2 land, fill in this README's empty timings and verb rows for a real success path.
+| Ticket | Finding origin | Outcome |
+|---|---|---|
+| [#3](https://github.com/pyrycode/tui-driver/issues/3) | Findings 1, 3, 4 | JSONL discovery + end-turn detection aligned with observed schema; parser tolerates unrecognized event types. Merged via PR #5 (2026-05-16). |
+| [#4](https://github.com/pyrycode/tui-driver/issues/4) | Finding 2 (refined by 8) | `thinking-detected` made optional; fast path accepted. Merged via PR #6 (2026-05-16). |
+| [#7](https://github.com/pyrycode/tui-driver/issues/7) | Finding 9 | Deterministic `--session-id <uuid>` pins JSONL path; mtime heuristic dropped. Merged via PR #8 (2026-05-17). Run 5 produced the first end-to-end SUCCESS. |
+
+The "first successful end-to-end turn" verification that finding-list-item 4
+gestured at was Run 5 itself — no separate verification ticket was needed
+because Run 5's data populated the *Observed timings* / *Observed thinking
+verbs* tables above directly. Run 6 (operator-supplied `-session-id`) verified
+#7's dual-path AC.
 
 ## Why no automated tests
 
