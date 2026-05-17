@@ -4,8 +4,8 @@ One-line summary per evergreen doc. Cross-reference target — keep it terse.
 
 ## Architecture
 
-- [System overview](architecture/system-overview.md) — modules, data flows, concurrency model
-- [JSONL layout](architecture/jsonl-layout.md) — where claude writes session logs, deterministic-path discovery via `--session-id`, and what the turn-terminator actually looks like
+- [System overview](architecture/system-overview.md) — modules, data flows, concurrency model (single-turn + multi-turn spike shapes)
+- [JSONL layout](architecture/jsonl-layout.md) — where claude writes session logs, deterministic-path discovery via `--session-id`, the turn-terminator shape, and msg_id grouping for multi-block messages
 
 ## Decisions (ADRs)
 
@@ -14,7 +14,7 @@ One-line summary per evergreen doc. Cross-reference target — keep it terse.
 
 ## Features
 
-(none yet — the only code is the throwaway spike in `cmd/spike-one-turn/`; see the per-ticket notes under `codebase/` for what each ticket touched)
+(none yet — the code is two throwaway spikes in `cmd/spike-one-turn/` and `cmd/spike-multi-turn/`; see the per-ticket notes under `codebase/` for what each ticket touched)
 
 ## Per-ticket notes
 
