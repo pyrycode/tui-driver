@@ -7,6 +7,7 @@
 tui-driver
 /spike-one-turn
 /spike-cancel
+/spike-permission
 /bin/
 
 # Test
