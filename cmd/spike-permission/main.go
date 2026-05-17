@@ -114,8 +114,11 @@ const (
 	modalClearedLimit = 30 * time.Second
 
 	// endTurnAfterApproveLimit: Probe 2's window for "modal cleared →
-	// end_turn arrives." Aggressive for the same reason.
-	endTurnAfterApproveLimit = 30 * time.Second
+	// end_turn arrives." Sized to absorb streaming tool responses
+	// (e.g. `ls -la /tmp` line-by-line listing) which can exceed 30 s
+	// end-to-end. SUCCESS exits as soon as end_turn arrives — the
+	// budget is a ceiling, not a floor. See finding #20.
+	endTurnAfterApproveLimit = 90 * time.Second
 )
 
 // copied from cmd/spike-cancel/main.go — keep in sync until library extraction
