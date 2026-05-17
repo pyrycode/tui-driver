@@ -407,8 +407,10 @@ func waitUntil(ctx context.Context, predicate func() bool) error {
 // --- JSONL discovery + tailing ---
 
 // projectsDir resolves $HOME/.claude/projects/<encoded-cwd>/ at runtime.
-// The encoding is byte-by-byte: '/' and '.' become '-', everything else passes
-// through. Adjacent '/' and '.' therefore produce '--' (non-reversible).
+// The encoding is byte-by-byte: '/', '.', and ' ' become '-', everything else
+// passes through. Adjacent chars therefore produce '--' (non-reversible).
+// Space mapping confirmed empirically against vault cwd `Second Brain`
+// landing at `...-Second-Brain` in claude's projects dir (2026-05-17).
 func projectsDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -426,7 +428,7 @@ func encodeCwd(cwd string) string {
 	b.Grow(len(cwd))
 	for i := 0; i < len(cwd); i++ {
 		c := cwd[i]
-		if c == '/' || c == '.' {
+		if c == '/' || c == '.' || c == ' ' {
 			b.WriteByte('-')
 		} else {
 			b.WriteByte(c)
