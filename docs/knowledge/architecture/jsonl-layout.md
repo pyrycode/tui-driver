@@ -90,6 +90,16 @@ The msg_id grouping rule handles this correctly because it keys on the **latest*
 
 JSONL `end_turn` says "model done speaking"; the PTY's `❯` glyph says "TUI ready to accept input." Consumers driving multi-turn sessions must wait for both before writing the next prompt — `cmd/spike-multi-turn/main.go` does this with a 250 ms `idleStableWindow` debounce on the `isIdle` half to absorb transient redraw observations.
 
+### Cancellation signal: `user(text "[Request interrupted by user]")`
+
+When the operator interrupts claude mid-response (ESC keystroke; see [system overview § Key signals](system-overview.md)), the JSONL records cancellation as a **`user`-role event** with a single `text` content block carrying the literal string `"[Request interrupted by user]"`. Verified in ticket [#11](../codebase/11.md). Important properties:
+
+- The **cancelled assistant message keeps its pre-cancel `stop_reason`** (e.g. `tool_use` for a cancel-during-tool-use). No `stop_reason=canceled` / `null` / `max_tokens` ever surfaces — the cancel is not a new value of the existing field; it's a new event downstream of the cancelled message.
+- For a cancel-during-tool-use, the marker lands **after** any `tool_result` events for in-flight tools. Tool subprocesses are NOT killed by ESC — they run to completion and emit their `tool_result` before the cancellation marker arrives. The sequence on disk is `assistant(stop_reason=tool_use) → user(tool_result) → user(text "[Request interrupted by user]")`. No follow-up assistant line resolves the cancelled `msg_id`.
+- The marker acts as a **hard turn boundary**. The next user prompt is treated as a clean new turn by claude — fresh `msg_id`, normal `stop_reason=end_turn`, no continuation of the cancelled work. The same `--session-id` is fully recoverable.
+
+> **The assistant-only tailer filter (`type=="assistant"`) drops this marker.** The marker has `type=="user"`. Consumers needing JSONL-side cancel acknowledgment must either widen the filter to also pass `user(text)` events upstream, or rely on PTY-side detection (the `❯-reappeared` predicate; see [system overview § Key signals](system-overview.md) for the PTY-quiescence form spike #11 uses). Both are reasonable — the post-spike library should likely surface the JSONL marker as the precise signal and PTY quiescence as a backstop.
+
 ## Observed top-level `type` values
 
 Captured from a single 11-event session JSONL during ticket [#3](../codebase/3.md) and corroborated against a 27-line multi-turn run in ticket [#9](../codebase/9.md):
@@ -118,3 +128,4 @@ Of these, only `user` and `assistant` carry a `message` object; everything else 
 - [System overview](system-overview.md)
 - Code: `cmd/spike-one-turn/main.go` — `projectsDir`, `encodeCwd`, `resolveSession`, `openSessionJSONL`, `tailJSONL`, `isEndTurn`, `extractAssistantText` (single-record content extractor; superseded by msg_id grouping)
 - Code: `cmd/spike-multi-turn/main.go` — `extractByMsgID` (the msg_id-grouped content extractor described above)
+- Code: `cmd/spike-cancel/main.go` — `logCancelEvent` (handles `<nil>` / `<missing>` / string `stop_reason` representations), `runCancel` (the cancel-probe driver; the assistant-only filter still drops the `user(text)` cancel marker, so detection is PTY-side via `❯-reappeared`)

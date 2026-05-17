@@ -4,12 +4,13 @@ Where things live and how data flows. Update when modules, types, or data flows 
 
 ## Current state
 
-The library proper (`pkg/tuidriver/`) does **not exist yet**. The Go code in the repo is two throwaway spike binaries that exercise every primitive the eventual library will own without committing to an API:
+The library proper (`pkg/tuidriver/`) does **not exist yet**. The Go code in the repo is three throwaway spike binaries that exercise every primitive the eventual library will own without committing to an API:
 
 - `cmd/spike-one-turn/` — single-turn happy path (idle → prompt → spinner → `end_turn` → SUCCESS). See [#1](../codebase/1.md), [#3](../codebase/3.md), [#4](../codebase/4.md), [#7](../codebase/7.md).
 - `cmd/spike-multi-turn/` — three-turn loop (simple text → Bash tool use → slow thinking) with msg_id-grouped content extraction and a `runTurn` per-turn driver. See [#9](../codebase/9.md).
+- `cmd/spike-cancel/` — three-probe cancellation binary (cancel during thinking → cancel during tool-use → recovery turn). Validates ESC as the cancel keystroke, documents the `user(text "[Request interrupted by user]")` JSONL cancellation marker, and verifies the same `--session-id` is recoverable post-cancel. See [#11](../codebase/11.md).
 
-Both spikes share ~600 LOC of helpers under `// copied from cmd/spike-one-turn/main.go — keep in sync until library extraction` attribution comments. The duplication is deliberate — both binaries delete when `pkg/tuidriver/` lands.
+All three spikes share ~600 LOC of helpers under `// copied from cmd/spike-one-turn/main.go — keep in sync until library extraction` (or `…/spike-multi-turn/main.go`) attribution comments. The duplication is deliberate — every spike binary deletes when `pkg/tuidriver/` lands.
 
 ## Intended modules (post-spike, not yet built)
 
@@ -24,6 +25,10 @@ cmd/spike-one-turn/   # throwaway single-file spike (single turn)
 cmd/spike-multi-turn/ # throwaway single-file spike (three turns)
   main.go             # adds runTurn per-turn driver + msg_id-grouped extractor + char-by-char typePrompt
   README.md           # multi-turn empirical observations log
+cmd/spike-cancel/     # throwaway single-file spike (three cancellation probes)
+  main.go             # adds runProbe (cancel-thinking/cancel-tool-use/recovery) + sendCancel
+                      # + clearInputLine (Ctrl-U) + rollingBuffer.quietFor (PTY-quiescence)
+  README.md           # cancellation empirical observations log
 docs/
   specs/architecture/ # per-ticket specs from the architect
   knowledge/          # this directory (evergreen)
@@ -70,17 +75,21 @@ Three goroutines per spike, coordinated by a single `context.WithCancelCause`:
 | PTY reader | the rolling buffer (mutex-protected) | EOF from PTY master (happens when shutdown closes it) |
 | JSONL tailer | the events channel (buffered, size 32) | context cancellation |
 
-In `cmd/spike-multi-turn/` the events channel is **session-scoped, not turn-scoped** — one tailer goroutine services all three turns, and `runTurn` non-blocking-drains residual events at turn start to discard any delta lines for the prior turn's msg_id that the tailer left buffered after `end_turn` was observed. Without the drain, the next turn's termination predicate could fire spuriously.
+In `cmd/spike-multi-turn/` and `cmd/spike-cancel/` the events channel is **session-scoped, not turn-scoped** — one tailer goroutine services every turn/probe, and `runTurn` / `runProbe` non-blocking-drains residual events at turn start to discard any delta lines for the prior turn's msg_id that the tailer left buffered after `end_turn` was observed. Without the drain, the next turn's termination predicate could fire spuriously.
 
-Shutdown is a `defer` with a `sync.Once`-guarded body: SIGTERM → 3 s grace race against `cmd.Wait()` → SIGKILL → close PTY → cancel context → `wg.Wait()`. Same sequence in both spike binaries.
+Shutdown is a `defer` with a `sync.Once`-guarded body: SIGTERM → 3 s grace race against `cmd.Wait()` → SIGKILL → close PTY → cancel context → `wg.Wait()`. Same sequence in all three spike binaries.
 
 ## Key signals
 
 - **Idle:** `❯` glyph (UTF-8 `\xe2\x9d\xaf`) present in the ANSI-stripped rolling buffer AND the spinner regex does NOT match.
-- **Thinking:** `✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s` — captures a 1–2-word verb (variable per prompt) and a time-tail in `Ns` or `Nm Ns` form. Currently misses every observed verb in practice (CSI cursor-forward between glyph and verb eaten by ANSI strip; ellipsis-form verbs lack the `for Ns` counter); slow-path log lines are dormant pending a regex fix.
+- **Thinking:** `✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s` — captures a 1–2-word verb (variable per prompt) and a time-tail in `Ns` or `Nm Ns` form. Currently misses every observed verb in practice (CSI cursor-forward between glyph and verb eaten by ANSI strip; ellipsis-form verbs lack the `for Ns` counter); slow-path log lines are dormant pending a regex fix. A bare-glyph fallback (`hasSpinnerGlyph` — `bytes.Contains` against `\xe2\x9c\xbb` after ANSI strip) is the practical "claude has started processing" signal until the regex is fixed; introduced in `cmd/spike-cancel/main.go`.
 - **Turn done (JSONL side):** at least one `type=="assistant"` line for the turn with `message.stop_reason=="end_turn"`. Note that this is on every delta of the message, not only the last line — see [JSONL layout § One Anthropic message ⇒ N JSONL lines](jsonl-layout.md).
 - **Turn-complete predicate (multi-turn):** JSONL `end_turn` observed AND `isIdle` true continuously for ≥250 ms (the `idleStableWindow` debounce in `cmd/spike-multi-turn/main.go`).
 - **Content extraction:** msg_id grouping — collect every assistant event whose `.message.id` equals the latest `end_turn`-tagged line's msg_id, concatenate `text`-type content blocks in JSONL arrival order. Skip `thinking` and `tool_use` blocks. See [JSONL layout § One Anthropic message ⇒ N JSONL lines](jsonl-layout.md).
+- **Cancel keystroke:** ESC (`\x1b`) — single byte, single `pty.Write`, no `\r`. Double-ESC and Ctrl-C also work but ESC is the default (matches the on-screen `esc to interrupt` hint, simplest single-byte representation). The keystroke does NOT go through `typePrompt` — the inter-byte-delay / `\r` reasoning that drives `typePrompt` does not apply to a `\r`-less single byte. See [#11](../codebase/11.md).
+- **Post-cancel readiness (PTY quiescence):** `❯-reappeared` after a cancel is detected via `isIdle(rb.snapshot()) AND rb.quietFor() >= 1500ms`, where `quietFor` is "time since the last byte was appended to the rolling buffer." Directly observes "claude has finished settling" instead of going through a proxy (e.g., "the spinner glyph has rolled out of the buffer"), which is unsound because post-cancel claude doesn't emit enough bytes to roll the 4 KB rolling buffer past the stale spinner glyph. Introduced in `cmd/spike-cancel/main.go`; likely the predicate the library will use post-extraction. See [#11](../codebase/11.md) for the empirical derivation.
+- **Cancellation acknowledged (JSONL side):** a `user`-role event with content `[{type:"text", text:"[Request interrupted by user]"}]` — NOT a new `stop_reason` value. The cancelled assistant message keeps its pre-cancel `stop_reason`. The current assistant-only tailer filter drops this marker; consumers needing JSONL-side acknowledgment must widen the filter or rely on PTY quiescence. See [JSONL layout § Cancellation signal](jsonl-layout.md).
+- **Input-box state across cancels:** post-cancel, claude restores the cancelled prompt as drafted input. The next prompt write must `Ctrl-U` (`0x15`) the input line first; idempotent on an empty input box. See [#11](../codebase/11.md).
 
 ## Related
 
