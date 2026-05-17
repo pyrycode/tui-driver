@@ -111,14 +111,17 @@ state-machine waiter exits via the watchdog inactivity deadline.
 
 ## Observed timings
 
-| Run | idle → prompt | prompt → thinking | thinking → spinner-gone | spinner-gone → result | total | outcome |
-|-----|---------------|-------------------|--------------------------|------------------------|-------|---------|
-|  1  | 0.408 ms      | never fired       | n/a                      | n/a                    | 5.0 s | FAIL — `jsonl-tailer-error: no new JSONL file appeared within 5s` |
-|  2  | 0.158 ms      | never fired       | n/a                      | n/a                    | 60.6 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` |
-|  3  | 0.857 ms      | never fired       | n/a                      | n/a                    | 60.6 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` (post-#3 fix; JSONL side now clean — see finding #8 for the new shape) |
-|  4  | 0.470 ms      | never fired       | n/a                      | n/a                    | 60.7 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` (post-#3 + #4; spike opened a STALE JSONL from a prior run — claude's actual new session JSONL had a different UUID and didn't exist yet — see finding #9) |
+| Run | spawn → idle | idle → prompt | prompt → jsonl-opened | jsonl-opened → end-turn | total | outcome |
+|-----|--------------|---------------|------------------------|--------------------------|-------|---------|
+|  1  | n/a          | 0.408 ms      | n/a (pre-#7 ordering)  | n/a                      | 5.0 s | FAIL — `jsonl-tailer-error: no new JSONL file appeared within 5s` |
+|  2  | n/a          | 0.158 ms      | n/a (pre-#7 ordering)  | n/a                      | 60.6 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` |
+|  3  | n/a          | 0.857 ms      | n/a (pre-#7 ordering)  | n/a                      | 60.6 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` (post-#3; JSONL side clean — see finding #8) |
+|  4  | n/a          | 0.470 ms      | n/a (pre-#7 ordering)  | n/a                      | 60.7 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` (post-#3 + #4; opened STALE JSONL — see finding #9) |
+|  5  | 303 ms       | 0.079 ms      | 202 ms                 | 2.737 s                  | 3.24 s | **SUCCESS** — `SUCCESS: 4` (post-#7; deterministic --session-id; spinner "Brewing…" rendered briefly but ellipsis-form so #8 still applies) |
 
-Run 1 hit the JSONL-tailer's 5-second deadline; runs 2-4 hit the main state-machine watchdog's 60-second inactivity deadline. The architecture's failure-handling worked correctly in all cases.
+Runs 1-4 all failed in distinct shapes — each surfaced a real bug. Run 5 is the first end-to-end success. The architecture's failure-handling worked correctly in every failing run; nothing wedged silently.
+
+The column shape changed between Run 4 and Run 5 because #7 reordered the state-log line sequence (`session-id-resolved` now fires before spawn, `session-jsonl-opened` now fires after `prompt-written`). The pre-#7 columns are kept as `n/a` for the earlier runs rather than retroactively rewriting them — the chronological honesty matters more than column uniformity.
 
 **The architecture is sound — implementation has bugs that the empirical run exposed.** Detail in `Surprises / findings` below.
 
@@ -129,6 +132,7 @@ Run 1 hit the JSONL-tailer's 5-second deadline; runs 2-4 hit the main state-mach
 | (none)          | 1, 2   | Spinner not observed in the raw PTY bytes in the earliest runs — see surprise #2. |
 | `Skedaddling`   | 3      | Appears as `✻ Skedaddling…` (ellipsis form, no `for Ns` counter — regex doesn't match). |
 | `Baked`         | 3      | Appears as `✻ Baked for 1s` but with a CSI cursor-forward between glyph and verb that the ANSI strip removes — see surprise #8. |
+| `Brewing`       | 5      | Appears as `✳ Brewing…` then transitions through `✶ Brewing…` → `✻ Brewing…` → `✽ Brewing…` (animation glyph cycles). Ellipsis form, no `for Ns` counter — regex doesn't match. The success path now exists without the spinner regex ever matching — finding #2/#8 lessons hold. |
 
 Known-good verbs from the operator's prior observation (NOT used as a regex whitelist): "Baked", "Whipped up", "Cooking". The spike's regex still captures zero verbs because of the strip/whitespace and ellipsis-form issues above.
 
@@ -247,7 +251,16 @@ This contrasts with finding #1 (where plain `claude` writes startup envelopes �
 
 **Implementation consequence:** `openSessionJSONL` is invoked **after** `prompt-written`, not after `idle-detected`. The JSONL tailer therefore starts seeking at offset 0 (the file is brand new) — the parser filter (`continue` on non-assistant types) handles whatever startup envelopes claude writes when it processes the first input.
 
-**Verification status:** this empirical claim still needs a clean post-fix run to confirm. The development iteration that uncovered it ran past `max_turns` before a `SUCCESS` was recorded; the architect's original spec assumed the opposite ordering (poll after idle, before prompt). If a verification run produces `SUCCESS: 4`, this finding stands. If the run fails with the JSONL-discovery timeout, the deferral hypothesis is wrong and the polling should move back to after `idle-detected` (without that being a regression of #3's mtime fix — `os.Stat` of a known path still works either way).
+**Verification status — confirmed by Run 5** (2026-05-17, post-#7 fix):
+
+- `session-id-resolved` fires at T+0 (before claude spawns).
+- `idle-detected` fires at T+303 ms (claude finished startup; `❯` rendered).
+- `prompt-written` fires at T+304 ms (immediately after idle).
+- `session-jsonl-opened path=… offset=0` fires at T+506 ms.
+
+The 202 ms gap between `prompt-written` and `session-jsonl-opened` is the deferral: claude with `--session-id` did not write the JSONL during its startup; the file appeared only after the prompt landed. If the deferral hypothesis were wrong, `os.Stat` would have succeeded immediately after the directory was scanned at startup time, and the gap would have been ≈0. The 202 ms is small but consistent across the spike run (the polling interval is 100 ms — so the true gap is in the [102, 202] ms range, but the sign and the ordering are unambiguous).
+
+The architect's original spec assumed the opposite ordering (poll after idle, before prompt). That ordering would have wedged in `openSessionJSONL` for 10 s and timed out — claude would not start processing input until the spike wrote the prompt, so the JSONL never would have appeared.
 
 ## Follow-up tickets the spike's findings justify
 
