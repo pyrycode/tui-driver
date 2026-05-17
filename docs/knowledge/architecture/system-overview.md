@@ -24,11 +24,13 @@ docs/
 ## Data flows
 
 ```
-                            ┌──────────────────────────┐
-                            │ spawned `claude` process │
-                            └──┬──────────────────┬────┘
-                          PTY  │                  │  writes session JSONL
-                       master  ▼                  ▼  to ~/.claude/projects/<encoded-cwd>/<id>.jsonl
+                            ┌──────────────────────────────┐
+                            │ spawned `claude` process     │
+                            │ (`--session-id <uuid>` pins  │
+                            │  the JSONL filename)         │
+                            └──┬──────────────────┬────────┘
+                          PTY  │                  │  writes session JSONL to the
+                       master  ▼                  ▼  deterministic path computed pre-spawn
               ┌───────────────────────┐    ┌─────────────────────┐
               │ PTY reader goroutine  │    │ JSONL tailer        │
               │ → rolling buffer (4K) │    │ → events channel    │

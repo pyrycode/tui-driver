@@ -62,7 +62,7 @@ Three goroutines, all coordinated by a single `context.Context` cancelled on shu
 |---|---|---|
 | `main` (orchestrator) | Runs the linear state machine: wait-idle → write-prompt → wait-thinking → wait-terminator → extract → success. Runs the watchdog tick (1 Hz). | State machine completes OR watchdog trips OR error. Always runs the shutdown path on exit. |
 | `ptyReader` | Reads from PTY master in a loop into a rolling buffer (last ~4 KB). Mirrors output to stderr so a human can see what claude is doing. Maintains an ANSI-stripped view of the buffer for regex matching. | PTY master returns EOF or error (which happens after the orchestrator closes it). |
-| `jsonlTailer` | Started immediately after `idle-detected`. Polls `~/.claude/projects/<encoded-cwd>/` for a new file vs. the startup snapshot. Once found, tails it line-by-line; for each line decodes JSON and emits the parsed object on a channel. | Context cancellation. |
+| `jsonlTailer` | Started immediately after `prompt-written` (and after `os.Stat` on the deterministic `<uuid>.jsonl` path succeeds — see § *JSONL discovery and tailing*). Tails the file line-by-line from offset 0; for each line decodes JSON and emits the parsed object on a channel. | Context cancellation. |
 
 Synchronization:
 
@@ -104,15 +104,18 @@ Notes for the dev:
 1. resolveProjectsDir() = $HOME/.claude/projects/<encode(getwd())>/
    where encode replaces '/' and '.' bytes with '-' character-by-character.
    (See § Empirical findings — encoding is byte-by-byte, NOT a normalization.)
-2. snapshot := set of existing *.jsonl filenames in that directory at startup (after waitIdle, before writePrompt — so the new file is unambiguous)
-3. After writePrompt: poll directory every 100 ms for a *.jsonl file whose name is NOT in snapshot. First hit is our session file.
-   Watchdog: if no new file appears within 5 s of writePrompt, abort with a named error.
-4. Open the file, read to EOF, then sleep 50 ms and re-read in a loop — classic tail.
+2. resolveSession(flag): empty flag → uuid.NewRandom(); non-empty → uuid.Parse (validate).
+   Compute jsonlPath = projectsDir/<uuid>.jsonl. Log `session-id-resolved id=<uuid> jsonl=<path>` BEFORE pty.Start.
+3. Spawn `claude --session-id <uuid>`. The flag pins the JSONL filename to the deterministic path computed in step 2.
+4. AFTER prompt-written (NOT after idle-detected — under --session-id, interactive claude defers JSONL creation until first input):
+   poll os.Stat(jsonlPath) every 100 ms with a 10 s timeout. On success, tail from offset 0 (file is brand new).
+5. Open the file, read to EOF, then sleep 50 ms and re-read in a loop — classic tail.
    Each line: json.Unmarshal into map[string]any. On parse error, log a warning and skip the line — one bad line shouldn't kill the spike.
-5. Filter for type == "assistant" — push those onto the channel. (Other types ignored; documented in README if anything notable shows up.)
+6. Filter: obj["message"] is a map AND obj["type"] == "assistant". Push those onto the channel.
+   Every other event type (permission-mode, file-history-snapshot, user, attachment, ai-title, system, last-prompt, future envelopes) is silently ignored.
 ```
 
-Do NOT use `fsnotify`. Polling at 100 ms is sufficient, deterministic, and avoids a dependency for a spike.
+Do NOT use `fsnotify`. Polling at 100 ms is sufficient, deterministic, and avoids a dependency for a spike. The directory-snapshot+diff approach in earlier revisions of this spec, and the newest-by-mtime heuristic that briefly replaced it, are both deleted — stale `.jsonl` files in the cwd are now structurally invisible because discovery only ever stats the one deterministic path. See [knowledge/architecture/jsonl-layout.md](../../knowledge/architecture/jsonl-layout.md) for the empirical backing and the ticket-#7 finding-#9 sub-finding about the deferral.
 
 ### Watchdog
 
@@ -142,16 +145,18 @@ The shutdown path must run on every exit (success, watchdog timeout, PTY error, 
 Required event names (with the watchdog log gated by `watchdog:` prefix as called out above):
 
 ```
+session-id-resolved id=<uuid> jsonl=<path>   # fires before pty.Start (ticket #7)
 idle-detected
 prompt-written
-thinking-detected verb=<captured-verb>   # slow path only — iff spinner observed
-spinner-gone                             # slow path only — iff spinner observed
-end-turn-detected               # assistant event with stop_reason=="end_turn"
+session-jsonl-opened path=<path> offset=0    # fires AFTER prompt-written — see ticket-#7 finding #9
+thinking-detected verb=<captured-verb>       # slow path only — iff spinner observed
+spinner-gone                                 # slow path only — iff spinner observed
+end-turn-detected                            # assistant event with stop_reason=="end_turn"
 assistant-text-extracted len=<n>
 shutdown-signalled
 ```
 
-On the fast path (trivial prompts where the spinner never renders, or where the spinner regex never matches it — see spike #1's README finding #8), `thinking-detected` and `spinner-gone` are skipped entirely; `end-turn-detected` fires directly after `prompt-written`.
+On the fast path (trivial prompts where the spinner never renders, or where the spinner regex never matches it — see spike #1's README finding #8), `thinking-detected` and `spinner-gone` are skipped entirely; `end-turn-detected` fires directly after `session-jsonl-opened`.
 
 One line per event. Free-form key=value tail is fine — these logs are for the README's timing table, not for machine parsing.
 

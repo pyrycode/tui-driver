@@ -22,16 +22,31 @@ Example: cwd `/Users/jhi/Workspace/Projects/.pyrycode-worktrees/architect-1` →
 
 ## Discovering the session file
 
-`claude` creates the session file **during its startup sequence**, before the first user prompt — it writes `permission-mode` and `file-history-snapshot` envelopes into the JSONL before any user input has been read (verified in ticket [#3](../codebase/3.md)). The discovery strategy is therefore:
+The robust mechanism is to **dictate the session ID up-front** via `claude --session-id <uuid>` (verified ticket [#7](../codebase/7.md)). The JSONL filename is then the deterministic `<uuid>.jsonl` in the encoded-cwd directory — no directory scan, no mtime heuristic, no `fsnotify`. The discovery strategy is:
 
-1. **After `idle-detected`, before writing the prompt**, pick the newest `*.jsonl` entry in the directory (`max(ModTime)`). claude just spawned and is touching the active log, so the freshly-mtimed file is unambiguous in practice.
-2. Stat the file to read its current byte `Size()`. This is the offset to seek to before tailing — everything written before that offset is claude's own startup chatter, which the spike has no use for.
-3. After writing the prompt, open the file, `Seek(offset, SeekStart)`, and tail with a 50 ms EOF backoff. Lines appended in response to the prompt arrive here.
-4. 1 s deadline on the discovery retry — covers the fresh-cwd race where `~/.claude/projects/<encoded-cwd>/` is created concurrently with the spike's idle detection, without masking a genuine absence.
+1. **Before spawning `claude`**, resolve the session ID (generate a fresh UUIDv4 by default, or accept an operator-supplied one via a flag). Compute `jsonlPath = ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`.
+2. Spawn `claude --session-id <uuid>`. Log the resolved id + path *before* `pty.Start` so an external operator can `tail -f <path>` or `claude --resume <uuid>` from another shell.
+3. **After writing the prompt** (see *Empirical surprise* below), poll `os.Stat(jsonlPath)` every 100 ms with a ≥10 s timeout. On success the file is brand new; tail from offset 0.
+4. The tailer's filter (`obj["message"]` is a map AND `obj["type"] == "assistant"`) silently skips claude's startup envelopes — same parser rule that handles non-`--session-id` runs.
 
-Polling is sufficient — do NOT pull in `fsnotify` for this. Implemented in `cmd/spike-one-turn/main.go` (`openSessionJSONL` + `tailJSONL`).
+Polling is sufficient — do NOT pull in `fsnotify` for this. Implemented in `cmd/spike-one-turn/main.go` (`resolveSession`, `openSessionJSONL`, `tailJSONL`).
 
-> **Historical note.** Spike #1 originally snapshotted the directory and waited for a *new* file to appear post-prompt; that approach was based on the pre-empirical assumption that the JSONL is created lazily at first turn. It isn't. The "wait for a new file" path was deleted in ticket #3.
+### Why the deterministic path
+
+"Newest `*.jsonl` by mtime" is fragile in two distinct ways:
+
+- Stale `.jsonl` files left in the cwd by prior runs make `max(ModTime)` return *the wrong existing file* when called before claude has written to the new one — the spike then tails an inert byte range and the watchdog eventually trips. Empirically observed in ticket #7 Run 4 with ≥5 stale files accumulated.
+- Even on a quiet cwd, the heuristic depends on claude touching its log "right now" — a thin race window that the #3 1-second retry papered over but did not eliminate.
+
+The hierarchy for "find the active file" is therefore: (1) dictate the identifier when the tool exposes a flag for it (preferred); (2) snapshot-before / diff-after (no flag available); (3) newest-by-mtime + retry (only safe when no stale data is plausible).
+
+### Empirical surprise: `--session-id` defers JSONL creation until first input
+
+Plain `claude` writes `permission-mode` and `file-history-snapshot` into the JSONL during its boot sequence (observed in ticket [#3](../codebase/3.md)). `claude --session-id <uuid>` does **not** — `os.Stat(jsonlPath)` fails with `IsNotExist` at the moment `❯` (idle) first renders. The file appears only after the user's first input is received and claude begins processing it. Confirmed in ticket #7 Runs 5 and 6 by the ~200 ms gap between `prompt-written` and `session-jsonl-opened`.
+
+Implementation consequence: the stat poll runs **after `prompt-written`**, not after `idle-detected`. Tailing starts at offset 0 because the file is brand new. Whether the deferral is intentional in v2.1.143 or an accident of the `--session-id` path is unknown; either way, consumers driving claude via this mechanism must not assume the file exists at idle.
+
+> **Historical note.** Ticket #1's spike snapshotted the directory and waited for a *new* file to appear post-prompt; ticket #3 replaced that with newest-by-mtime + offset-tail; ticket #7 replaced *that* with the deterministic-path model above. Each predecessor is described in its own per-ticket notes for context.
 
 ## Turn lifecycle in JSONL
 
@@ -77,4 +92,4 @@ Of these, only `user` and `assistant` carry a `message` object; everything else 
 
 - [ADR-0001 — Hybrid JSONL + TUI](../decisions/0001-hybrid-jsonl-tui.md)
 - [System overview](system-overview.md)
-- Code: `cmd/spike-one-turn/main.go` — `projectsDir`, `encodeCwd`, `openSessionJSONL`, `newestJSONL`, `tailJSONL`, `isEndTurn`, `extractAssistantText`
+- Code: `cmd/spike-one-turn/main.go` — `projectsDir`, `encodeCwd`, `resolveSession`, `openSessionJSONL`, `tailJSONL`, `isEndTurn`, `extractAssistantText`

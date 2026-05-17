@@ -5,7 +5,7 @@ One-line summary per evergreen doc. Cross-reference target — keep it terse.
 ## Architecture
 
 - [System overview](architecture/system-overview.md) — modules, data flows, concurrency model
-- [JSONL layout](architecture/jsonl-layout.md) — where claude writes session logs and what the turn-terminator actually looks like
+- [JSONL layout](architecture/jsonl-layout.md) — where claude writes session logs, deterministic-path discovery via `--session-id`, and what the turn-terminator actually looks like
 
 ## Decisions (ADRs)
 

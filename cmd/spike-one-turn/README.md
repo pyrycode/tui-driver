@@ -7,16 +7,22 @@ hybrid JSONL + TUI architecture decided 2026-05-16. See
 
 ## What it does
 
-1. Allocates a 120×40 PTY via `github.com/creack/pty`.
-2. Spawns `claude` (interactive, no flags) attached to the slave side.
-3. Reads the PTY master into a 4 KB rolling buffer, mirroring raw bytes to
+1. Resolves a session ID — generates a fresh UUIDv4 by default, or accepts one
+   via `-session-id <uuid>` (validated; bad UUID exits 2 before claude spawns).
+   Computes the deterministic JSONL path
+   `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` and logs
+   `session-id-resolved id=<uuid> jsonl=<path>` *before* spawn so an operator
+   can `tail -f` or `claude --resume` from another terminal.
+2. Allocates a 120×40 PTY via `github.com/creack/pty`.
+3. Spawns `claude --session-id <uuid>` attached to the slave side.
+4. Reads the PTY master into a 4 KB rolling buffer, mirroring raw bytes to
    stderr so a human watching the spike sees claude's UI live.
-4. Waits for the idle prompt (`❯` glyph present and no `✻` spinner).
-5. Opens the session JSONL claude already created during startup (newest
-   `*.jsonl` in `~/.claude/projects/<encoded-cwd>/`) and records its current
-   byte size — a 1 s retry covers a fresh-cwd race.
+5. Waits for the idle prompt (`❯` glyph present and no `✻` spinner).
 6. Writes `What is 2+2?\r` to the PTY master.
-7. Starts the JSONL tailer: seeks the recorded offset and tails appended lines.
+7. Polls `os.Stat(jsonlPath)` every 100 ms with a 10 s timeout. Under
+   `--session-id` the file is *not* created during claude startup — it appears
+   only after the prompt lands (see finding #9). On first stat success, tails
+   the file from offset 0.
 8. Waits for the thinking spinner regex (`✻ <verb> for <Ns>|<Nm Ns>`).
 9. Waits for BOTH: the spinner regex stops matching, AND a JSONL line arrives
    with `type=="assistant"` and `message.stop_reason=="end_turn"`. The parser
