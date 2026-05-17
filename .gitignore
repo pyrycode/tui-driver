@@ -28,3 +28,11 @@ go.work.sum
 # Local config
 .env
 .env.local
+
+# CodeGraph index (per-machine; populated by `codegraph init -i` + refreshed
+# automatically by the dispatcher's post-merge hook on agent-driven changes)
+.codegraph/
+
+# Dispatcher's per-target lock file (prevents two dispatchers from racing the
+# same target repo).
+.dispatcher.lock
