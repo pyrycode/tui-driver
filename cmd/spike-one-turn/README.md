@@ -57,12 +57,19 @@ SUCCESS: 2 + 2 = 4
 
 Stderr contains the raw claude UI bytes interleaved with the state log lines.
 
+### Optional flags
+
+- `-session-id <uuid>` — pin claude's session ID (and therefore the JSONL filename). Default: an empty value triggers a fresh UUIDv4 at startup. A non-empty value must parse as a valid UUID; otherwise the spike exits non-zero with a usage error. Whether the ID was generated or supplied, it is emitted in the `session-id-resolved` log line **before** `claude` spawns — so an operator can `tail -f <jsonl-path>` or run `claude --resume <id>` from another terminal while the spike runs.
+
+  Use cases: debugging (tail the same JSONL from another shell), parallel post-mortem, deterministic reproduction across runs.
+
 ### Required state log lines (in order)
 
 ```
+session-id-resolved id=<uuid> jsonl=<path>   # fires before pty.Start
 idle-detected
-session-jsonl-opened path=<path> offset=<bytes>
 prompt-written
+session-jsonl-opened path=<path> offset=0    # fires AFTER prompt-written — see finding #9
 thinking-detected verb="<captured>"   # slow path only — iff spinner observed
 spinner-gone                          # slow path only — iff spinner observed
 end-turn-detected              # assistant event with stop_reason=="end_turn"
@@ -73,7 +80,12 @@ shutdown-signalled
 On the fast path (trivial prompts where the spinner never renders, or where the
 spinner regex never matches it — see finding #8), `thinking-detected` and
 `spinner-gone` are skipped; `end-turn-detected` fires directly after
-`prompt-written`.
+`session-jsonl-opened`.
+
+Note the ordering change vs the pre-#7 spike: `session-jsonl-opened` now fires
+**after** `prompt-written`, not after `idle-detected`. The deterministic JSONL
+path (pinned via `--session-id`) does not exist on disk until claude starts
+processing the first input — see finding #9.
 
 Watchdog trips are prefixed `watchdog:` so `grep '^.*watchdog:' stderr.log`
 finds them cleanly during post-mortems.
@@ -104,8 +116,9 @@ state-machine waiter exits via the watchdog inactivity deadline.
 |  1  | 0.408 ms      | never fired       | n/a                      | n/a                    | 5.0 s | FAIL — `jsonl-tailer-error: no new JSONL file appeared within 5s` |
 |  2  | 0.158 ms      | never fired       | n/a                      | n/a                    | 60.6 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` |
 |  3  | 0.857 ms      | never fired       | n/a                      | n/a                    | 60.6 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` (post-#3 fix; JSONL side now clean — see finding #8 for the new shape) |
+|  4  | 0.470 ms      | never fired       | n/a                      | n/a                    | 60.7 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` (post-#3 + #4; spike opened a STALE JSONL from a prior run — claude's actual new session JSONL had a different UUID and didn't exist yet — see finding #9) |
 
-Run 1 hit the JSONL-tailer's 5-second deadline; runs 2 and 3 hit the main state-machine watchdog's 60-second inactivity deadline. The architecture's failure-handling worked correctly in all cases.
+Run 1 hit the JSONL-tailer's 5-second deadline; runs 2-4 hit the main state-machine watchdog's 60-second inactivity deadline. The architecture's failure-handling worked correctly in all cases.
 
 **The architecture is sound — implementation has bugs that the empirical run exposed.** Detail in `Surprises / findings` below.
 
@@ -198,6 +211,43 @@ Note the JSONL side is fully healthy in this run — the `assistant` event with 
 - **ANSI quirks:** no apparent strip failures; the `\x1b\[[0-9;?]*[a-zA-Z]` strip handled the welcome-banner sequences cleanly. The raw stderr-mirroring during the spike was readable when decoded as a terminal would render it (boxed banner appeared correctly via `cat` of the captured bytes — for the curious, `cat /tmp/spike-run1.err`).
 - **`❯` during thinking:** not observed (no thinking state visible)
 - **Spinner pauses mid-prompt:** not observed (no spinner at all)
+
+### 9. JSONL discovery: mtime heuristic opened a STALE session file; fixed by pinning `--session-id`
+
+Run 4 (post-#3 + #4) failed in a new shape. State log:
+
+```
+2026/05/17 11:09:01.694709 idle-detected
+2026/05/17 11:09:01.695096 session-jsonl-opened path=.../dddf559a-…jsonl offset=63216
+2026/05/17 11:09:01.695179 prompt-written
+2026/05/17 11:10:02.394169 watchdog: stuck in state prompt-written for 1m1s
+```
+
+The spike opened `dddf559a-….jsonl`. Claude's actual session JSONL for this run was `9707673d-….jsonl` (revealed by the `Resume this session with: claude --resume 9707673d-…` banner). Different files. At the moment the spike called `openSessionJSONL` (immediately after `idle-detected`), `9707673d` did NOT yet exist on disk; `newestJSONL` returned whichever existing `.jsonl` was newest at that instant, and prior spike runs had accumulated 4+ stale files in the projects-cwd. Claude's `9707673d` JSONL recorded the correct exchange (`"What is 2+2?"` → `"4"` with `stop_reason=end_turn`) within ~1 s of `prompt-written` — the architecture was fine; the spike just tailed the wrong file.
+
+**Generalizable lesson:** "newest file by mtime" is a common pattern for "find the active file." It is fragile when (a) files of the same shape persist across runs (stale data in the cwd) and (b) the thing being looked for hasn't been created yet at the moment of polling. The robust patterns, in order of preference:
+
+1. **Dictate the identifier** if the tool provides a way to (`--session-id`, `--output-file`, etc.). No race, no discovery logic at all.
+2. **Snapshot baseline + diff** — record state before triggering work; look for what's new after.
+3. **Newest-by-mtime + retry** — fragile, only safe if no stale data is plausible.
+
+Always check the tool's flags for option (1) before implementing (2) or (3).
+
+**Fix shape (this ticket):** claude exposes `--session-id <uuid>` (verified via `claude --help` v2.1.143). The spike now:
+
+- Generates a UUIDv4 at startup (or accepts an operator-supplied one via `-session-id`), spawns `claude --session-id <uuid>`, and computes the deterministic JSONL path `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`.
+- Logs `session-id-resolved id=<uuid> jsonl=<path>` **before** spawning claude, so the operator can `tail -f` or `claude --resume` from another terminal.
+- Polls `os.Stat(jsonlPath)` for up to 10 s instead of scanning the directory. Stale files in the cwd are now structurally invisible.
+
+#### Empirical sub-finding: interactive `claude --session-id` defers JSONL creation until first input
+
+Discovered during this fix's developer iteration: when claude is spawned with `--session-id <uuid>`, the deterministic JSONL path does NOT exist at the moment `❯` (idle) first renders. The file appears only after claude receives the first user input. Confirmed by the spike's stat-poll timing across the developer's iterations.
+
+This contrasts with finding #1 (where plain `claude` writes startup envelopes — `permission-mode`, `file-history-snapshot` — into the JSONL during its boot sequence, *before* any user input). Whether the `--session-id` deferral is intentional or an implementation accident in v2.1.143 is unknown; either way, the spike must accommodate it.
+
+**Implementation consequence:** `openSessionJSONL` is invoked **after** `prompt-written`, not after `idle-detected`. The JSONL tailer therefore starts seeking at offset 0 (the file is brand new) — the parser filter (`continue` on non-assistant types) handles whatever startup envelopes claude writes when it processes the first input.
+
+**Verification status:** this empirical claim still needs a clean post-fix run to confirm. The development iteration that uncovered it ran past `max_turns` before a `SUCCESS` was recorded; the architect's original spec assumed the opposite ordering (poll after idle, before prompt). If a verification run produces `SUCCESS: 4`, this finding stands. If the run fails with the JSONL-discovery timeout, the deferral hypothesis is wrong and the polling should move back to after `idle-detected` (without that being a regression of #3's mtime fix — `os.Stat` of a known path still works either way).
 
 ## Follow-up tickets the spike's findings justify
 
