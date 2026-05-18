@@ -36,3 +36,12 @@ func TestHasTrustModalEmpty(t *testing.T) {
 		t.Errorf("HasTrustModal([]byte{}) = true, want false")
 	}
 }
+
+func TestStripANSIString(t *testing.T) {
+	in := "\x1b[1m\x1b[34mhello\x1b[0m world"
+	got := StripANSIString(in)
+	want := "hello world"
+	if got != want {
+		t.Errorf("StripANSIString(%q) = %q, want %q", in, got, want)
+	}
+}

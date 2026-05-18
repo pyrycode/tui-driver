@@ -16,3 +16,10 @@ var ansiCsiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
 func StripANSI(snap []byte) []byte {
 	return ansiCsiRe.ReplaceAll(snap, nil)
 }
+
+// StripANSIString is the string variant of StripANSI. Useful when the
+// caller is already operating on a string (e.g. after a chained text-level
+// stripper of color codes and cursor-forward sequences).
+func StripANSIString(s string) string {
+	return ansiCsiRe.ReplaceAllString(s, "")
+}
