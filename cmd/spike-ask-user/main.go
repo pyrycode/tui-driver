@@ -49,17 +49,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/creack/pty"
 	"github.com/google/uuid"
+	"github.com/pyrycode/tui-driver/pkg/tuidriver"
 )
 
 const (
-	rollingBufferCap   = 4096
-	statePollInterval  = 50 * time.Millisecond
-	jsonlTailInterval  = 50 * time.Millisecond
-	sessionFileWait    = 10 * time.Second
-	sessionFilePoll    = 100 * time.Millisecond
-	watchdogTick       = 1 * time.Second
+	statePollInterval = 50 * time.Millisecond
+	jsonlTailInterval = 50 * time.Millisecond
+	sessionFileWait   = 10 * time.Second
+	sessionFilePoll   = 100 * time.Millisecond
+	watchdogTick      = 1 * time.Second
 	// AskUserQuestion modals render then claude goes QUIET waiting for
 	// user input. The PTY-heartbeat semantic ("no bytes = wedge") wrongly
 	// fires in this state. Bumped to 120 s so the probe can capture the
@@ -70,9 +69,6 @@ const (
 	spinnerFreezeLimit = 30 * time.Second
 	shutdownGrace      = 3 * time.Second
 
-	ptyRows = 40
-	ptyCols = 120
-
 	defaultPrompt = "Use the AskUserQuestion tool to ask me which of three programming languages I should learn next: Rust, Zig, or Go. Then wait for my answer before doing anything else."
 
 	askUserQuestionLimit = 60 * time.Second
@@ -80,7 +76,6 @@ const (
 	settleWindow         = 1500 * time.Millisecond
 )
 
-var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
 var oscRe = regexp.MustCompile(`\x1b\][^\x07]*\x07`)
 var idleGlyph = []byte("\xe2\x9d\xaf")
 var spinnerGlyph = []byte("\xe2\x9c\xbb")
@@ -122,19 +117,16 @@ func run(prompt, trustFolderPolicy, answer string) error {
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
 	defer cancelCause(errors.New("run: returning"))
 
-	rb := &rollingBuffer{}
+	rb := tuidriver.NewBuffer(0)
 	tr := newTracker()
 	tr.recordTransition("start")
 
 	cmd := exec.Command("claude", "--session-id", sessionID)
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	tuidriver.EnsureClaudeEnv(cmd)
 
-	ptmx, err := pty.Start(cmd)
+	ptmx, err := tuidriver.StartPTY(cmd)
 	if err != nil {
 		return fmt.Errorf("pty.Start: %w", err)
-	}
-	if err := pty.Setsize(ptmx, &pty.Winsize{Rows: ptyRows, Cols: ptyCols}); err != nil {
-		logger.Printf("warning: pty.Setsize: %v", err)
 	}
 
 	cmdExited := make(chan error, 1)
@@ -167,7 +159,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 			n, rerr := ptmx.Read(buf)
 			if n > 0 {
 				chunk := buf[:n]
-				rb.append(chunk)
+				rb.Append(chunk)
 				_, _ = os.Stderr.Write(chunk)
 			}
 			if rerr != nil {
@@ -186,8 +178,8 @@ func run(prompt, trustFolderPolicy, answer string) error {
 			case <-rootCtx.Done():
 				return
 			case <-ticker.C:
-				snap := rb.snapshot()
-				stripped := ansiRe.ReplaceAll(snap, nil)
+				snap := rb.Snapshot()
+				stripped := tuidriver.StripANSI(snap)
 				_, total, ok := matchSpinner(stripped)
 				tr.observeSpinner(ok, total)
 				if werr := tr.checkWatchdog(rb); werr != nil {
@@ -199,13 +191,13 @@ func run(prompt, trustFolderPolicy, answer string) error {
 		}
 	}()
 
-	if err := waitUntil(rootCtx, func() bool { return isIdle(rb.snapshot()) }); err != nil {
+	if err := waitUntil(rootCtx, func() bool { return isIdle(rb.Snapshot()) }); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
 	tr.recordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
-	if hasTrustModal(rb.snapshot()) {
+	if tuidriver.HasTrustModal(rb.Snapshot()) {
 		switch trustFolderPolicy {
 		case "fail":
 			return fmt.Errorf("claude shows the trust-folder dialog — pass `-trust-folder accept`")
@@ -216,8 +208,8 @@ func run(prompt, trustFolderPolicy, answer string) error {
 			tr.recordTransition("trust-folder-accepted")
 			logger.Printf("trust-folder-accepted")
 			if err := waitUntil(rootCtx, func() bool {
-				snap := rb.snapshot()
-				return !hasTrustModal(snap) && isIdle(snap)
+				snap := rb.Snapshot()
+				return !tuidriver.HasTrustModal(snap) && isIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait idle post-trust: %w", err)
 			}
@@ -256,7 +248,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 	// We anchor on a non-space-stripped fragment that's robust across both
 	// CSI-cursor-forward and literal-space rendering paths.
 	deadline := time.Now().Add(askUserQuestionLimit)
-	for !hasAskUserModal(rb.snapshot()) {
+	for !hasAskUserModal(rb.Snapshot()) {
 		select {
 		case <-rootCtx.Done():
 			return context.Cause(rootCtx)
@@ -277,12 +269,12 @@ func run(prompt, trustFolderPolicy, answer string) error {
 	}
 
 	// Snapshot PTY for byte-level inspection.
-	snap := rb.snapshot()
+	snap := rb.Snapshot()
 	dumpPath := fmt.Sprintf("/tmp/spike-ask-user-bytes-%d.bin", time.Now().UnixNano())
 	if err := os.WriteFile(dumpPath, snap, 0o644); err != nil {
 		logger.Printf("warning: write snapshot: %v", err)
 	}
-	stripped := oscRe.ReplaceAll(ansiRe.ReplaceAll(snap, nil), nil)
+	stripped := oscRe.ReplaceAll(tuidriver.StripANSI(snap), nil)
 	tr.recordTransition("modal-snapshot")
 	logger.Printf("modal-snapshot path=%s raw_len=%d stripped_len=%d", dumpPath, len(snap), len(stripped))
 
@@ -359,41 +351,6 @@ func extractAskUserQuestion(ev map[string]any) map[string]any {
 
 // --- shared primitives ---
 
-type rollingBuffer struct {
-	mu           sync.Mutex
-	buf          []byte
-	lastAppendAt time.Time
-}
-
-func (r *rollingBuffer) append(p []byte) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.buf = append(r.buf, p...)
-	if len(r.buf) > rollingBufferCap {
-		fresh := make([]byte, rollingBufferCap)
-		copy(fresh, r.buf[len(r.buf)-rollingBufferCap:])
-		r.buf = fresh
-	}
-	r.lastAppendAt = time.Now()
-}
-
-func (r *rollingBuffer) snapshot() []byte {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]byte, len(r.buf))
-	copy(out, r.buf)
-	return out
-}
-
-func (r *rollingBuffer) quietFor() time.Duration {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.lastAppendAt.IsZero() {
-		return 0
-	}
-	return time.Since(r.lastAppendAt)
-}
-
 type tracker struct {
 	mu                    sync.Mutex
 	currentState          string
@@ -433,11 +390,11 @@ func (t *tracker) observeSpinner(visible bool, totalSeconds int) {
 	}
 }
 
-func (t *tracker) checkWatchdog(rb *rollingBuffer) error {
+func (t *tracker) checkWatchdog(rb *tuidriver.Buffer) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := time.Now()
-	if quiet := rb.quietFor(); quiet > ptyQuietLimit {
+	if quiet := rb.QuietFor(); quiet > ptyQuietLimit {
 		return fmt.Errorf("watchdog: PTY quiet for %s (last state: %s)",
 			quiet.Round(time.Second), t.currentState)
 	}
@@ -464,7 +421,7 @@ func waitUntil(ctx context.Context, predicate func() bool) error {
 }
 
 func isIdle(snap []byte) bool {
-	stripped := ansiRe.ReplaceAll(snap, nil)
+	stripped := tuidriver.StripANSI(snap)
 	if !bytes.Contains(stripped, idleGlyph) {
 		return false
 	}
@@ -472,11 +429,6 @@ func isIdle(snap []byte) bool {
 		return false
 	}
 	return true
-}
-
-func hasTrustModal(snap []byte) bool {
-	stripped := ansiRe.ReplaceAll(snap, nil)
-	return bytes.Contains(stripped, []byte("Quicksafetycheck"))
 }
 
 // hasAskUserModal: claude's AskUserQuestion tool renders an interactive
@@ -487,7 +439,7 @@ func hasTrustModal(snap []byte) bool {
 // variants (the hint-bar literals don't contain CSI cursor-forward in
 // the renderings observed so far, but matching with-spaces is safer).
 func hasAskUserModal(snap []byte) bool {
-	stripped := ansiRe.ReplaceAll(snap, nil)
+	stripped := tuidriver.StripANSI(snap)
 	return bytes.Contains(stripped, []byte("Enter to select")) ||
 		bytes.Contains(stripped, []byte("Entertoselect"))
 }
@@ -518,21 +470,9 @@ func projectsDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".claude", "projects", encodeCwd(cwd)), nil
+	return filepath.Join(home, ".claude", "projects", tuidriver.EncodeCwd(cwd)), nil
 }
 
-func encodeCwd(cwd string) string {
-	var b []byte
-	for i := 0; i < len(cwd); i++ {
-		c := cwd[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
-			b = append(b, c)
-		} else {
-			b = append(b, '-')
-		}
-	}
-	return string(b)
-}
 
 func openSessionJSONL(path string) error {
 	deadline := time.Now().Add(sessionFileWait)
