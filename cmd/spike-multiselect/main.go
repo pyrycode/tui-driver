@@ -67,32 +67,52 @@ var idleGlyph = []byte("\xe2\x9d\xaf")
 var spinnerGlyph = []byte("\xe2\x9c\xbb")
 var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
 
-// Picker-parser regexes (loop 4 D-1, 2026-05-18).
+// Picker-parser regexes (loop 4 D-1 unfiltered, D-2 filtered, 2026-05-18).
 //
-// Each slash-command line in claude's `/` picker is rendered as:
+// Claude renders the `/` picker in two structurally different modes:
 //
-//   \x1b[38;5;<color>m/<command><CSI-alignment>[(<category>)<space>]<description>\x1b[39m
+// UNFILTERED (user typed `/` only): each row is a single color block.
+//   \x1b[38;5;<color>m/<cmd><CSI-fwd>[(<cat>) ]<desc>\x1b[39m
+//   - color=153 (light blue) marks the HIGHLIGHTED row (default
+//     selection — the one Enter would commit). color=246 (gray) marks
+//     every other row.
+//   - CSI cursor-forward (\x1b[<N>C) substitutes for spaces between
+//     words (same root cause as spike #1 finding #8).
 //
-// where:
-//   - color=153 (light blue) marks the HIGHLIGHTED row (default selection,
-//     the one Enter would commit)
-//   - color=246 (gray) marks every other row
-//   - <CSI-alignment> is `\x1b[<N>C` cursor-forward to align the desc column
-//   - <description> uses `\x1b[1C` between every WORD instead of a space
-//     (same root cause as spike #1 finding #8 — CSI cursor-forward
-//     substitutes for whitespace in claude's renderer)
+// FILTERED (user typed e.g. `/fi`): each row has MULTIPLE color
+//   switches WITHIN it. Claude wraps each occurrence of the typed
+//   filter substring in color 153 to highlight matching characters,
+//   while the rest of the row stays in 246. So `/figma-use` with
+//   filter `fi` renders as:
+//   \x1b[38;5;246m/\x1b[38;5;153mfi\x1b[38;5;246mgma-use\x1b[39m
+//   The whole-row highlight semantic is lost in filtered mode; claude
+//   instead surfaces the SELECTED row's full description in a separate
+//   right-column color-153 block. Default selection in filtered mode
+//   is always the first match (claude convention).
 //
-// Parser strategy: regex over the raw snapshot to capture color+command+
-// content, then convert `\x1b[<N>C` to single spaces in the content and
-// strip any remaining ANSI for plain-text output.
-var pickerCmdRe = regexp.MustCompile(
-	`\x1b\[38;5;(\d+)m` + // color code (group 1)
-		`(/[a-zA-Z][a-zA-Z0-9_\-]*)` + // /command-name (group 2)
-		`((?s:.*?))` + // content (group 3, non-greedy across newlines)
-		`\x1b\[39m`, // color reset
+// Parser strategy: walk the raw snapshot top-to-bottom, find each
+// "item start" — `\x1b[38;5;{246|153}m/<letter>` — capture content
+// until next item start OR end of buffer. Strip color codes (preserve
+// adjacency), convert cursor-forward to single spaces. Highlight bit:
+// unfiltered mode = items with 153 opening; filtered mode = first
+// item (heuristic).
+var pickerItemStartRe = regexp.MustCompile(
+	// `\x1b[38;5;{246|153}m/` followed by either a letter (unfiltered or
+	// no leading substring match) OR another color code (filtered mode
+	// where the matched substring starts at position 1, e.g. `/figma-*`
+	// filtered by `fi` renders as `\x1b[38;5;246m/\x1b[38;5;153mfi…`).
+	// Requiring `/` + (color-code? + letter) covers both shapes without
+	// false-positiving on description-embedded slashes (which never have
+	// a `\x1b[38;5;{246|153}m` prefix).
+	`\x1b\[38;5;(246|153)m/(?:\x1b\[38;5;\d+m)?[a-zA-Z]`,
 )
 
 var csiCursorFwdRe = regexp.MustCompile(`\x1b\[(\d+)C`)
+
+// colorCodeRe matches the foreground-color SGR codes (open + close) we
+// strip during command-name + description reconstruction. Cursor-forward
+// (\x1b[NC) is handled separately because it's positional, not stylistic.
+var colorCodeRe = regexp.MustCompile(`\x1b\[(?:38;5;\d+|39)m`)
 
 // pickerCategoryRe matches the optional "(category)" prefix at the start
 // of a description (e.g. "(figma) **MANDATORY...").
@@ -517,49 +537,115 @@ type PickerItem struct {
 }
 
 // parsePickerItems extracts structured items from a raw PTY snapshot of
-// claude's `/` slash-command picker. Returns the items in render order
-// (top-to-bottom in the picker). Items past the visible-window cutoff
-// in the 4096-byte rolling buffer won't appear here — picker scrolling
-// would require a follow-up snapshot after sending arrow-down keys.
+// claude's `/` slash-command picker. Returns items in render order
+// (top-to-bottom). Handles both UNFILTERED and FILTERED modes (see
+// pickerItemStartRe comment for the structural difference).
+//
+// Items past the visible-window cutoff in the 4096-byte rolling buffer
+// won't appear; picker scrolling requires a follow-up snapshot after
+// arrow-down keys (D-3 territory).
 func parsePickerItems(snap []byte) []PickerItem {
 	// Strip OSC sequences first (window title, etc. — irrelevant noise).
 	cleaned := oscRe.ReplaceAll(snap, nil)
 
-	var items []PickerItem
-	for _, m := range pickerCmdRe.FindAllSubmatch(cleaned, -1) {
-		color := string(m[1])
-		cmd := string(m[2])
-		content := m[3]
+	// Find all item starts. Each start is the byte offset of \x1b[38;5;<color>m/
+	starts := pickerItemStartRe.FindAllSubmatchIndex(cleaned, -1)
+	if len(starts) == 0 {
+		return nil
+	}
 
-		// Convert CSI cursor-forward to single spaces (the "spaces between
-		// words" rendering). Then strip any remaining ANSI.
-		content = csiCursorFwdRe.ReplaceAll(content, []byte(" "))
-		content = ansiRe.ReplaceAll(content, nil)
-		// Also strip stray CR/LF — descriptions can wrap onto subsequent
-		// lines via the wider "right column" rendering, but we want a
-		// single-line description for the API. Replace CR/LF with space
-		// and collapse multi-spaces.
-		text := strings.ReplaceAll(strings.ReplaceAll(string(content), "\r", " "), "\n", " ")
-		// Collapse runs of whitespace.
+	// Detect mode: filtered mode has lots of mid-row 153 substring highlights;
+	// unfiltered has only one 153 — the highlighted row. Heuristic: count how
+	// many of the item-start matches have color=153. In unfiltered, 0 or 1.
+	// In filtered, every item-start tends to be 246 (substring highlights are
+	// MID-name, not at item-start). The simpler signal: if the FIRST item's
+	// start is color 246 AND it contains a 153 segment within (filtered mode
+	// indicator), treat as filtered.
+	highlightedCount153 := 0
+	for _, m := range starts {
+		// The color is captured group 1 — its bytes are at m[2]:m[3]
+		color := string(cleaned[m[2]:m[3]])
+		if color == "153" {
+			highlightedCount153++
+		}
+	}
+
+	var items []PickerItem
+	for i, m := range starts {
+		// Determine the byte range for this item: from m[0] to EITHER the
+		// next item's start OR the first newline (whichever is sooner).
+		// Capping at the first newline prevents the right-pane (selected-
+		// item full description, color 153) from being absorbed into the
+		// LAST left-column item's range — left-column items are single-line.
+		itemStart := m[0]
+		var itemEnd int
+		if i+1 < len(starts) {
+			itemEnd = starts[i+1][0]
+		} else {
+			itemEnd = len(cleaned)
+		}
+		// Trim to first \r or \n (single-line per item in the left column).
+		if nl := bytes.IndexAny(cleaned[itemStart:itemEnd], "\r\n"); nl >= 0 {
+			itemEnd = itemStart + nl
+		}
+		raw := cleaned[itemStart:itemEnd]
+
+		// Opening color of this item.
+		openColor := string(cleaned[m[2]:m[3]])
+
+		// Reconstruct command + description text:
+		// 1. Strip ALL color codes (preserve adjacency).
+		// 2. Convert cursor-forward to single space.
+		// 3. Normalize whitespace.
+		text := colorCodeRe.ReplaceAllString(string(raw), "")
+		text = csiCursorFwdRe.ReplaceAllString(text, " ")
+		text = ansiRe.ReplaceAllString(text, "")
 		for strings.Contains(text, "  ") {
 			text = strings.ReplaceAll(text, "  ", " ")
 		}
 		text = strings.TrimSpace(text)
 
-		// Try to peel off the "(category) " prefix.
+		// Parse "/<cmd> <rest>" — split on first whitespace after the slash-word.
+		if !strings.HasPrefix(text, "/") {
+			continue
+		}
+		spaceIdx := strings.IndexAny(text, " \t")
+		var cmd, rest string
+		if spaceIdx < 0 {
+			cmd, rest = text, ""
+		} else {
+			cmd, rest = text[:spaceIdx], strings.TrimSpace(text[spaceIdx+1:])
+		}
+
+		// Peel off "(category) " prefix.
 		var category, description string
-		if catMatch := pickerCategoryRe.FindStringSubmatch(text); catMatch != nil {
+		if catMatch := pickerCategoryRe.FindStringSubmatch(rest); catMatch != nil {
 			category = catMatch[1]
 			description = catMatch[2]
 		} else {
-			description = text
+			description = rest
+		}
+
+		// Highlight detection:
+		//   - UNFILTERED mode: exactly one row OPENS with 153 (the
+		//     highlighted/default-selected row). highlightedCount153 == 1.
+		//   - FILTERED mode: every row opens with 246 in the left column;
+		//     the right pane shows the full description of the selected
+		//     item in its own 153 block (not at any item-start). So
+		//     highlightedCount153 == 0 among item-starts. Default-selected
+		//     in filtered mode is the FIRST item (claude convention).
+		var highlighted bool
+		if highlightedCount153 >= 1 {
+			highlighted = openColor == "153"
+		} else {
+			highlighted = i == 0
 		}
 
 		items = append(items, PickerItem{
 			Command:     cmd,
 			Category:    category,
 			Description: description,
-			Highlighted: color == "153", // light blue = default-selected row
+			Highlighted: highlighted,
 		})
 	}
 	return items
