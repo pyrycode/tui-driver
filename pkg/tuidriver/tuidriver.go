@@ -16,15 +16,27 @@
 // # MCP server reliability
 //
 // claude renders a "N MCP server failed · /mcp" status banner when one or
-// more configured MCP servers fail to connect at startup. Two strategies:
+// more configured MCP servers fail to connect at startup. The user's MCP
+// servers are part of what the driver is forwarding (e.g. pyry acp
+// surfacing Gmail / GitHub / Figma tools to mobile), so the library does
+// not strip them — consumers handle failures by detecting them and
+// surfacing to the host UI.
 //
-//   - Sidestep (recommended for non-interactive drivers): pass
-//     --strict-mcp-config to claude. Configured MCP servers are skipped
-//     entirely; banner never appears.
-//   - Surface: allow MCP servers, and call HasMcpFailureBanner /
-//     FailedMcpCount to detect failures and forward to the host UI.
+// Primitives:
+//
+//   - HasMcpFailureBanner(snap) — boolean check for the banner
+//   - FailedMcpCount(snap) — integer count, 0 if no banner
+//   - ParseMcpStatus(snap) — full structured /mcp modal contents
 //
 // The banner is a terminal state — "I failed to connect," not "I'm still
 // trying." There is no benefit to polling for it to clear, so the library
-// does not expose a WaitForMcpReady primitive.
+// does not expose a WaitForMcpReady primitive. Consumers either retry
+// (out of library scope — relaunch claude, possibly with an adjusted
+// --mcp-config) or proceed with partial MCP and surface the failure.
+//
+// --strict-mcp-config is a claude CLI flag that skips configured MCP
+// servers entirely. It exists for reproducibility scenarios (CI, tests,
+// containers) but is NOT the recommended path for an interactive driver:
+// it discards the user's MCP servers, which are usually part of the value
+// being driven.
 package tuidriver
