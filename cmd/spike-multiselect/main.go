@@ -123,6 +123,8 @@ func main() {
 		"keystroke to trigger the picker: '/' (slash-command autocomplete, default), '@' (file picker), '#' (memory)")
 	trustFolderFlag := flag.String("trust-folder", "fail",
 		"policy when claude's trust-folder dialog appears at idle: 'fail' (default — return clear error) or 'accept' (send `1\\r` to auto-trust this cwd, then proceed)")
+	postKeysFlag := flag.String("post-trigger-keys", "",
+		"comma-separated keys to send AFTER trigger and BEFORE snapshot: 'down' (\\x1b[B), 'up' (\\x1b[A), 'left' (\\x1b[D), 'right' (\\x1b[C). Each key gets a brief settle delay. Use for D-3 highlight-via-navigation probes.")
 	flag.Parse()
 
 	if *trustFolderFlag != "fail" && *trustFolderFlag != "accept" {
@@ -130,13 +132,13 @@ func main() {
 		os.Exit(2)
 	}
 
-	if err := run(*triggerFlag, *trustFolderFlag); err != nil {
+	if err := run(*triggerFlag, *trustFolderFlag, *postKeysFlag); err != nil {
 		fmt.Fprintf(os.Stderr, "spike failed: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(trigger string, trustFolderPolicy string) error {
+func run(trigger string, trustFolderPolicy string, postTriggerKeys string) error {
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
 	startedAt := time.Now()
 	logger.Printf("trigger=%q", trigger)
@@ -269,6 +271,42 @@ func run(trigger string, trustFolderPolicy string) error {
 	case <-rootCtx.Done():
 		return context.Cause(rootCtx)
 	case <-time.After(settleWindow):
+	}
+
+	// Loop 4 D-3: post-trigger navigation keys. Send each, settle briefly,
+	// then proceed to snapshot. Snapshot captures the state AFTER all keys
+	// land — sufficient for "did the highlight move?" verification. To
+	// capture intermediate states, run the spike multiple times with
+	// progressively-longer key sequences.
+	if postTriggerKeys != "" {
+		keys := strings.Split(postTriggerKeys, ",")
+		for _, k := range keys {
+			k = strings.TrimSpace(k)
+			var keyBytes []byte
+			switch k {
+			case "down":
+				keyBytes = []byte{0x1b, 0x5b, 0x42} // \x1b[B
+			case "up":
+				keyBytes = []byte{0x1b, 0x5b, 0x41} // \x1b[A
+			case "left":
+				keyBytes = []byte{0x1b, 0x5b, 0x44} // \x1b[D
+			case "right":
+				keyBytes = []byte{0x1b, 0x5b, 0x43} // \x1b[C
+			default:
+				return fmt.Errorf("unknown post-trigger key %q (want down/up/left/right)", k)
+			}
+			if _, err := ptmx.Write(keyBytes); err != nil {
+				return fmt.Errorf("write %q: %w", k, err)
+			}
+			tr.recordTransition("post-trigger-key-" + k)
+			logger.Printf("post-trigger-key-sent name=%s bytes=%x", k, keyBytes)
+			// Brief settle between keys — claude redraws the highlighted row.
+			select {
+			case <-rootCtx.Done():
+				return context.Cause(rootCtx)
+			case <-time.After(300 * time.Millisecond):
+			}
+		}
 	}
 
 	// Snapshot. Dump raw bytes to /tmp for byte-level inspection;
