@@ -260,7 +260,7 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 
 	// --- linear state machine (session-level) ---
 
-	if err := waitUntil(rootCtx, func() bool {
+	if err := tuidriver.WaitUntil(rootCtx, func() bool {
 		return tuidriver.IsIdle(rb.Snapshot())
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
@@ -278,7 +278,7 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 			}
 			tr.recordTransition("trust-folder-accepted")
 			logger.Printf("trust-folder-accepted bytes=31 0d")
-			if err := waitUntil(rootCtx, func() bool {
+			if err := tuidriver.WaitUntil(rootCtx, func() bool {
 				snap := rb.Snapshot()
 				return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
 			}); err != nil {
@@ -850,23 +850,6 @@ func (t *tracker) checkWatchdog() error {
 // --- generic predicate wait ---
 // copied from cmd/spike-multi-turn/main.go — keep in sync until library extraction
 
-func waitUntil(ctx context.Context, predicate func() bool) error {
-	if predicate() {
-		return nil
-	}
-	ticker := time.NewTicker(statePollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		case <-ticker.C:
-			if predicate() {
-				return nil
-			}
-		}
-	}
-}
 
 // --- JSONL discovery + tailing ---
 // copied from cmd/spike-multi-turn/main.go — keep in sync until library extraction
