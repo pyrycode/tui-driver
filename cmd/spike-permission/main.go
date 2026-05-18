@@ -229,6 +229,8 @@ func main() {
 		"approve keystroke to send: 1-enter | y-enter | enter | down-enter")
 	modalPredicateFlag := flag.String("modal-predicate", "literal-text",
 		"modal-detection predicate: box-drawing | literal-text")
+	trustFolderFlag := flag.String("trust-folder", "fail",
+		"policy when claude's trust-folder dialog appears at idle: 'fail' (default — return clear error) or 'accept' (send `1\\r` to auto-trust this cwd, then proceed)")
 	flag.Parse()
 
 	approveKey, approveHex, err := parseApproveKeystroke(*approveKeystrokeFlag)
@@ -245,7 +247,12 @@ func main() {
 		os.Exit(2)
 	}
 
-	if err := run(*sessionIDFlag, approveKey, approveHex, pred); err != nil {
+	if *trustFolderFlag != "fail" && *trustFolderFlag != "accept" {
+		fmt.Fprintf(os.Stderr, "invalid -trust-folder value %q (want 'fail' or 'accept')\n", *trustFolderFlag)
+		os.Exit(2)
+	}
+
+	if err := run(*sessionIDFlag, approveKey, approveHex, pred, *trustFolderFlag); err != nil {
 		fmt.Fprintf(os.Stderr, "spike failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -286,7 +293,7 @@ var (
 	probe3Prompt = "read /etc/hostname"
 )
 
-func run(sessionIDFlag string, approveKey []byte, approveHex string, pred modalPredicate) error {
+func run(sessionIDFlag string, approveKey []byte, approveHex string, pred modalPredicate, trustFolderPolicy string) error {
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
 	startedAt := time.Now()
 
@@ -308,7 +315,7 @@ func run(sessionIDFlag string, approveKey []byte, approveHex string, pred modalP
 	}
 	logger.Printf("session-id-resolved id=%s jsonl=%s tag=a", sessionA, jsonlA)
 
-	if err := runSession(rootCtx, logger, sessionA, jsonlA, "a", 1, approveKey, approveHex, pred,
+	if err := runSession(rootCtx, logger, sessionA, jsonlA, "a", 1, approveKey, approveHex, pred, trustFolderPolicy,
 		[]probeSpec{{kind: kindObserve, prompt: probe1Prompt}}); err != nil {
 		return fmt.Errorf("session A: %w", err)
 	}
@@ -321,7 +328,7 @@ func run(sessionIDFlag string, approveKey []byte, approveHex string, pred modalP
 	}
 	logger.Printf("session-id-resolved id=%s jsonl=%s tag=b", sessionB, jsonlB)
 
-	if err := runSession(rootCtx, logger, sessionB, jsonlB, "b", 2, approveKey, approveHex, pred,
+	if err := runSession(rootCtx, logger, sessionB, jsonlB, "b", 2, approveKey, approveHex, pred, trustFolderPolicy,
 		[]probeSpec{
 			{kind: kindAutoRespond, prompt: probe2Prompt},
 			{kind: kindEscalate, prompt: probe3Prompt},
@@ -347,6 +354,7 @@ func runSession(
 	approveKey []byte,
 	approveHex string,
 	pred modalPredicate,
+	trustFolderPolicy string,
 	probes []probeSpec,
 ) error {
 	logger := parentLogger
@@ -452,8 +460,25 @@ func runSession(
 	tr.recordTransition(fmt.Sprintf("session=%s idle-detected", tag))
 	logger.Printf("idle-detected tag=%s", tag)
 
-	if err := detectTrustModal(rb.snapshot()); err != nil {
-		return err
+	if hasTrustModal(rb.snapshot()) {
+		switch trustFolderPolicy {
+		case "fail":
+			return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike. Or pass `-trust-folder accept` to auto-trust")
+		case "accept":
+			if _, err := ptmx.Write([]byte("1\r")); err != nil {
+				return fmt.Errorf("write trust-accept keystroke: %w", err)
+			}
+			tr.recordTransition(fmt.Sprintf("session=%s trust-folder-accepted", tag))
+			logger.Printf("trust-folder-accepted tag=%s bytes=31 0d", tag)
+			if err := waitUntil(ctx, func() bool {
+				snap := rb.snapshot()
+				return !hasTrustModal(snap) && isIdle(snap)
+			}); err != nil {
+				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
+			}
+			tr.recordTransition(fmt.Sprintf("session=%s idle-detected-post-trust", tag))
+			logger.Printf("idle-detected-post-trust tag=%s", tag)
+		}
 	}
 
 	// Diagnostic: does the chosen modal predicate produce a false positive
@@ -1166,15 +1191,12 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	return string(m[1]), minutes*60 + seconds, true
 }
 
-// detectTrustModal: see cmd/spike-one-turn/main.go for derivation (loop 2 exp B-5).
-func detectTrustModal(snap []byte) error {
+// hasTrustModal: anchored on the modal HEADER "Quicksafetycheck" — NOT
+// the post-accept confirmation. See cmd/spike-one-turn/main.go for
+// derivation (loop 3 C-1).
+func hasTrustModal(snap []byte) bool {
 	stripped := ansiRe.ReplaceAll(snap, nil)
-	if bytes.Contains(stripped, []byte("trust this folder")) ||
-		bytes.Contains(stripped, []byte("trustthisfolder")) ||
-		bytes.Contains(stripped, []byte("Quicksafetycheck")) {
-		return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike")
-	}
-	return nil
+	return bytes.Contains(stripped, []byte("Quicksafetycheck"))
 }
 
 func isIdle(snap []byte) bool {
