@@ -36,12 +36,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/creack/pty"
 	"github.com/google/uuid"
+	"github.com/pyrycode/tui-driver/pkg/tuidriver"
 )
 
 const (
-	rollingBufferCap   = 4096
 	statePollInterval  = 50 * time.Millisecond
 	jsonlTailInterval  = 50 * time.Millisecond
 	sessionFileWait    = 10 * time.Second
@@ -52,19 +51,12 @@ const (
 	shutdownGrace      = 3 * time.Second
 
 	promptText = "What is 2+2?\r"
-
-	ptyRows = 40
-	ptyCols = 120
 )
 
 // spinnerRe matches the thinking indicator. The verb (group 1) is 1–2 words and
 // varies per prompt — capture it for the empirical log; do NOT depend on any
 // specific value. Time-tail is `Ns` or `Nm Ns` (groups 2,3).
 var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
-
-// CSI sequences in claude's output wrap the spinner and prompt glyphs in color
-// codes. A single-pass strip is enough for regex matching at spike fidelity.
-var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
 
 // idleGlyph is the UTF-8 encoding of ❯ — claude's input-line prompt marker.
 var idleGlyph = []byte("\xe2\x9d\xaf")
@@ -107,20 +99,16 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
 	defer cancelCause(errors.New("run: returning"))
 
-	rb := &rollingBuffer{}
+	rb := tuidriver.NewBuffer(0)
 	tr := newTracker()
 	tr.recordTransition("start")
 
 	cmd := exec.Command("claude", "--session-id", sessionID)
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	tuidriver.EnsureClaudeEnv(cmd)
 
-	ptmx, err := pty.Start(cmd)
+	ptmx, err := tuidriver.StartPTY(cmd)
 	if err != nil {
 		return fmt.Errorf("pty.Start: %w", err)
-	}
-	if err := pty.Setsize(ptmx, &pty.Winsize{Rows: ptyRows, Cols: ptyCols}); err != nil {
-		// Non-fatal — claude will still draw, just possibly clipped.
-		logger.Printf("warning: pty.Setsize: %v", err)
 	}
 
 	cmdExited := make(chan error, 1)
@@ -156,7 +144,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			n, rerr := ptmx.Read(buf)
 			if n > 0 {
 				chunk := buf[:n]
-				rb.append(chunk)
+				rb.Append(chunk)
 				_, _ = os.Stderr.Write(chunk)
 			}
 			if rerr != nil {
@@ -176,8 +164,8 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			case <-rootCtx.Done():
 				return
 			case <-ticker.C:
-				snap := rb.snapshot()
-				stripped := ansiRe.ReplaceAll(snap, nil)
+				snap := rb.Snapshot()
+				stripped := tuidriver.StripANSI(snap)
 				verb, total, ok := matchSpinner(stripped)
 				_ = verb
 				tr.observeSpinner(ok, total)
@@ -193,14 +181,14 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	// --- linear state machine ---
 
 	if err := waitUntil(rootCtx, func() bool {
-		return isIdle(rb.snapshot())
+		return isIdle(rb.Snapshot())
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
 	tr.recordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
-	if hasTrustModal(rb.snapshot()) {
+	if tuidriver.HasTrustModal(rb.Snapshot()) {
 		switch trustFolderPolicy {
 		case "fail":
 			return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike. Or pass `-trust-folder accept` to auto-trust")
@@ -211,11 +199,11 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			tr.recordTransition("trust-folder-accepted")
 			logger.Printf("trust-folder-accepted bytes=31 0d")
 			// Wait for claude to dismiss the modal and return to true idle.
-			// hasTrustModal must be false (modal text is gone) AND isIdle
+			// HasTrustModal must be false (modal text is gone) AND isIdle
 			// must be true (❯ visible + no spinner).
 			if err := waitUntil(rootCtx, func() bool {
-				snap := rb.snapshot()
-				return !hasTrustModal(snap) && isIdle(snap)
+				snap := rb.Snapshot()
+				return !tuidriver.HasTrustModal(snap) && isIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
 			}
@@ -279,7 +267,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 				logger.Printf("end-turn-detected")
 			}
 		case <-probe.C:
-			stripped := ansiRe.ReplaceAll(rb.snapshot(), nil)
+			stripped := tuidriver.StripANSI(rb.Snapshot())
 			v, _, ok := matchSpinner(stripped)
 			switch {
 			case ok && !thinkingObserved:
@@ -304,32 +292,6 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	return nil
 }
 
-// --- rolling buffer ---
-
-type rollingBuffer struct {
-	mu  sync.Mutex
-	buf []byte
-}
-
-func (r *rollingBuffer) append(p []byte) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.buf = append(r.buf, p...)
-	if len(r.buf) > rollingBufferCap {
-		fresh := make([]byte, rollingBufferCap)
-		copy(fresh, r.buf[len(r.buf)-rollingBufferCap:])
-		r.buf = fresh
-	}
-}
-
-func (r *rollingBuffer) snapshot() []byte {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]byte, len(r.buf))
-	copy(out, r.buf)
-	return out
-}
-
 // --- pattern matching ---
 
 func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
@@ -345,31 +307,10 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	return string(m[1]), minutes*60 + seconds, true
 }
 
-// hasTrustModal: claude shows a "Quick safety check: Is this a project
-// you created or one you trust?" dialog on first use of any previously-
-// unseen cwd. The spike's isIdle predicate matches inside it (claude
-// renders ❯ in the modal's input field), so without explicit detection
-// the spike would type its prompt into the trust modal and time out
-// opaquely. See loop 2 exp B-5 (2026-05-18) for derivation; loop 3
-// exp C-1 (2026-05-18) refined the predicate to be modal-specific
-// (not confirmation-text-matching).
-//
-// Anchored on "Quicksafetycheck" — the modal HEADER, space-stripped per
-// claude's Bash-style CSI cursor-forward rendering. Critically, this is
-// NOT in the confirmation "Yes, I trust this folder✔" text that lands
-// after acceptance and lingers in the rolling buffer. Loop 3 C-1's
-// initial predicate (`trust this folder` / `trustthisfolder`) matched
-// BOTH the modal AND the confirmation, breaking the post-accept wait.
-// Library extraction should use the same modal-specific anchor.
-func hasTrustModal(snap []byte) bool {
-	stripped := ansiRe.ReplaceAll(snap, nil)
-	return bytes.Contains(stripped, []byte("Quicksafetycheck"))
-}
-
 // isIdle: ❯ glyph is present AND spinner regex does not match. The TUI redraws
 // the input line below the spinner during thinking, so ❯ alone is not enough.
 func isIdle(snap []byte) bool {
-	stripped := ansiRe.ReplaceAll(snap, nil)
+	stripped := tuidriver.StripANSI(snap)
 	if !bytes.Contains(stripped, idleGlyph) {
 		return false
 	}
@@ -472,27 +413,7 @@ func projectsDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".claude", "projects", encodeCwd(cwd)), nil
-}
-
-// encodeCwd matches claude's empirically-confirmed projects-dir
-// encoding rule (loop 2 exp B-4, 2026-05-18): every non-alphanumeric
-// byte → '-' (one-to-one substitution, not run-collapsed). Tested
-// against /private/tmp/encode test (with) [brackets] & amp+plus_under
-// which claude wrote to `-private-tmp-encode-test--with---brackets----amp-plus-under`
-// — every special char including `_` became exactly one '-'.
-func encodeCwd(cwd string) string {
-	var b strings.Builder
-	b.Grow(len(cwd))
-	for i := 0; i < len(cwd); i++ {
-		c := cwd[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
-			b.WriteByte(c)
-		} else {
-			b.WriteByte('-')
-		}
-	}
-	return b.String()
+	return filepath.Join(home, ".claude", "projects", tuidriver.EncodeCwd(cwd)), nil
 }
 
 // resolveSession turns the operator-supplied flag into a normalised session ID
