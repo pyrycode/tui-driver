@@ -73,13 +73,26 @@ const (
 	jsonlTailInterval  = 50 * time.Millisecond
 	sessionFileWait    = 10 * time.Second
 	sessionFilePoll    = 100 * time.Millisecond
-	watchdogTick       = 1 * time.Second
-	// inactivityLimit: session-level umbrella watchdog. Must exceed the
-	// largest probe-level ceiling (endTurnAfterApproveLimit = 90 s) or
-	// it becomes the binding constraint during streaming tool responses
-	// post-approve (no state transitions fire between modal-cleared and
-	// end-turn-detected while claude streams). See finding #22.
-	inactivityLimit    = 120 * time.Second
+	watchdogTick = 1 * time.Second
+
+	// ptyQuietLimit: universal liveness watchdog. Fires when no new PTY
+	// bytes have arrived for this long, regardless of which "phase" of a
+	// probe we're in. Replaces the prior stack of state-transition-based
+	// ceilings (inactivityLimit / modalClearedLimit / endTurnAfterApprove)
+	// which formed a cascade where each fix unmasked the next-tightest.
+	// PTY bytes flowing == claude alive: spinner counter incrementing,
+	// tool output streaming, ⏺ status redraws, etc. State transitions are
+	// discrete milestones, not heartbeats — wrong primitive for streaming.
+	// 30 s is well above any observed PTY-quiet gap during normal activity.
+	// See findings #19-#24 + Open Questions architectural section.
+	ptyQuietLimit = 30 * time.Second
+
+	// sessionWallCap: outermost safety net for genuinely runaway sessions
+	// where claude emits bytes but doesn't progress (e.g. theoretical loop
+	// on a status banner redraw — not observed, cheap to defend against).
+	// Real probes complete in <60 s; 10 min is enormous headroom.
+	sessionWallCap = 10 * time.Minute
+
 	spinnerFreezeLimit = 30 * time.Second
 	shutdownGrace      = 3 * time.Second
 
@@ -88,11 +101,6 @@ const (
 
 	ptyRows = 40
 	ptyCols = 120
-
-	// ptyQuietWindow: post-approve we treat "the rolling buffer has had no
-	// new bytes for this long" as "claude has finished settling," same
-	// rationale as spike-cancel's post-cancel quiescence predicate.
-	ptyQuietWindow = 1500 * time.Millisecond
 
 	// clearLineSettle: brief pause after Ctrl-U so the input handler can
 	// process the line-kill before the next byte arrives.
@@ -113,17 +121,6 @@ const (
 	// open after the simulated-escalation log lines, per AC.
 	escalationWindow = 3 * time.Second
 
-	// modalClearedLimit: Probe 2's window for "approve sent → modal
-	// cleared." Aggressive vs the 60 s session-level inactivity watchdog
-	// because modal clearing should be near-instant.
-	modalClearedLimit = 30 * time.Second
-
-	// endTurnAfterApproveLimit: Probe 2's window for "modal cleared →
-	// end_turn arrives." Sized to absorb streaming tool responses
-	// (e.g. `ls -la /tmp` line-by-line listing) which can exceed 30 s
-	// end-to-end. SUCCESS exits as soon as end_turn arrives — the
-	// budget is a ceiling, not a floor. See finding #20.
-	endTurnAfterApproveLimit = 90 * time.Second
 )
 
 // copied from cmd/spike-cancel/main.go — keep in sync until library extraction
@@ -414,9 +411,12 @@ func runSession(
 		}
 	}()
 
-	// Watchdog: 60 s inactivity + 30 s spinner-freeze. Same shape as
-	// spike-cancel; the watchdog is session-scoped (resets when Session B
-	// starts).
+	// Watchdog: PTY-quiet-for-30s liveness + 30s spinner-freeze + 10min
+	// session wall-cap. Session-scoped (resets when Session B starts).
+	// PTY-heartbeat replaces the prior state-transition-based stack
+	// (inactivityLimit / modalClearedLimit / endTurnAfterApproveLimit)
+	// per findings #19-#24 cascade observation.
+	sessionStart := time.Now()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -431,7 +431,7 @@ func runSession(
 				stripped := ansiRe.ReplaceAll(snap, nil)
 				_, total, ok := matchSpinner(stripped)
 				tr.observeSpinner(ok, total)
-				if werr := tr.checkWatchdog(); werr != nil {
+				if werr := tr.checkWatchdog(rb, sessionStart); werr != nil {
 					logger.Printf("%v", werr)
 					cancelCause(werr)
 					return
@@ -634,59 +634,39 @@ func runAutoRespond(
 	if err := sendKeystroke(ptmx, approveKey); err != nil {
 		return fmt.Errorf("send approve: %w", err)
 	}
-	keystrokeSentAt := time.Now()
 	tr.recordTransition(fmt.Sprintf("probe=%d response-keystroke-sent", probeN))
 	logger.Printf("probe=%d response-keystroke-sent bytes=%s", probeN, approveHex)
 
-	// Accumulate JSONL events while waiting for modal-cleared. Keep them
-	// for the post-cleared end_turn extraction.
+	// Single post-keystroke loop. Two transitions to log along the way:
+	//
+	//   modal-cleared: first JSONL `assistant` event after keystroke-sent.
+	//     Per finding #15 the modal has ZERO JSONL footprint pre-approve;
+	//     the moment claude emits any assistant content it has moved past
+	//     the modal. The JSONL tailer pre-filters to type=assistant only
+	//     (see tailJSONL), so the first event from eventCh post-keystroke
+	//     IS the modal-cleared positive signal — no need for a separate
+	//     PTY rolling-buffer `hasModal` check (which was finding #23's
+	//     bug: modal text persists in the 4096-byte rolling buffer when
+	//     streaming responses don't push it out fast enough).
+	//
+	//   end-turn-detected: JSONL stop_reason=end_turn AND PTY idle (❯
+	//     visible). Per spike #2 finding the gap is ~100µs; passive
+	//     verification suffices.
+	//
+	// No per-phase wall-clock deadlines here. Liveness is enforced by
+	// the session-level PTY-heartbeat watchdog (tracker.checkWatchdog) —
+	// PTY quiet for >ptyQuietLimit fires `cancelCause` and surfaces via
+	// ctx.Done. The session wall-cap is the outer safety net.
 	var (
 		events             []map[string]any
 		latestEndTurnMsgID string
 		gotEndTurn         bool
+		modalCleared       bool
 	)
 
-	// Wait for modal-cleared: !hasModal AND isIdle.
-	// The earlier quietFor >= ptyQuietWindow clause was inherited from
-	// spike-cancel's post-cancel predicate where it makes sense (post-cancel
-	// claude IS quiet); under post-approve, claude is actively producing the
-	// response, and streaming-heavy tool output (e.g. `ls -la /tmp` dot-anim)
-	// kept quietFor under 1.5 s for the full 30 s budget on ~50% of runs.
-	// Modal-gone is the actual signal; quiescence is a proxy that fails under
-	// streaming. See finding #19.
-	clearedDeadline := keystrokeSentAt.Add(modalClearedLimit)
 	ticker := time.NewTicker(statePollInterval)
 	defer ticker.Stop()
 
-clearedLoop:
-	for {
-		select {
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		case ev := <-eventCh:
-			events = append(events, ev)
-			if isEndTurn(ev) {
-				if id := msgIDOf(ev); id != "" {
-					latestEndTurnMsgID = id
-				}
-				gotEndTurn = true
-			}
-		case <-ticker.C:
-			snap := rb.snapshot()
-			if !hasModal(snap, pred) && isIdle(snap) {
-				break clearedLoop
-			}
-			if time.Now().After(clearedDeadline) {
-				return fmt.Errorf("watchdog: modal not cleared after approve within %s", modalClearedLimit)
-			}
-		}
-	}
-	tr.recordTransition(fmt.Sprintf("probe=%d modal-cleared", probeN))
-	logger.Printf("probe=%d modal-cleared", probeN)
-
-	// Wait for end_turn (may have already arrived during the cleared
-	// wait). Predicate: gotEndTurn AND isIdle stable.
-	endTurnDeadline := keystrokeSentAt.Add(endTurnAfterApproveLimit)
 	var idleSince time.Time
 	check := func() bool {
 		if !gotEndTurn {
@@ -709,6 +689,11 @@ clearedLoop:
 			return context.Cause(ctx)
 		case ev := <-eventCh:
 			events = append(events, ev)
+			if !modalCleared {
+				modalCleared = true
+				tr.recordTransition(fmt.Sprintf("probe=%d modal-cleared", probeN))
+				logger.Printf("probe=%d modal-cleared", probeN)
+			}
 			if isEndTurn(ev) {
 				if id := msgIDOf(ev); id != "" {
 					latestEndTurnMsgID = id
@@ -716,9 +701,8 @@ clearedLoop:
 				gotEndTurn = true
 			}
 		case <-ticker.C:
-			if time.Now().After(endTurnDeadline) {
-				return fmt.Errorf("watchdog: end_turn not detected after approve within %s", endTurnAfterApproveLimit)
-			}
+			// No per-phase deadline; PTY-heartbeat watchdog handles
+			// "claude wedged" at the tracker level.
 		}
 	}
 
@@ -1226,17 +1210,26 @@ func (t *tracker) observeSpinner(visible bool, totalSeconds int) {
 	}
 }
 
-func (t *tracker) checkWatchdog() error {
+// checkWatchdog is called from the per-tick goroutine with the rolling
+// buffer + the session-start timestamp. Replaces the prior
+// state-transition-based inactivity check with a PTY-heartbeat check:
+// PTY bytes flowing == claude alive, regardless of which state the
+// probe thinks it's in.
+func (t *tracker) checkWatchdog(rb *rollingBuffer, sessionStart time.Time) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := time.Now()
-	if !t.lastTransitionAt.IsZero() && now.Sub(t.lastTransitionAt) > inactivityLimit {
-		return fmt.Errorf("watchdog: stuck in state %s for %s",
-			t.currentState, now.Sub(t.lastTransitionAt).Round(time.Second))
+	if quiet := rb.quietFor(); quiet > ptyQuietLimit {
+		return fmt.Errorf("watchdog: PTY quiet for %s (last state: %s)",
+			quiet.Round(time.Second), t.currentState)
 	}
 	if t.spinnerActive && now.Sub(t.lastSpinnerProgressAt) > spinnerFreezeLimit {
 		return fmt.Errorf("watchdog: spinner counter frozen at %ds for %s",
 			t.lastSpinnerTotal, now.Sub(t.lastSpinnerProgressAt).Round(time.Second))
+	}
+	if elapsed := now.Sub(sessionStart); elapsed > sessionWallCap {
+		return fmt.Errorf("watchdog: session exceeded wall-clock cap of %s (elapsed %s, last state: %s)",
+			sessionWallCap, elapsed.Round(time.Second), t.currentState)
 	}
 	return nil
 }
