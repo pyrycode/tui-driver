@@ -233,6 +233,10 @@ func run(sessionIDFlag string) error {
 	tr.recordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
+	if err := detectTrustModal(rb.snapshot()); err != nil {
+		return err
+	}
+
 	// Shared events channel for the whole session; one tailer goroutine
 	// services all three turns. Tailer is started inside turn 1's
 	// postPromptHook because interactive `claude --session-id` defers JSONL
@@ -526,6 +530,17 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	}
 	seconds, _ := strconv.Atoi(string(m[3]))
 	return string(m[1]), minutes*60 + seconds, true
+}
+
+// detectTrustModal: see cmd/spike-one-turn/main.go for derivation (loop 2 exp B-5).
+func detectTrustModal(snap []byte) error {
+	stripped := ansiRe.ReplaceAll(snap, nil)
+	if bytes.Contains(stripped, []byte("trust this folder")) ||
+		bytes.Contains(stripped, []byte("trustthisfolder")) ||
+		bytes.Contains(stripped, []byte("Quicksafetycheck")) {
+		return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike")
+	}
+	return nil
 }
 
 // isIdle: ❯ glyph present AND spinner regex does not match.

@@ -450,6 +450,10 @@ func runSession(
 	tr.recordTransition(fmt.Sprintf("session=%s idle-detected", tag))
 	logger.Printf("idle-detected tag=%s", tag)
 
+	if err := detectTrustModal(rb.snapshot()); err != nil {
+		return err
+	}
+
 	// Diagnostic: does the chosen modal predicate produce a false positive
 	// at idle (before any prompt)? The README documents the baseline.
 	idleHasModal := hasModal(rb.snapshot(), pred)
@@ -1158,6 +1162,17 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	}
 	seconds, _ := strconv.Atoi(string(m[3]))
 	return string(m[1]), minutes*60 + seconds, true
+}
+
+// detectTrustModal: see cmd/spike-one-turn/main.go for derivation (loop 2 exp B-5).
+func detectTrustModal(snap []byte) error {
+	stripped := ansiRe.ReplaceAll(snap, nil)
+	if bytes.Contains(stripped, []byte("trust this folder")) ||
+		bytes.Contains(stripped, []byte("trustthisfolder")) ||
+		bytes.Contains(stripped, []byte("Quicksafetycheck")) {
+		return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike")
+	}
+	return nil
 }
 
 func isIdle(snap []byte) bool {
