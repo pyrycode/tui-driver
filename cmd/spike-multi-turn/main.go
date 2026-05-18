@@ -87,15 +87,24 @@ var idleGlyph = []byte("\xe2\x9d\xaf")
 // don't change their wording. Prompts 4+ are appended during follow-up
 // experiments for additional coverage.
 //
-// Prompt 4 (loop 2 exp B-2, 2026-05-18): parallel-tool stress to validate
-// pre-spike finding #2's tool-use interleaving observation. Two independent
-// reads should plausibly trigger parallel tool_use blocks within one
-// assistant message (msg_id-grouped extraction must tolerate this).
+// Prompt 4 (loop 2 exp B-2, 2026-05-18): parallel-tool stress, soft
+// wording — claude chose serial reads under this phrasing. Pattern from
+// pre-spike finding #2 still reproduced (tool_use blocks under one
+// msg_id, interleaved with tool_result events) but the parallel-in-flight
+// case (multiple tool_use BEFORE first tool_result) wasn't triggered.
+//
+// Prompt 5 (loop 3 exp C-3, 2026-05-18): same probe with explicit
+// parallel-call wording — "issue both tool calls in a single response
+// before waiting for results." Aim is to observe the parallel-in-flight
+// shape claude can produce (per Anthropic API docs that say tool_use is
+// list-typed) and validate the msg_id-grouped extractor handles N
+// concurrent tool_use blocks within one assistant message.
 var prompts = []string{
 	"say hello",
 	"list the files in /tmp",
 	"think carefully and compute 1+2+3+...+100, showing your reasoning",
 	"read /etc/hosts and /etc/passwd and summarize the differences in one sentence",
+	"Read /etc/hosts and /etc/passwd in parallel — issue both Read tool calls in a single assistant response BEFORE waiting for any result, then summarize the differences in one sentence",
 }
 
 func main() {
