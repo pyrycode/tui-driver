@@ -1,6 +1,9 @@
 package tuidriver
 
-import "bytes"
+import (
+	"bytes"
+	"regexp"
+)
 
 // ModalClass identifies which of claude's modal/picker UI states a PTY
 // snapshot is currently rendering. Returned by DetectModalClass.
@@ -25,31 +28,45 @@ const (
 )
 
 // Modal-class detection anchors. Each is unique to its class — verified
-// empirically across loops 1-6. CSI cursor-forward stripping eats
-// inter-word spaces in some renderings (Bash-style), so the predicates
-// match both space-stripped and space-preserved forms where claude varies.
+// empirically across loops 1-6 plus the 2026-05-18 API-extending probes.
+// CSI cursor-forward stripping eats inter-word spaces in some renderings
+// (Bash-style), so predicates match both space-stripped and space-
+// preserved forms where claude varies.
 //
 // Anchors are unexported — consumers call DetectModalClass rather than
 // matching directly. The literal forms are documented here for readers.
 //
 //	mcp                → "ManageMCPservers"
 //	agents             → "Agents" header + "Running" or "Library" tab
-//	slash-picker       → "?forshortcuts" or "? for shortcuts"
+//	slash-picker       → SGR-colored picker row (`\x1b[38;5;{246|153}m/<letter>`)
 //	ask-user-question  → "Entertoselect" or "Enter to select"
 //	trust-folder       → "Quicksafetycheck"
 //	permission         → "Doyouwanttoproceed" or "Do you want to proceed"
+//
+// slash-picker uses the SGR-row pattern rather than the "? for shortcuts"
+// hint-bar text. The hint-bar text appears at idle too (it's part of the
+// welcome banner's input-line hint), causing false-positive picker
+// classifications. The SGR row pattern only matches when actual picker
+// rows are rendered. The same regex doubles as the parser's item-start
+// matcher in picker.go.
 var (
 	anchorMCP                = []byte("ManageMCPservers")
 	anchorAgentsHeader       = []byte("Agents")
 	anchorAgentsTabRunning   = []byte("Running")
 	anchorAgentsTabLibrary   = []byte("Library")
-	anchorSlashPickerStripped = []byte("?forshortcuts")
-	anchorSlashPickerSpaced   = []byte("? for shortcuts")
-	anchorAskUserStripped     = []byte("Entertoselect")
-	anchorAskUserSpaced       = []byte("Enter to select")
-	anchorTrustFolder         = []byte("Quicksafetycheck")
-	anchorPermissionStripped  = []byte("Doyouwanttoproceed")
-	anchorPermissionSpaced    = []byte("Do you want to proceed")
+	anchorAskUserStripped    = []byte("Entertoselect")
+	anchorAskUserSpaced      = []byte("Enter to select")
+	anchorTrustFolder        = []byte("Quicksafetycheck")
+	anchorPermissionStripped = []byte("Doyouwanttoproceed")
+	anchorPermissionSpaced   = []byte("Do you want to proceed")
+)
+
+// slashPickerRowRe matches a picker item-start. Identical pattern to
+// pickerItemStartRe in picker.go (kept independent to avoid coupling the
+// detector to the parser's internals; the patterns are documented as
+// the same in both files).
+var slashPickerRowRe = regexp.MustCompile(
+	`\x1b\[38;5;(246|153)m/(?:\x1b\[38;5;\d+m)?[a-zA-Z]`,
 )
 
 // DetectModalClass classifies the modal/picker currently rendered in snap.
@@ -65,6 +82,13 @@ var (
 // Returns ModalClassUnknown when no anchor matches (the common case at
 // idle — no modal currently rendered).
 func DetectModalClass(snap []byte) ModalClass {
+	// slash-picker is detected on the RAW snapshot — the row anchor is an
+	// SGR sequence which StripANSI would remove. Check it first so the
+	// unstripped path doesn't get hit by the other anchors' matching on
+	// the welcome-banner text.
+	if slashPickerRowRe.Match(snap) {
+		return ModalClassSlashPicker
+	}
 	stripped := StripOSC(StripANSI(snap))
 	switch {
 	case bytes.Contains(stripped, anchorMCP):
@@ -73,9 +97,6 @@ func DetectModalClass(snap []byte) ModalClass {
 		(bytes.Contains(stripped, anchorAgentsTabRunning) ||
 			bytes.Contains(stripped, anchorAgentsTabLibrary)):
 		return ModalClassAgents
-	case bytes.Contains(stripped, anchorSlashPickerStripped) ||
-		bytes.Contains(stripped, anchorSlashPickerSpaced):
-		return ModalClassSlashPicker
 	case bytes.Contains(stripped, anchorAskUserStripped) ||
 		bytes.Contains(stripped, anchorAskUserSpaced):
 		return ModalClassAskUserQuestion
