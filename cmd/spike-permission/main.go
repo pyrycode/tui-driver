@@ -62,13 +62,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/creack/pty"
 	"github.com/google/uuid"
+	"github.com/pyrycode/tui-driver/pkg/tuidriver"
 )
 
 const (
-	// copied from cmd/spike-cancel/main.go — keep in sync until library extraction
-	rollingBufferCap   = 4096
 	statePollInterval  = 50 * time.Millisecond
 	jsonlTailInterval  = 50 * time.Millisecond
 	sessionFileWait    = 10 * time.Second
@@ -101,9 +99,6 @@ const (
 	disappearedWindow = 500 * time.Millisecond
 	idleStableWindow  = 250 * time.Millisecond
 
-	ptyRows = 40
-	ptyCols = 120
-
 	// clearLineSettle: brief pause after Ctrl-U so the input handler can
 	// process the line-kill before the next byte arrives.
 	clearLineSettle = 50 * time.Millisecond
@@ -129,7 +124,6 @@ const (
 var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
 
 // copied from cmd/spike-cancel/main.go — keep in sync until library extraction
-var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
 
 // oscRe matches OSC (Operating System Command) sequences — ESC ] ... BEL.
 // Claude uses these for window title and similar metadata; they show up
@@ -362,7 +356,7 @@ func runSession(
 	ctx, cancelCause := context.WithCancelCause(parentCtx)
 	defer cancelCause(errors.New("runSession: returning"))
 
-	rb := &rollingBuffer{}
+	rb := tuidriver.NewBuffer(0)
 	tr := newTracker()
 	tr.recordTransition(fmt.Sprintf("session=%s start", tag))
 
@@ -370,14 +364,11 @@ func runSession(
 	// to skip the modal; we WANT the modal here). Let claude pick its own
 	// default permission mode.
 	cmd := exec.Command("claude", "--session-id", sessionID)
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	tuidriver.EnsureClaudeEnv(cmd)
 
-	ptmx, err := pty.Start(cmd)
+	ptmx, err := tuidriver.StartPTY(cmd)
 	if err != nil {
 		return fmt.Errorf("pty.Start: %w", err)
-	}
-	if err := pty.Setsize(ptmx, &pty.Winsize{Rows: ptyRows, Cols: ptyCols}); err != nil {
-		logger.Printf("warning: pty.Setsize: %v", err)
 	}
 
 	cmdExited := make(chan error, 1)
@@ -412,7 +403,7 @@ func runSession(
 			n, rerr := ptmx.Read(buf)
 			if n > 0 {
 				chunk := buf[:n]
-				rb.append(chunk)
+				rb.Append(chunk)
 				_, _ = os.Stderr.Write(chunk)
 			}
 			if rerr != nil {
@@ -437,8 +428,8 @@ func runSession(
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				snap := rb.snapshot()
-				stripped := ansiRe.ReplaceAll(snap, nil)
+				snap := rb.Snapshot()
+				stripped := tuidriver.StripANSI(snap)
 				_, total, ok := matchSpinner(stripped)
 				tr.observeSpinner(ok, total)
 				if werr := tr.checkWatchdog(rb); werr != nil {
@@ -453,14 +444,14 @@ func runSession(
 	// Wait for idle (❯ glyph + no spinner). Same predicate as the other
 	// spikes.
 	if err := waitUntil(ctx, func() bool {
-		return isIdle(rb.snapshot())
+		return isIdle(rb.Snapshot())
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
 	tr.recordTransition(fmt.Sprintf("session=%s idle-detected", tag))
 	logger.Printf("idle-detected tag=%s", tag)
 
-	if hasTrustModal(rb.snapshot()) {
+	if tuidriver.HasTrustModal(rb.Snapshot()) {
 		switch trustFolderPolicy {
 		case "fail":
 			return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike. Or pass `-trust-folder accept` to auto-trust")
@@ -471,8 +462,8 @@ func runSession(
 			tr.recordTransition(fmt.Sprintf("session=%s trust-folder-accepted", tag))
 			logger.Printf("trust-folder-accepted tag=%s bytes=31 0d", tag)
 			if err := waitUntil(ctx, func() bool {
-				snap := rb.snapshot()
-				return !hasTrustModal(snap) && isIdle(snap)
+				snap := rb.Snapshot()
+				return !tuidriver.HasTrustModal(snap) && isIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
 			}
@@ -483,7 +474,7 @@ func runSession(
 
 	// Diagnostic: does the chosen modal predicate produce a false positive
 	// at idle (before any prompt)? The README documents the baseline.
-	idleHasModal := hasModal(rb.snapshot(), pred)
+	idleHasModal := hasModal(rb.Snapshot(), pred)
 	logger.Printf("idle-predicate-check tag=%s predicate=%s has_modal=%v",
 		tag, pred.String(), idleHasModal)
 
@@ -546,7 +537,7 @@ func runObserve(
 	prompt string,
 	pred modalPredicate,
 	ptmx *os.File,
-	rb *rollingBuffer,
+	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
 	tr *tracker,
 	postPromptHook func() error,
@@ -577,7 +568,7 @@ func runObserve(
 	logger.Printf("probe=%d modal-detected pattern=%q", probeN, pred.String())
 
 	// Snapshot bytes + persist to tempfile + log truncated extracted text.
-	snap := rb.snapshot()
+	snap := rb.Snapshot()
 	tr.recordTransition(fmt.Sprintf("probe=%d modal-bytes-snapshot", probeN))
 	logger.Printf("probe=%d modal-bytes-snapshot len=%d", probeN, len(snap))
 
@@ -630,7 +621,7 @@ func runAutoRespond(
 	approveHex string,
 	pred modalPredicate,
 	ptmx *os.File,
-	rb *rollingBuffer,
+	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
 	tr *tracker,
 	postPromptHook func() error,
@@ -659,7 +650,7 @@ func runAutoRespond(
 	tr.recordTransition(fmt.Sprintf("probe=%d modal-detected", probeN))
 	logger.Printf("probe=%d modal-detected pattern=%q", probeN, pred.String())
 
-	text := extractModalText(rb.snapshot())
+	text := extractModalText(rb.Snapshot())
 	logger.Printf("probe=%d modal-text-extracted text=%q", probeN, truncateForLog(text, 200))
 
 	if err := sendKeystroke(ptmx, approveKey); err != nil {
@@ -703,7 +694,7 @@ func runAutoRespond(
 		if !gotEndTurn {
 			return false
 		}
-		if !isIdle(rb.snapshot()) {
+		if !isIdle(rb.Snapshot()) {
 			idleSince = time.Time{}
 			return false
 		}
@@ -759,7 +750,7 @@ func runEscalate(
 	prompt string,
 	pred modalPredicate,
 	ptmx *os.File,
-	rb *rollingBuffer,
+	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
 	tr *tracker,
 ) error {
@@ -792,7 +783,7 @@ drain:
 	tr.recordTransition(fmt.Sprintf("probe=%d modal-detected", probeN))
 	logger.Printf("probe=%d modal-detected pattern=%q", probeN, pred.String())
 
-	snap := rb.snapshot()
+	snap := rb.Snapshot()
 	snapPath := fmt.Sprintf("/tmp/spike-permission-probe%d-bytes-%d.bin", probeN, time.Now().UnixNano())
 	if err := writeTempSnapshot(snapPath, snap); err != nil {
 		logger.Printf("warning: probe=%d snapshot-write-err err=%v", probeN, err)
@@ -820,7 +811,7 @@ drain:
 	case <-time.After(escalationWindow):
 	}
 
-	stillOpen := hasModal(rb.snapshot(), pred)
+	stillOpen := hasModal(rb.Snapshot(), pred)
 	tr.recordTransition(fmt.Sprintf("probe=%d modal-still-open", probeN))
 	logger.Printf("probe=%d modal-still-open=%v", probeN, stillOpen)
 
@@ -829,12 +820,12 @@ drain:
 
 // waitForModal polls hasModal at statePollInterval until true or limit
 // elapses. Returns the watchdog-shaped error on timeout.
-func waitForModal(ctx context.Context, rb *rollingBuffer, pred modalPredicate, limit time.Duration) error {
+func waitForModal(ctx context.Context, rb *tuidriver.Buffer, pred modalPredicate, limit time.Duration) error {
 	deadline := time.Now().Add(limit)
 	ticker := time.NewTicker(statePollInterval)
 	defer ticker.Stop()
 	for {
-		if hasModal(rb.snapshot(), pred) {
+		if hasModal(rb.Snapshot(), pred) {
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -851,7 +842,7 @@ func waitForModal(ctx context.Context, rb *rollingBuffer, pred modalPredicate, l
 // hasModal reports whether the rolling-buffer snapshot currently shows a
 // permission modal. Two predicate variants, both ANSI-strip first.
 func hasModal(snap []byte, pred modalPredicate) bool {
-	stripped := ansiRe.ReplaceAll(snap, nil)
+	stripped := tuidriver.StripANSI(snap)
 	switch pred {
 	case modalPredBoxDrawing:
 		return bytes.ContainsAny(stripped, string(boxDrawingBytes))
@@ -881,7 +872,7 @@ func hasModal(snap []byte, pred modalPredicate) bool {
 // proceed-marker is robust against varying snapshot-vs-modal timing.
 func extractModalText(snap []byte) string {
 	stripped := oscRe.ReplaceAll(snap, nil)
-	stripped = ansiRe.ReplaceAll(stripped, nil)
+	stripped = tuidriver.StripANSI(stripped)
 	full := string(stripped)
 
 	// Bash modal uses no-space form; Read modal uses spaced form.
@@ -981,7 +972,7 @@ func cleanModalLines(s string) string {
 // extractToolName: best-effort. Look for known tool name tokens in the
 // modal region; return the first match. Empty string if none found.
 func extractToolName(snap []byte) string {
-	stripped := ansiRe.ReplaceAll(snap, nil)
+	stripped := tuidriver.StripANSI(snap)
 	tools := []string{"Bash", "Read", "Write", "Edit", "WebFetch", "WebSearch", "Glob", "Grep", "Task"}
 	// Restrict the search to the modal region (last ~1 KB before the
 	// "Doyouwanttoproceed" question).
@@ -1090,7 +1081,7 @@ func typePrompt(ptmx *os.File, prompt string) error {
 // hasSpinnerGlyph: copied from cmd/spike-cancel/main.go — keep in sync until
 // library extraction.
 func hasSpinnerGlyph(snap []byte) bool {
-	stripped := ansiRe.ReplaceAll(snap, nil)
+	stripped := tuidriver.StripANSI(snap)
 	return bytes.Contains(stripped, spinnerGlyph)
 }
 
@@ -1137,44 +1128,6 @@ func msgIDOf(ev map[string]any) string {
 	return id
 }
 
-// --- rolling buffer ---
-// copied from cmd/spike-cancel/main.go — keep in sync until library extraction
-
-type rollingBuffer struct {
-	mu           sync.Mutex
-	buf          []byte
-	lastAppendAt time.Time
-}
-
-func (r *rollingBuffer) append(p []byte) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.buf = append(r.buf, p...)
-	if len(r.buf) > rollingBufferCap {
-		fresh := make([]byte, rollingBufferCap)
-		copy(fresh, r.buf[len(r.buf)-rollingBufferCap:])
-		r.buf = fresh
-	}
-	r.lastAppendAt = time.Now()
-}
-
-func (r *rollingBuffer) snapshot() []byte {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]byte, len(r.buf))
-	copy(out, r.buf)
-	return out
-}
-
-func (r *rollingBuffer) quietFor() time.Duration {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.lastAppendAt.IsZero() {
-		return 0
-	}
-	return time.Since(r.lastAppendAt)
-}
-
 // --- pattern matching ---
 // copied from cmd/spike-cancel/main.go — keep in sync until library extraction
 
@@ -1191,16 +1144,8 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	return string(m[1]), minutes*60 + seconds, true
 }
 
-// hasTrustModal: anchored on the modal HEADER "Quicksafetycheck" — NOT
-// the post-accept confirmation. See cmd/spike-one-turn/main.go for
-// derivation (loop 3 C-1).
-func hasTrustModal(snap []byte) bool {
-	stripped := ansiRe.ReplaceAll(snap, nil)
-	return bytes.Contains(stripped, []byte("Quicksafetycheck"))
-}
-
 func isIdle(snap []byte) bool {
-	stripped := ansiRe.ReplaceAll(snap, nil)
+	stripped := tuidriver.StripANSI(snap)
 	if !bytes.Contains(stripped, idleGlyph) {
 		return false
 	}
@@ -1255,11 +1200,11 @@ func (t *tracker) observeSpinner(visible bool, totalSeconds int) {
 // regardless of which state the probe thinks it's in. Spinner-freeze
 // stays as a separate signal (claude says it's thinking but isn't
 // progressing). No wall-clock cap — see ptyQuietLimit comment.
-func (t *tracker) checkWatchdog(rb *rollingBuffer) error {
+func (t *tracker) checkWatchdog(rb *tuidriver.Buffer) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := time.Now()
-	if quiet := rb.quietFor(); quiet > ptyQuietLimit {
+	if quiet := rb.QuietFor(); quiet > ptyQuietLimit {
 		return fmt.Errorf("watchdog: PTY quiet for %s (last state: %s)",
 			quiet.Round(time.Second), t.currentState)
 	}
@@ -1303,24 +1248,7 @@ func projectsDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".claude", "projects", encodeCwd(cwd)), nil
-}
-
-// encodeCwd: claude's empirically-confirmed rule — every non-alphanumeric
-// byte → '-' (one-to-one). See cmd/spike-one-turn/main.go for the
-// derivation (loop 2 exp B-4, 2026-05-18).
-func encodeCwd(cwd string) string {
-	var b strings.Builder
-	b.Grow(len(cwd))
-	for i := 0; i < len(cwd); i++ {
-		c := cwd[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
-			b.WriteByte(c)
-		} else {
-			b.WriteByte('-')
-		}
-	}
-	return b.String()
+	return filepath.Join(home, ".claude", "projects", tuidriver.EncodeCwd(cwd)), nil
 }
 
 // newSessionID is like spike-cancel's resolveSession but takes a single
