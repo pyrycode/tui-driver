@@ -41,13 +41,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/creack/pty"
 	"github.com/google/uuid"
+	"github.com/pyrycode/tui-driver/pkg/tuidriver"
 )
 
 const (
-	// copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
-	rollingBufferCap   = 4096
 	statePollInterval  = 50 * time.Millisecond
 	jsonlTailInterval  = 50 * time.Millisecond
 	sessionFileWait    = 10 * time.Second
@@ -66,16 +64,10 @@ const (
 	// typePrompt delay (see typePrompt) — this stability window is a
 	// secondary belt-and-suspenders gate at minimal overhead.
 	idleStableWindow = 250 * time.Millisecond
-
-	ptyRows = 40
-	ptyCols = 120
 )
 
 // copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
 var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
-
-// copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
-var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
 
 // copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
 var idleGlyph = []byte("\xe2\x9d\xaf")
@@ -145,7 +137,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
 	defer cancelCause(errors.New("run: returning"))
 
-	rb := &rollingBuffer{}
+	rb := tuidriver.NewBuffer(0)
 	tr := newTracker()
 	tr.recordTransition("start")
 
@@ -161,14 +153,11 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 		"--session-id", sessionID,
 		"--permission-mode", "bypassPermissions",
 	)
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	tuidriver.EnsureClaudeEnv(cmd)
 
-	ptmx, err := pty.Start(cmd)
+	ptmx, err := tuidriver.StartPTY(cmd)
 	if err != nil {
 		return fmt.Errorf("pty.Start: %w", err)
-	}
-	if err := pty.Setsize(ptmx, &pty.Winsize{Rows: ptyRows, Cols: ptyCols}); err != nil {
-		logger.Printf("warning: pty.Setsize: %v", err)
 	}
 
 	cmdExited := make(chan error, 1)
@@ -205,7 +194,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			n, rerr := ptmx.Read(buf)
 			if n > 0 {
 				chunk := buf[:n]
-				rb.append(chunk)
+				rb.Append(chunk)
 				_, _ = os.Stderr.Write(chunk)
 			}
 			if rerr != nil {
@@ -226,8 +215,8 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			case <-rootCtx.Done():
 				return
 			case <-ticker.C:
-				snap := rb.snapshot()
-				stripped := ansiRe.ReplaceAll(snap, nil)
+				snap := rb.Snapshot()
+				stripped := tuidriver.StripANSI(snap)
 				_, total, ok := matchSpinner(stripped)
 				tr.observeSpinner(ok, total)
 				if werr := tr.checkWatchdog(); werr != nil {
@@ -242,14 +231,14 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	// --- linear state machine (session-level) ---
 
 	if err := waitUntil(rootCtx, func() bool {
-		return isIdle(rb.snapshot())
+		return isIdle(rb.Snapshot())
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
 	tr.recordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
-	if hasTrustModal(rb.snapshot()) {
+	if tuidriver.HasTrustModal(rb.Snapshot()) {
 		switch trustFolderPolicy {
 		case "fail":
 			return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike. Or pass `-trust-folder accept` to auto-trust")
@@ -260,8 +249,8 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			tr.recordTransition("trust-folder-accepted")
 			logger.Printf("trust-folder-accepted bytes=31 0d")
 			if err := waitUntil(rootCtx, func() bool {
-				snap := rb.snapshot()
-				return !hasTrustModal(snap) && isIdle(snap)
+				snap := rb.Snapshot()
+				return !tuidriver.HasTrustModal(snap) && isIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
 			}
@@ -325,7 +314,7 @@ func runTurn(
 	turn int,
 	prompt string,
 	ptmx *os.File,
-	rb *rollingBuffer,
+	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
 	tr *tracker,
 	postPromptHook func() error,
@@ -364,7 +353,7 @@ drain:
 		ticker := time.NewTicker(statePollInterval)
 		defer ticker.Stop()
 		for {
-			if !isIdle(rb.snapshot()) {
+			if !isIdle(rb.Snapshot()) {
 				logger.Printf("turn=%d ❯-disappeared", turn)
 				return
 			}
@@ -412,7 +401,7 @@ drain:
 		if !gotEndTurn {
 			return false
 		}
-		if !isIdle(rb.snapshot()) {
+		if !isIdle(rb.Snapshot()) {
 			idleSince = time.Time{}
 			return false
 		}
@@ -522,33 +511,6 @@ func msgIDOf(ev map[string]any) string {
 	return id
 }
 
-// --- rolling buffer ---
-// copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
-
-type rollingBuffer struct {
-	mu  sync.Mutex
-	buf []byte
-}
-
-func (r *rollingBuffer) append(p []byte) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.buf = append(r.buf, p...)
-	if len(r.buf) > rollingBufferCap {
-		fresh := make([]byte, rollingBufferCap)
-		copy(fresh, r.buf[len(r.buf)-rollingBufferCap:])
-		r.buf = fresh
-	}
-}
-
-func (r *rollingBuffer) snapshot() []byte {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]byte, len(r.buf))
-	copy(out, r.buf)
-	return out
-}
-
 // --- pattern matching ---
 // copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
 
@@ -565,18 +527,9 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	return string(m[1]), minutes*60 + seconds, true
 }
 
-// hasTrustModal: anchored on the modal HEADER "Quicksafetycheck" — NOT
-// the post-accept confirmation "Yes, I trust this folder✔" which lingers
-// in the rolling buffer. See cmd/spike-one-turn/main.go for derivation
-// (loop 2 exp B-5 introduced detection; loop 3 C-1 refined to header-only).
-func hasTrustModal(snap []byte) bool {
-	stripped := ansiRe.ReplaceAll(snap, nil)
-	return bytes.Contains(stripped, []byte("Quicksafetycheck"))
-}
-
 // isIdle: ❯ glyph present AND spinner regex does not match.
 func isIdle(snap []byte) bool {
-	stripped := ansiRe.ReplaceAll(snap, nil)
+	stripped := tuidriver.StripANSI(snap)
 	if !bytes.Contains(stripped, idleGlyph) {
 		return false
 	}
@@ -673,24 +626,7 @@ func projectsDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".claude", "projects", encodeCwd(cwd)), nil
-}
-
-// encodeCwd: claude's empirically-confirmed rule — every non-alphanumeric
-// byte → '-' (one-to-one). See cmd/spike-one-turn/main.go for the
-// derivation (loop 2 exp B-4, 2026-05-18).
-func encodeCwd(cwd string) string {
-	var b strings.Builder
-	b.Grow(len(cwd))
-	for i := 0; i < len(cwd); i++ {
-		c := cwd[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
-			b.WriteByte(c)
-		} else {
-			b.WriteByte('-')
-		}
-	}
-	return b.String()
+	return filepath.Join(home, ".claude", "projects", tuidriver.EncodeCwd(cwd)), nil
 }
 
 func resolveSession(flagValue string, dir string) (sessionID string, jsonlPath string, err error) {
