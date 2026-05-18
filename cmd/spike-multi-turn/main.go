@@ -80,13 +80,22 @@ var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
 // copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
 var idleGlyph = []byte("\xe2\x9d\xaf")
 
-// The three probe prompts. The strings are the ticket AC's verbatim test set —
-// do not modify them; README observations are reproducible against these
-// exact prompts.
+// The probe prompts.
+//
+// Prompts 1-3 are spike #2's ticket AC verbatim test set — README
+// observations for spike #2 are reproducible against these exact strings,
+// don't change their wording. Prompts 4+ are appended during follow-up
+// experiments for additional coverage.
+//
+// Prompt 4 (loop 2 exp B-2, 2026-05-18): parallel-tool stress to validate
+// pre-spike finding #2's tool-use interleaving observation. Two independent
+// reads should plausibly trigger parallel tool_use blocks within one
+// assistant message (msg_id-grouped extraction must tolerate this).
 var prompts = []string{
 	"say hello",
 	"list the files in /tmp",
 	"think carefully and compute 1+2+3+...+100, showing your reasoning",
+	"read /etc/hosts and /etc/passwd and summarize the differences in one sentence",
 }
 
 func main() {
@@ -223,6 +232,10 @@ func run(sessionIDFlag string) error {
 	}
 	tr.recordTransition("idle-detected")
 	logger.Printf("idle-detected")
+
+	if err := detectTrustModal(rb.snapshot()); err != nil {
+		return err
+	}
 
 	// Shared events channel for the whole session; one tailer goroutine
 	// services all three turns. Tailer is started inside turn 1's
@@ -519,6 +532,17 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	return string(m[1]), minutes*60 + seconds, true
 }
 
+// detectTrustModal: see cmd/spike-one-turn/main.go for derivation (loop 2 exp B-5).
+func detectTrustModal(snap []byte) error {
+	stripped := ansiRe.ReplaceAll(snap, nil)
+	if bytes.Contains(stripped, []byte("trust this folder")) ||
+		bytes.Contains(stripped, []byte("trustthisfolder")) ||
+		bytes.Contains(stripped, []byte("Quicksafetycheck")) {
+		return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike")
+	}
+	return nil
+}
+
 // isIdle: ❯ glyph present AND spinner regex does not match.
 func isIdle(snap []byte) bool {
 	stripped := ansiRe.ReplaceAll(snap, nil)
@@ -621,15 +645,18 @@ func projectsDir() (string, error) {
 	return filepath.Join(home, ".claude", "projects", encodeCwd(cwd)), nil
 }
 
+// encodeCwd: claude's empirically-confirmed rule — every non-alphanumeric
+// byte → '-' (one-to-one). See cmd/spike-one-turn/main.go for the
+// derivation (loop 2 exp B-4, 2026-05-18).
 func encodeCwd(cwd string) string {
 	var b strings.Builder
 	b.Grow(len(cwd))
 	for i := 0; i < len(cwd); i++ {
 		c := cwd[i]
-		if c == '/' || c == '.' || c == ' ' {
-			b.WriteByte('-')
-		} else {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
 			b.WriteByte(c)
+		} else {
+			b.WriteByte('-')
 		}
 	}
 	return b.String()

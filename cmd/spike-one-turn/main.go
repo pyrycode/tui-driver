@@ -193,6 +193,10 @@ func run(sessionIDFlag string) error {
 	tr.recordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
+	if err := detectTrustModal(rb.snapshot()); err != nil {
+		return err
+	}
+
 	if _, err := ptmx.Write([]byte(promptText)); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
 	}
@@ -314,6 +318,27 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	return string(m[1]), minutes*60 + seconds, true
 }
 
+// detectTrustModal: claude shows a "trust this folder" dialog on first
+// use of any previously-unseen cwd. The spike's isIdle predicate matches
+// inside it (claude renders ❯ in the modal's input field), so without
+// this check the spike would type its prompt into the trust modal and
+// time out opaquely on "session JSONL did not appear within 10s." Fire
+// this right after idle-detected and return a clear error pointing at
+// the fix (run claude interactively in the cwd once, accept trust).
+//
+// Handles both Bash-style space-stripped rendering (Itrustthisfolder)
+// and Read-style space-preserved rendering (I trust this folder).
+// See loop 2 exp B-5 (2026-05-18) for derivation.
+func detectTrustModal(snap []byte) error {
+	stripped := ansiRe.ReplaceAll(snap, nil)
+	if bytes.Contains(stripped, []byte("trust this folder")) ||
+		bytes.Contains(stripped, []byte("trustthisfolder")) ||
+		bytes.Contains(stripped, []byte("Quicksafetycheck")) {
+		return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike")
+	}
+	return nil
+}
+
 // isIdle: ❯ glyph is present AND spinner regex does not match. The TUI redraws
 // the input line below the spinner during thinking, so ❯ alone is not enough.
 func isIdle(snap []byte) bool {
@@ -423,15 +448,21 @@ func projectsDir() (string, error) {
 	return filepath.Join(home, ".claude", "projects", encodeCwd(cwd)), nil
 }
 
+// encodeCwd matches claude's empirically-confirmed projects-dir
+// encoding rule (loop 2 exp B-4, 2026-05-18): every non-alphanumeric
+// byte → '-' (one-to-one substitution, not run-collapsed). Tested
+// against /private/tmp/encode test (with) [brackets] & amp+plus_under
+// which claude wrote to `-private-tmp-encode-test--with---brackets----amp-plus-under`
+// — every special char including `_` became exactly one '-'.
 func encodeCwd(cwd string) string {
 	var b strings.Builder
 	b.Grow(len(cwd))
 	for i := 0; i < len(cwd); i++ {
 		c := cwd[i]
-		if c == '/' || c == '.' || c == ' ' {
-			b.WriteByte('-')
-		} else {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
 			b.WriteByte(c)
+		} else {
+			b.WriteByte('-')
 		}
 	}
 	return b.String()
