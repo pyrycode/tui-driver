@@ -27,6 +27,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -65,6 +66,37 @@ var oscRe = regexp.MustCompile(`\x1b\][^\x07]*\x07`)
 var idleGlyph = []byte("\xe2\x9d\xaf")
 var spinnerGlyph = []byte("\xe2\x9c\xbb")
 var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
+
+// Picker-parser regexes (loop 4 D-1, 2026-05-18).
+//
+// Each slash-command line in claude's `/` picker is rendered as:
+//
+//   \x1b[38;5;<color>m/<command><CSI-alignment>[(<category>)<space>]<description>\x1b[39m
+//
+// where:
+//   - color=153 (light blue) marks the HIGHLIGHTED row (default selection,
+//     the one Enter would commit)
+//   - color=246 (gray) marks every other row
+//   - <CSI-alignment> is `\x1b[<N>C` cursor-forward to align the desc column
+//   - <description> uses `\x1b[1C` between every WORD instead of a space
+//     (same root cause as spike #1 finding #8 — CSI cursor-forward
+//     substitutes for whitespace in claude's renderer)
+//
+// Parser strategy: regex over the raw snapshot to capture color+command+
+// content, then convert `\x1b[<N>C` to single spaces in the content and
+// strip any remaining ANSI for plain-text output.
+var pickerCmdRe = regexp.MustCompile(
+	`\x1b\[38;5;(\d+)m` + // color code (group 1)
+		`(/[a-zA-Z][a-zA-Z0-9_\-]*)` + // /command-name (group 2)
+		`((?s:.*?))` + // content (group 3, non-greedy across newlines)
+		`\x1b\[39m`, // color reset
+)
+
+var csiCursorFwdRe = regexp.MustCompile(`\x1b\[(\d+)C`)
+
+// pickerCategoryRe matches the optional "(category)" prefix at the start
+// of a description (e.g. "(figma) **MANDATORY...").
+var pickerCategoryRe = regexp.MustCompile(`^\(([^)]+)\)\s*(.*)`)
 
 func main() {
 	triggerFlag := flag.String("trigger", "/",
@@ -261,6 +293,38 @@ func run(trigger string, trustFolderPolicy string) error {
 	logger.Printf("picker-shape has_box_drawing=%v line_count=%d longest_line=%d numbered_options=%v slash_command_lines=%d",
 		hasBox, len(lines), longest, numberedOptions, slashLines)
 
+	// Loop 4 D-1: parse the picker into structured items and dump as JSON
+	// to a sibling file. The mobile-app use case: pyry acp forwards this
+	// list to the host UI, user picks an item, pyry acp sends the matching
+	// keystrokes back through the PTY.
+	items := parsePickerItems(snap)
+	logger.Printf("picker-parsed item_count=%d", len(items))
+	for i, it := range items {
+		marker := " "
+		if it.Highlighted {
+			marker = "*"
+		}
+		cat := ""
+		if it.Category != "" {
+			cat = "[" + it.Category + "] "
+		}
+		// Truncate description for compact logging
+		desc := it.Description
+		if len(desc) > 80 {
+			desc = desc[:80] + "…"
+		}
+		logger.Printf("picker-item[%02d]%s %s %s%s", i, marker, it.Command, cat, desc)
+	}
+	if len(items) > 0 {
+		jsonPath := strings.TrimSuffix(dumpPath, ".bin") + ".items.json"
+		jsonBytes, _ := json.MarshalIndent(items, "", "  ")
+		if err := os.WriteFile(jsonPath, jsonBytes, 0o644); err != nil {
+			logger.Printf("warning: write items json: %v", err)
+		} else {
+			logger.Printf("picker-items-json path=%s", jsonPath)
+		}
+	}
+
 	// Look for some specific picker hints we might recognize.
 	hints := []string{
 		"to apply", "to select", "to navigate", "Esc to", "esc to",
@@ -440,6 +504,65 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 		}
 	}
 	return verb, totalSeconds, true
+}
+
+// PickerItem represents one row of claude's `/` slash-command picker as
+// extracted from PTY bytes. Loop 4 D-1 deliverable shape for `pyry acp`
+// to forward to a mobile host UI.
+type PickerItem struct {
+	Command     string `json:"command"`
+	Category    string `json:"category,omitempty"`
+	Description string `json:"description"`
+	Highlighted bool   `json:"highlighted"`
+}
+
+// parsePickerItems extracts structured items from a raw PTY snapshot of
+// claude's `/` slash-command picker. Returns the items in render order
+// (top-to-bottom in the picker). Items past the visible-window cutoff
+// in the 4096-byte rolling buffer won't appear here — picker scrolling
+// would require a follow-up snapshot after sending arrow-down keys.
+func parsePickerItems(snap []byte) []PickerItem {
+	// Strip OSC sequences first (window title, etc. — irrelevant noise).
+	cleaned := oscRe.ReplaceAll(snap, nil)
+
+	var items []PickerItem
+	for _, m := range pickerCmdRe.FindAllSubmatch(cleaned, -1) {
+		color := string(m[1])
+		cmd := string(m[2])
+		content := m[3]
+
+		// Convert CSI cursor-forward to single spaces (the "spaces between
+		// words" rendering). Then strip any remaining ANSI.
+		content = csiCursorFwdRe.ReplaceAll(content, []byte(" "))
+		content = ansiRe.ReplaceAll(content, nil)
+		// Also strip stray CR/LF — descriptions can wrap onto subsequent
+		// lines via the wider "right column" rendering, but we want a
+		// single-line description for the API. Replace CR/LF with space
+		// and collapse multi-spaces.
+		text := strings.ReplaceAll(strings.ReplaceAll(string(content), "\r", " "), "\n", " ")
+		// Collapse runs of whitespace.
+		for strings.Contains(text, "  ") {
+			text = strings.ReplaceAll(text, "  ", " ")
+		}
+		text = strings.TrimSpace(text)
+
+		// Try to peel off the "(category) " prefix.
+		var category, description string
+		if catMatch := pickerCategoryRe.FindStringSubmatch(text); catMatch != nil {
+			category = catMatch[1]
+			description = catMatch[2]
+		} else {
+			description = text
+		}
+
+		items = append(items, PickerItem{
+			Command:     cmd,
+			Category:    category,
+			Description: description,
+			Highlighted: color == "153", // light blue = default-selected row
+		})
+	}
+	return items
 }
 
 // Compile-time references so we keep parity with the rest of the spike suite.
