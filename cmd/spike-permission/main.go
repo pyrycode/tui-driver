@@ -131,12 +131,6 @@ var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)
 // for text extraction to work.
 var oscRe = regexp.MustCompile(`\x1b\][^\x07]*\x07`)
 
-// copied from cmd/spike-cancel/main.go — keep in sync until library extraction
-var idleGlyph = []byte("\xe2\x9d\xaf")
-
-// copied from cmd/spike-cancel/main.go — keep in sync until library extraction
-var spinnerGlyph = []byte("\xe2\x9c\xbb")
-
 // boxDrawingBytes: the Unicode box-drawing codepoints the modal predicate's
 // cheap variant searches for. Combined with the input box's own box-drawing
 // chars at idle, this predicate has known false-positive risk — captured
@@ -444,7 +438,7 @@ func runSession(
 	// Wait for idle (❯ glyph + no spinner). Same predicate as the other
 	// spikes.
 	if err := waitUntil(ctx, func() bool {
-		return isIdle(rb.Snapshot())
+		return tuidriver.IsIdle(rb.Snapshot())
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
@@ -463,7 +457,7 @@ func runSession(
 			logger.Printf("trust-folder-accepted tag=%s bytes=31 0d", tag)
 			if err := waitUntil(ctx, func() bool {
 				snap := rb.Snapshot()
-				return !tuidriver.HasTrustModal(snap) && isIdle(snap)
+				return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
 			}
@@ -694,7 +688,7 @@ func runAutoRespond(
 		if !gotEndTurn {
 			return false
 		}
-		if !isIdle(rb.Snapshot()) {
+		if !tuidriver.IsIdle(rb.Snapshot()) {
 			idleSince = time.Time{}
 			return false
 		}
@@ -1082,7 +1076,7 @@ func typePrompt(ptmx *os.File, prompt string) error {
 // library extraction.
 func hasSpinnerGlyph(snap []byte) bool {
 	stripped := tuidriver.StripANSI(snap)
-	return bytes.Contains(stripped, spinnerGlyph)
+	return bytes.Contains(stripped, tuidriver.SpinnerGlyph)
 }
 
 // isToolUse: copied from cmd/spike-cancel/main.go — keep in sync until
@@ -1144,13 +1138,6 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	return string(m[1]), minutes*60 + seconds, true
 }
 
-func isIdle(snap []byte) bool {
-	stripped := tuidriver.StripANSI(snap)
-	if !bytes.Contains(stripped, idleGlyph) {
-		return false
-	}
-	return !spinnerRe.Match(stripped)
-}
 
 // --- tracker (state + watchdog bookkeeping) ---
 // copied from cmd/spike-cancel/main.go — keep in sync until library extraction

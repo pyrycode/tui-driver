@@ -77,8 +77,6 @@ const (
 )
 
 var oscRe = regexp.MustCompile(`\x1b\][^\x07]*\x07`)
-var idleGlyph = []byte("\xe2\x9d\xaf")
-var spinnerGlyph = []byte("\xe2\x9c\xbb")
 var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
 
 func main() {
@@ -191,7 +189,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 		}
 	}()
 
-	if err := waitUntil(rootCtx, func() bool { return isIdle(rb.Snapshot()) }); err != nil {
+	if err := waitUntil(rootCtx, func() bool { return tuidriver.IsIdle(rb.Snapshot()) }); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
 	tr.recordTransition("idle-detected")
@@ -209,7 +207,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 			logger.Printf("trust-folder-accepted")
 			if err := waitUntil(rootCtx, func() bool {
 				snap := rb.Snapshot()
-				return !tuidriver.HasTrustModal(snap) && isIdle(snap)
+				return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait idle post-trust: %w", err)
 			}
@@ -418,17 +416,6 @@ func waitUntil(ctx context.Context, predicate func() bool) error {
 		case <-ticker.C:
 		}
 	}
-}
-
-func isIdle(snap []byte) bool {
-	stripped := tuidriver.StripANSI(snap)
-	if !bytes.Contains(stripped, idleGlyph) {
-		return false
-	}
-	if bytes.Contains(stripped, spinnerGlyph) {
-		return false
-	}
-	return true
 }
 
 // hasAskUserModal: claude's AskUserQuestion tool renders an interactive

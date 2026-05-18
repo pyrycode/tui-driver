@@ -70,7 +70,6 @@ const (
 var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
 
 // copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
-var idleGlyph = []byte("\xe2\x9d\xaf")
 
 // The probe prompts.
 //
@@ -231,7 +230,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	// --- linear state machine (session-level) ---
 
 	if err := waitUntil(rootCtx, func() bool {
-		return isIdle(rb.Snapshot())
+		return tuidriver.IsIdle(rb.Snapshot())
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
@@ -250,7 +249,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			logger.Printf("trust-folder-accepted bytes=31 0d")
 			if err := waitUntil(rootCtx, func() bool {
 				snap := rb.Snapshot()
-				return !tuidriver.HasTrustModal(snap) && isIdle(snap)
+				return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
 			}
@@ -353,7 +352,7 @@ drain:
 		ticker := time.NewTicker(statePollInterval)
 		defer ticker.Stop()
 		for {
-			if !isIdle(rb.Snapshot()) {
+			if !tuidriver.IsIdle(rb.Snapshot()) {
 				logger.Printf("turn=%d ❯-disappeared", turn)
 				return
 			}
@@ -378,7 +377,7 @@ drain:
 	// Accumulate assistant events and detect turn-complete.
 	//
 	// Predicate: at least one assistant line with stop_reason=end_turn has
-	// been seen for this turn AND isIdle(rb) is true. The conjunction is
+	// been seen for this turn AND tuidriver.IsIdle(rb) is true. The conjunction is
 	// load-bearing — JSONL end_turn means "model done speaking"; isIdle
 	// (❯ visible, spinner gone) means "TUI ready to accept input." Both
 	// must hold to safely write the next prompt.
@@ -401,7 +400,7 @@ drain:
 		if !gotEndTurn {
 			return false
 		}
-		if !isIdle(rb.Snapshot()) {
+		if !tuidriver.IsIdle(rb.Snapshot()) {
 			idleSince = time.Time{}
 			return false
 		}
@@ -527,14 +526,6 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	return string(m[1]), minutes*60 + seconds, true
 }
 
-// isIdle: ❯ glyph present AND spinner regex does not match.
-func isIdle(snap []byte) bool {
-	stripped := tuidriver.StripANSI(snap)
-	if !bytes.Contains(stripped, idleGlyph) {
-		return false
-	}
-	return !spinnerRe.Match(stripped)
-}
 
 // --- tracker (state + watchdog bookkeeping) ---
 // copied from cmd/spike-one-turn/main.go — keep in sync until library extraction

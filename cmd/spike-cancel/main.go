@@ -99,17 +99,6 @@ const (
 // copied from cmd/spike-multi-turn/main.go — keep in sync until library extraction
 var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
 
-// copied from cmd/spike-multi-turn/main.go — keep in sync until library extraction
-
-// copied from cmd/spike-multi-turn/main.go — keep in sync until library extraction
-var idleGlyph = []byte("\xe2\x9d\xaf")
-
-// spinnerGlyph: the bare ✻ codepoint as UTF-8 bytes. Used as the "claude
-// has started processing" signal because the full spinnerRe regex never
-// matches in practice (see spike-multi-turn finding 8). The glyph itself
-// is the only stable signal across every verb / aphorism / form.
-var spinnerGlyph = []byte("\xe2\x9c\xbb")
-
 // ProbeKind selects per-probe behavior inside runProbe.
 type ProbeKind int
 
@@ -303,7 +292,7 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 	// --- linear state machine (session-level) ---
 
 	if err := waitUntil(rootCtx, func() bool {
-		return isIdle(rb.Snapshot())
+		return tuidriver.IsIdle(rb.Snapshot())
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
@@ -322,7 +311,7 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 			logger.Printf("trust-folder-accepted bytes=31 0d")
 			if err := waitUntil(rootCtx, func() bool {
 				snap := rb.Snapshot()
-				return !tuidriver.HasTrustModal(snap) && isIdle(snap)
+				return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
 			}
@@ -582,7 +571,7 @@ func waitReappeared(
 	defer ticker.Stop()
 
 	stable := func() bool {
-		if !isIdle(rb.Snapshot()) {
+		if !tuidriver.IsIdle(rb.Snapshot()) {
 			return false
 		}
 		return rb.QuietFor() >= ptyQuietWindow
@@ -631,7 +620,7 @@ func logCancelEvent(logger *log.Logger, probeN int, ev map[string]any) {
 
 // runRecovery drives Probe 3: same shape as spike-multi-turn's runTurn
 // from prompt-written onward. Detects turn-complete on the conjunction
-// `gotEndTurn ∧ isIdle(rb)` stable for idleStableWindow, then extracts
+// `gotEndTurn ∧ tuidriver.IsIdle(rb)` stable for idleStableWindow, then extracts
 // the assistant text by msg_id grouping.
 func runRecovery(
 	ctx context.Context,
@@ -649,7 +638,7 @@ func runRecovery(
 		ticker := time.NewTicker(statePollInterval)
 		defer ticker.Stop()
 		for {
-			if !isIdle(rb.Snapshot()) {
+			if !tuidriver.IsIdle(rb.Snapshot()) {
 				logger.Printf("probe=%d ❯-disappeared", probeN)
 				return
 			}
@@ -678,7 +667,7 @@ func runRecovery(
 		if !gotEndTurn {
 			return false
 		}
-		if !isIdle(rb.Snapshot()) {
+		if !tuidriver.IsIdle(rb.Snapshot()) {
 			idleSince = time.Time{}
 			return false
 		}
@@ -753,7 +742,7 @@ func clearInputLine(ptmx *os.File) error {
 // finding 8).
 func hasSpinnerGlyph(snap []byte) bool {
 	stripped := tuidriver.StripANSI(snap)
-	return bytes.Contains(stripped, spinnerGlyph)
+	return bytes.Contains(stripped, tuidriver.SpinnerGlyph)
 }
 
 // isToolUse reports whether an assistant event carries
@@ -830,14 +819,6 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	}
 	seconds, _ := strconv.Atoi(string(m[3]))
 	return string(m[1]), minutes*60 + seconds, true
-}
-
-func isIdle(snap []byte) bool {
-	stripped := tuidriver.StripANSI(snap)
-	if !bytes.Contains(stripped, idleGlyph) {
-		return false
-	}
-	return !spinnerRe.Match(stripped)
 }
 
 // --- tracker (state + watchdog bookkeeping) ---
