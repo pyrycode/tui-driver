@@ -143,18 +143,32 @@ type probeSpec struct {
 	prompt string
 }
 
-// Verbatim from the ticket AC; do not modify — README observations are
-// reproducible against these exact prompts.
+// Probes 1-3 are spike #11's ticket AC verbatim test set — README
+// observations for spike #11 are reproducible against these strings,
+// don't change their wording. Probes 4+ are appended during follow-up
+// experiments for additional coverage.
+//
+// Probe 4 (loop 3 C-4, 2026-05-18): cancel-then-resend-same-prompt —
+// after Probe 3's recovery, retry the original thinking prompt to see
+// whether claude does the work fresh or remembers it was cancelled.
+// Probe 5 (loop 3 C-4): cancel-then-followup-referencing-cancelled —
+// ask claude what it was doing when interrupted. Tests whether the
+// cancellation marker (`user(text "[Request interrupted by user]")`)
+// is part of claude's conversation memory.
 var probes = []probeSpec{
 	{kindThinking, "think carefully and write a 1000-word essay on the philosophy of monads"},
 	{kindToolUse, "recursively list all files under /tmp"},
 	{kindRecovery, "say hello"},
+	{kindRecovery, "think carefully and write a 1000-word essay on the philosophy of monads"},
+	{kindRecovery, "What were you working on just now when I interrupted you? Answer in one sentence."},
 }
 
 func main() {
 	sessionIDFlag := flag.String("session-id", "", "UUID to pin claude's session ID and JSONL filename (default: generate one)")
 	cancelKeystrokeFlag := flag.String("cancel-keystroke", "esc",
 		"cancel keystroke to send: esc | double-esc | ctrl-c")
+	trustFolderFlag := flag.String("trust-folder", "fail",
+		"policy when claude's trust-folder dialog appears at idle: 'fail' (default — return clear error) or 'accept' (send `1\\r` to auto-trust this cwd, then proceed)")
 	flag.Parse()
 
 	keystroke, hex, err := parseCancelKeystroke(*cancelKeystrokeFlag)
@@ -164,7 +178,12 @@ func main() {
 		os.Exit(2)
 	}
 
-	if err := run(*sessionIDFlag, keystroke, hex); err != nil {
+	if *trustFolderFlag != "fail" && *trustFolderFlag != "accept" {
+		fmt.Fprintf(os.Stderr, "invalid -trust-folder value %q (want 'fail' or 'accept')\n", *trustFolderFlag)
+		os.Exit(2)
+	}
+
+	if err := run(*sessionIDFlag, keystroke, hex, *trustFolderFlag); err != nil {
 		fmt.Fprintf(os.Stderr, "spike failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -183,7 +202,7 @@ func parseCancelKeystroke(name string) (bytes []byte, hexStr string, err error) 
 	}
 }
 
-func run(sessionIDFlag string, cancelKey []byte, cancelHex string) error {
+func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPolicy string) error {
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
 	startedAt := time.Now()
 
@@ -301,8 +320,25 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string) error {
 	tr.recordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
-	if err := detectTrustModal(rb.snapshot()); err != nil {
-		return err
+	if hasTrustModal(rb.snapshot()) {
+		switch trustFolderPolicy {
+		case "fail":
+			return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike. Or pass `-trust-folder accept` to auto-trust")
+		case "accept":
+			if _, err := ptmx.Write([]byte("1\r")); err != nil {
+				return fmt.Errorf("write trust-accept keystroke: %w", err)
+			}
+			tr.recordTransition("trust-folder-accepted")
+			logger.Printf("trust-folder-accepted bytes=31 0d")
+			if err := waitUntil(rootCtx, func() bool {
+				snap := rb.snapshot()
+				return !hasTrustModal(snap) && isIdle(snap)
+			}); err != nil {
+				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
+			}
+			tr.recordTransition("idle-detected-post-trust")
+			logger.Printf("idle-detected-post-trust")
+		}
 	}
 
 	eventCh := make(chan map[string]any, 32)
@@ -846,15 +882,12 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	return string(m[1]), minutes*60 + seconds, true
 }
 
-// detectTrustModal: see cmd/spike-one-turn/main.go for derivation (loop 2 exp B-5).
-func detectTrustModal(snap []byte) error {
+// hasTrustModal: anchored on the modal HEADER "Quicksafetycheck" — NOT
+// the post-accept confirmation. See cmd/spike-one-turn/main.go for
+// derivation (loop 3 C-1).
+func hasTrustModal(snap []byte) bool {
 	stripped := ansiRe.ReplaceAll(snap, nil)
-	if bytes.Contains(stripped, []byte("trust this folder")) ||
-		bytes.Contains(stripped, []byte("trustthisfolder")) ||
-		bytes.Contains(stripped, []byte("Quicksafetycheck")) {
-		return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike")
-	}
-	return nil
+	return bytes.Contains(stripped, []byte("Quicksafetycheck"))
 }
 
 func isIdle(snap []byte) bool {

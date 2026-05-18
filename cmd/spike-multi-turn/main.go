@@ -87,28 +87,44 @@ var idleGlyph = []byte("\xe2\x9d\xaf")
 // don't change their wording. Prompts 4+ are appended during follow-up
 // experiments for additional coverage.
 //
-// Prompt 4 (loop 2 exp B-2, 2026-05-18): parallel-tool stress to validate
-// pre-spike finding #2's tool-use interleaving observation. Two independent
-// reads should plausibly trigger parallel tool_use blocks within one
-// assistant message (msg_id-grouped extraction must tolerate this).
+// Prompt 4 (loop 2 exp B-2, 2026-05-18): parallel-tool stress, soft
+// wording — claude chose serial reads under this phrasing. Pattern from
+// pre-spike finding #2 still reproduced (tool_use blocks under one
+// msg_id, interleaved with tool_result events) but the parallel-in-flight
+// case (multiple tool_use BEFORE first tool_result) wasn't triggered.
+//
+// Prompt 5 (loop 3 exp C-3, 2026-05-18): same probe with explicit
+// parallel-call wording — "issue both tool calls in a single response
+// before waiting for results." Aim is to observe the parallel-in-flight
+// shape claude can produce (per Anthropic API docs that say tool_use is
+// list-typed) and validate the msg_id-grouped extractor handles N
+// concurrent tool_use blocks within one assistant message.
 var prompts = []string{
 	"say hello",
 	"list the files in /tmp",
 	"think carefully and compute 1+2+3+...+100, showing your reasoning",
 	"read /etc/hosts and /etc/passwd and summarize the differences in one sentence",
+	"Read /etc/hosts and /etc/passwd in parallel — issue both Read tool calls in a single assistant response BEFORE waiting for any result, then summarize the differences in one sentence",
 }
 
 func main() {
 	sessionIDFlag := flag.String("session-id", "", "UUID to pin claude's session ID and JSONL filename (default: generate one)")
+	trustFolderFlag := flag.String("trust-folder", "fail",
+		"policy when claude's trust-folder dialog appears at idle: 'fail' (default — return clear error) or 'accept' (send `1\\r` to auto-trust this cwd, then proceed)")
 	flag.Parse()
 
-	if err := run(*sessionIDFlag); err != nil {
+	if *trustFolderFlag != "fail" && *trustFolderFlag != "accept" {
+		fmt.Fprintf(os.Stderr, "invalid -trust-folder value %q (want 'fail' or 'accept')\n", *trustFolderFlag)
+		os.Exit(2)
+	}
+
+	if err := run(*sessionIDFlag, *trustFolderFlag); err != nil {
 		fmt.Fprintf(os.Stderr, "spike failed: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(sessionIDFlag string) error {
+func run(sessionIDFlag string, trustFolderPolicy string) error {
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
 	startedAt := time.Now()
 
@@ -233,8 +249,25 @@ func run(sessionIDFlag string) error {
 	tr.recordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
-	if err := detectTrustModal(rb.snapshot()); err != nil {
-		return err
+	if hasTrustModal(rb.snapshot()) {
+		switch trustFolderPolicy {
+		case "fail":
+			return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike. Or pass `-trust-folder accept` to auto-trust")
+		case "accept":
+			if _, err := ptmx.Write([]byte("1\r")); err != nil {
+				return fmt.Errorf("write trust-accept keystroke: %w", err)
+			}
+			tr.recordTransition("trust-folder-accepted")
+			logger.Printf("trust-folder-accepted bytes=31 0d")
+			if err := waitUntil(rootCtx, func() bool {
+				snap := rb.snapshot()
+				return !hasTrustModal(snap) && isIdle(snap)
+			}); err != nil {
+				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
+			}
+			tr.recordTransition("idle-detected-post-trust")
+			logger.Printf("idle-detected-post-trust")
+		}
 	}
 
 	// Shared events channel for the whole session; one tailer goroutine
@@ -532,15 +565,13 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	return string(m[1]), minutes*60 + seconds, true
 }
 
-// detectTrustModal: see cmd/spike-one-turn/main.go for derivation (loop 2 exp B-5).
-func detectTrustModal(snap []byte) error {
+// hasTrustModal: anchored on the modal HEADER "Quicksafetycheck" — NOT
+// the post-accept confirmation "Yes, I trust this folder✔" which lingers
+// in the rolling buffer. See cmd/spike-one-turn/main.go for derivation
+// (loop 2 exp B-5 introduced detection; loop 3 C-1 refined to header-only).
+func hasTrustModal(snap []byte) bool {
 	stripped := ansiRe.ReplaceAll(snap, nil)
-	if bytes.Contains(stripped, []byte("trust this folder")) ||
-		bytes.Contains(stripped, []byte("trustthisfolder")) ||
-		bytes.Contains(stripped, []byte("Quicksafetycheck")) {
-		return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike")
-	}
-	return nil
+	return bytes.Contains(stripped, []byte("Quicksafetycheck"))
 }
 
 // isIdle: ❯ glyph present AND spinner regex does not match.
