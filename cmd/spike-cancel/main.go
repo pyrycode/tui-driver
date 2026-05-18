@@ -143,12 +143,24 @@ type probeSpec struct {
 	prompt string
 }
 
-// Verbatim from the ticket AC; do not modify — README observations are
-// reproducible against these exact prompts.
+// Probes 1-3 are spike #11's ticket AC verbatim test set — README
+// observations for spike #11 are reproducible against these strings,
+// don't change their wording. Probes 4+ are appended during follow-up
+// experiments for additional coverage.
+//
+// Probe 4 (loop 3 C-4, 2026-05-18): cancel-then-resend-same-prompt —
+// after Probe 3's recovery, retry the original thinking prompt to see
+// whether claude does the work fresh or remembers it was cancelled.
+// Probe 5 (loop 3 C-4): cancel-then-followup-referencing-cancelled —
+// ask claude what it was doing when interrupted. Tests whether the
+// cancellation marker (`user(text "[Request interrupted by user]")`)
+// is part of claude's conversation memory.
 var probes = []probeSpec{
 	{kindThinking, "think carefully and write a 1000-word essay on the philosophy of monads"},
 	{kindToolUse, "recursively list all files under /tmp"},
 	{kindRecovery, "say hello"},
+	{kindRecovery, "think carefully and write a 1000-word essay on the philosophy of monads"},
+	{kindRecovery, "What were you working on just now when I interrupted you? Answer in one sentence."},
 }
 
 func main() {
