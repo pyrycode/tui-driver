@@ -87,6 +87,8 @@ func main() {
 		"policy when claude's trust-folder dialog appears at idle: 'fail' (default) or 'accept'")
 	answerFlag := flag.String("answer", "1",
 		"which option to pick when the modal appears: digit (1, 2, 3) sent with CR. Use 'dismiss' to send ESC instead.")
+	strictMcpFlag := flag.Bool("strict-mcp-config", false,
+		"pass --strict-mcp-config to claude (sidesteps the 'N MCP server failed' banner)")
 	flag.Parse()
 
 	if *trustFolderFlag != "fail" && *trustFolderFlag != "accept" {
@@ -94,13 +96,13 @@ func main() {
 		os.Exit(2)
 	}
 
-	if err := run(*promptFlag, *trustFolderFlag, *answerFlag); err != nil {
+	if err := run(*promptFlag, *trustFolderFlag, *answerFlag, *strictMcpFlag); err != nil {
 		fmt.Fprintf(os.Stderr, "spike failed: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(prompt, trustFolderPolicy, answer string) error {
+func run(prompt, trustFolderPolicy, answer string, strictMcpConfig bool) error {
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
 	startedAt := time.Now()
 
@@ -121,7 +123,11 @@ func run(prompt, trustFolderPolicy, answer string) error {
 	tr := newTracker()
 	tr.recordTransition("start")
 
-	cmd := exec.Command("claude", "--session-id", sessionID)
+	claudeArgs := []string{"--session-id", sessionID}
+	if strictMcpConfig {
+		claudeArgs = append(claudeArgs, "--strict-mcp-config")
+	}
+	cmd := exec.Command("claude", claudeArgs...)
 	tuidriver.EnsureClaudeEnv(cmd)
 
 	ptmx, err := tuidriver.StartPTY(cmd)
