@@ -58,9 +58,6 @@ const (
 // specific value. Time-tail is `Ns` or `Nm Ns` (groups 2,3).
 var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
 
-// idleGlyph is the UTF-8 encoding of ❯ — claude's input-line prompt marker.
-var idleGlyph = []byte("\xe2\x9d\xaf")
-
 func main() {
 	sessionIDFlag := flag.String("session-id", "", "UUID to pin claude's session ID and JSONL filename (default: generate one)")
 	trustFolderFlag := flag.String("trust-folder", "fail",
@@ -181,7 +178,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	// --- linear state machine ---
 
 	if err := waitUntil(rootCtx, func() bool {
-		return isIdle(rb.Snapshot())
+		return tuidriver.IsIdle(rb.Snapshot())
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
@@ -203,7 +200,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			// must be true (❯ visible + no spinner).
 			if err := waitUntil(rootCtx, func() bool {
 				snap := rb.Snapshot()
-				return !tuidriver.HasTrustModal(snap) && isIdle(snap)
+				return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
 			}
@@ -307,15 +304,6 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	return string(m[1]), minutes*60 + seconds, true
 }
 
-// isIdle: ❯ glyph is present AND spinner regex does not match. The TUI redraws
-// the input line below the spinner during thinking, so ❯ alone is not enough.
-func isIdle(snap []byte) bool {
-	stripped := tuidriver.StripANSI(snap)
-	if !bytes.Contains(stripped, idleGlyph) {
-		return false
-	}
-	return !spinnerRe.Match(stripped)
-}
 
 // --- tracker (state + watchdog bookkeeping) ---
 

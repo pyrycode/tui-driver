@@ -56,8 +56,6 @@ const (
 	settleWindow = 1500 * time.Millisecond
 )
 
-var idleGlyph = []byte("\xe2\x9d\xaf")
-var spinnerGlyph = []byte("\xe2\x9c\xbb")
 var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
 
 func main() {
@@ -170,7 +168,7 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	}()
 
 	// Wait for idle.
-	if err := waitUntil(rootCtx, func() bool { return isIdle(rb.Snapshot()) }); err != nil {
+	if err := waitUntil(rootCtx, func() bool { return tuidriver.IsIdle(rb.Snapshot()) }); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
 	tr.recordTransition("idle-detected")
@@ -189,7 +187,7 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 			logger.Printf("trust-folder-accepted bytes=31 0d")
 			if err := waitUntil(rootCtx, func() bool {
 				snap := rb.Snapshot()
-				return !tuidriver.HasTrustModal(snap) && isIdle(snap)
+				return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
 			}
@@ -398,7 +396,7 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	// the dismiss keystroke works and how long it takes).
 	dismissDeadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(dismissDeadline) {
-		if isIdle(rb.Snapshot()) {
+		if tuidriver.IsIdle(rb.Snapshot()) {
 			logger.Printf("idle-detected-post-dismiss elapsed=%s", time.Since(dismissDeadline.Add(-3*time.Second)).Round(time.Millisecond))
 			break
 		}
@@ -485,16 +483,6 @@ func waitUntil(ctx context.Context, predicate func() bool) error {
 	}
 }
 
-func isIdle(snap []byte) bool {
-	stripped := tuidriver.StripANSI(snap)
-	if !bytes.Contains(stripped, idleGlyph) {
-		return false
-	}
-	if bytes.Contains(stripped, spinnerGlyph) {
-		return false
-	}
-	return true
-}
 
 func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	m := spinnerRe.FindSubmatch(stripped)
