@@ -114,8 +114,11 @@ func run(prompt, trustFolderPolicy, answer string) error {
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
 	defer cancelCause(errors.New("run: returning"))
 
-	tr := newTracker()
-	tr.recordTransition("start")
+	tr := tuidriver.NewTracker(tuidriver.TrackerOpts{
+		PTYQuietLimit:      ptyQuietLimit,
+		SpinnerFreezeLimit: spinnerFreezeLimit,
+	})
+	tr.RecordTransition("start")
 
 	cmd := exec.Command("claude", "--session-id", sessionID)
 	tuidriver.EnsureClaudeEnv(cmd)
@@ -150,8 +153,8 @@ func run(prompt, trustFolderPolicy, answer string) error {
 				snap := rb.Snapshot()
 				stripped := tuidriver.StripANSI(snap)
 				_, total, ok := matchSpinner(stripped)
-				tr.observeSpinner(ok, total)
-				if werr := tr.checkWatchdog(rb); werr != nil {
+				tr.ObserveSpinner(ok, total)
+				if werr := tr.CheckWatchdog(rb); werr != nil {
 					logger.Printf("%v", werr)
 					cancelCause(werr)
 					return
@@ -163,7 +166,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 	if err := tuidriver.WaitUntil(rootCtx, func() bool { return tuidriver.IsIdle(rb.Snapshot()) }); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
-	tr.recordTransition("idle-detected")
+	tr.RecordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
 	if tuidriver.HasTrustModal(rb.Snapshot()) {
@@ -174,7 +177,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 			if _, err := ptmx.Write([]byte("1\r")); err != nil {
 				return fmt.Errorf("write trust-accept: %w", err)
 			}
-			tr.recordTransition("trust-folder-accepted")
+			tr.RecordTransition("trust-folder-accepted")
 			logger.Printf("trust-folder-accepted")
 			if err := tuidriver.WaitUntil(rootCtx, func() bool {
 				snap := rb.Snapshot()
@@ -189,7 +192,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 	if _, err := ptmx.Write([]byte(prompt + "\r")); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
 	}
-	tr.recordTransition("prompt-written")
+	tr.RecordTransition("prompt-written")
 	logger.Printf("prompt-written prompt=%q", prompt)
 
 	// Tail JSONL from start; the deterministic --session-id path means we
@@ -227,7 +230,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 			}
 		}
 	}
-	tr.recordTransition("ask-user-modal-detected")
+	tr.RecordTransition("ask-user-modal-detected")
 	logger.Printf("ask-user-modal-detected")
 
 	// Let the PTY rendering settle so we snapshot a complete modal.
@@ -244,7 +247,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 		logger.Printf("warning: write snapshot: %v", err)
 	}
 	stripped := oscRe.ReplaceAll(tuidriver.StripANSI(snap), nil)
-	tr.recordTransition("modal-snapshot")
+	tr.RecordTransition("modal-snapshot")
 	logger.Printf("modal-snapshot path=%s raw_len=%d stripped_len=%d", dumpPath, len(snap), len(stripped))
 
 	// Look for shape hints in the rendered modal.
@@ -271,7 +274,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 	if _, err := ptmx.Write(answerBytes); err != nil {
 		return fmt.Errorf("write answer: %w", err)
 	}
-	tr.recordTransition("answer-sent")
+	tr.RecordTransition("answer-sent")
 	logger.Printf("answer-sent bytes=%x kind=%q", answerBytes, answer)
 
 	// Wait for end_turn — confirms the answer landed and claude finished.
@@ -284,7 +287,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 		case ev := <-eventCh:
 			if isEndTurn(ev) {
 				gotEnd = true
-				tr.recordTransition("end-turn-detected")
+				tr.RecordTransition("end-turn-detected")
 				logger.Printf("end-turn-detected")
 			}
 		case <-time.After(500 * time.Millisecond):
@@ -317,63 +320,6 @@ func extractAskUserQuestion(ev map[string]any) map[string]any {
 	}
 	return nil
 }
-
-// --- shared primitives ---
-
-type tracker struct {
-	mu                    sync.Mutex
-	currentState          string
-	lastTransitionAt      time.Time
-	lastSpinnerProgressAt time.Time
-	lastSpinnerTotal      int
-	spinnerActive         bool
-}
-
-func newTracker() *tracker { return &tracker{} }
-
-func (t *tracker) recordTransition(state string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.currentState = state
-	t.lastTransitionAt = time.Now()
-}
-
-func (t *tracker) observeSpinner(visible bool, totalSeconds int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := time.Now()
-	if !visible {
-		t.spinnerActive = false
-		t.lastSpinnerTotal = 0
-		return
-	}
-	if !t.spinnerActive {
-		t.spinnerActive = true
-		t.lastSpinnerTotal = totalSeconds
-		t.lastSpinnerProgressAt = now
-		return
-	}
-	if totalSeconds > t.lastSpinnerTotal {
-		t.lastSpinnerTotal = totalSeconds
-		t.lastSpinnerProgressAt = now
-	}
-}
-
-func (t *tracker) checkWatchdog(rb *tuidriver.Buffer) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := time.Now()
-	if quiet := rb.QuietFor(); quiet > ptyQuietLimit {
-		return fmt.Errorf("watchdog: PTY quiet for %s (last state: %s)",
-			quiet.Round(time.Second), t.currentState)
-	}
-	if t.spinnerActive && now.Sub(t.lastSpinnerProgressAt) > spinnerFreezeLimit {
-		return fmt.Errorf("watchdog: spinner counter frozen at %ds for %s",
-			t.lastSpinnerTotal, now.Sub(t.lastSpinnerProgressAt).Round(time.Second))
-	}
-	return nil
-}
-
 
 // hasAskUserModal: claude's AskUserQuestion tool renders an interactive
 // modal in the TUI with a unique hint-bar at the bottom:

@@ -50,7 +50,7 @@ const (
 	sessionFileWait    = 10 * time.Second
 	sessionFilePoll    = 100 * time.Millisecond
 	watchdogTick       = 1 * time.Second
-	inactivityLimit    = 60 * time.Second
+	ptyQuietLimit      = 60 * time.Second
 	spinnerFreezeLimit = 30 * time.Second
 	shutdownGrace      = 3 * time.Second
 
@@ -135,8 +135,11 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
 	defer cancelCause(errors.New("run: returning"))
 
-	tr := newTracker()
-	tr.recordTransition("start")
+	tr := tuidriver.NewTracker(tuidriver.TrackerOpts{
+		PTYQuietLimit:      ptyQuietLimit,
+		SpinnerFreezeLimit: spinnerFreezeLimit,
+	})
+	tr.RecordTransition("start")
 
 	// --permission-mode bypassPermissions: turn 2's "list the files in /tmp"
 	// prompt invokes claude's Bash tool. Under default permission mode, claude
@@ -184,8 +187,8 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 				snap := rb.Snapshot()
 				stripped := tuidriver.StripANSI(snap)
 				_, total, ok := matchSpinner(stripped)
-				tr.observeSpinner(ok, total)
-				if werr := tr.checkWatchdog(); werr != nil {
+				tr.ObserveSpinner(ok, total)
+				if werr := tr.CheckWatchdog(rb); werr != nil {
 					logger.Printf("%v", werr)
 					cancelCause(werr)
 					return
@@ -201,7 +204,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
-	tr.recordTransition("idle-detected")
+	tr.RecordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
 	if tuidriver.HasTrustModal(rb.Snapshot()) {
@@ -212,7 +215,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			if _, err := ptmx.Write([]byte("1\r")); err != nil {
 				return fmt.Errorf("write trust-accept keystroke: %w", err)
 			}
-			tr.recordTransition("trust-folder-accepted")
+			tr.RecordTransition("trust-folder-accepted")
 			logger.Printf("trust-folder-accepted bytes=31 0d")
 			if err := tuidriver.WaitUntil(rootCtx, func() bool {
 				snap := rb.Snapshot()
@@ -220,7 +223,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
 			}
-			tr.recordTransition("idle-detected-post-trust")
+			tr.RecordTransition("idle-detected-post-trust")
 			logger.Printf("idle-detected-post-trust")
 		}
 	}
@@ -282,11 +285,11 @@ func runTurn(
 	ptmx *os.File,
 	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
-	tr *tracker,
+	tr *tuidriver.Tracker,
 	postPromptHook func() error,
 ) (string, string, error) {
 	logger.Printf("turn=%d turn-start prompt=%q", turn, prompt)
-	tr.recordTransition(fmt.Sprintf("turn=%d turn-start", turn))
+	tr.RecordTransition(fmt.Sprintf("turn=%d turn-start", turn))
 
 	// Drain any residual events queued from a prior turn. After a prior
 	// turn's end_turn was observed, additional delta lines for the same
@@ -306,7 +309,7 @@ drain:
 	if err := typePrompt(ptmx, prompt); err != nil {
 		return "", "", fmt.Errorf("write prompt: %w", err)
 	}
-	tr.recordTransition(fmt.Sprintf("turn=%d prompt-written", turn))
+	tr.RecordTransition(fmt.Sprintf("turn=%d prompt-written", turn))
 	logger.Printf("turn=%d prompt-written", turn)
 
 	// ❯-disappeared observer: short-lived goroutine. Polls isIdle for up to
@@ -397,14 +400,14 @@ drain:
 
 	<-observerDone
 
-	tr.recordTransition(fmt.Sprintf("turn=%d end-turn-detected", turn))
+	tr.RecordTransition(fmt.Sprintf("turn=%d end-turn-detected", turn))
 	logger.Printf("turn=%d end-turn-detected msg_id=%s", turn, latestEndTurnMsgID)
 
-	tr.recordTransition(fmt.Sprintf("turn=%d ❯-reappeared", turn))
+	tr.RecordTransition(fmt.Sprintf("turn=%d ❯-reappeared", turn))
 	logger.Printf("turn=%d ❯-reappeared", turn)
 
 	assistantText = extractByMsgID(events, latestEndTurnMsgID)
-	tr.recordTransition(fmt.Sprintf("turn=%d assistant-text-extracted", turn))
+	tr.RecordTransition(fmt.Sprintf("turn=%d assistant-text-extracted", turn))
 	logger.Printf("turn=%d assistant-text-extracted len=%d", turn, len(assistantText))
 
 	fmt.Printf("SUCCESS: %s\n", assistantText)
@@ -493,63 +496,6 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	return string(m[1]), minutes*60 + seconds, true
 }
 
-
-// --- tracker (state + watchdog bookkeeping) ---
-// copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
-
-type tracker struct {
-	mu                    sync.Mutex
-	currentState          string
-	lastTransitionAt      time.Time
-	lastSpinnerProgressAt time.Time
-	lastSpinnerTotal      int
-	spinnerActive         bool
-}
-
-func newTracker() *tracker { return &tracker{} }
-
-func (t *tracker) recordTransition(state string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.currentState = state
-	t.lastTransitionAt = time.Now()
-}
-
-func (t *tracker) observeSpinner(visible bool, totalSeconds int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := time.Now()
-	if !visible {
-		t.spinnerActive = false
-		t.lastSpinnerTotal = 0
-		return
-	}
-	if !t.spinnerActive {
-		t.spinnerActive = true
-		t.lastSpinnerTotal = totalSeconds
-		t.lastSpinnerProgressAt = now
-		return
-	}
-	if totalSeconds > t.lastSpinnerTotal {
-		t.lastSpinnerTotal = totalSeconds
-		t.lastSpinnerProgressAt = now
-	}
-}
-
-func (t *tracker) checkWatchdog() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := time.Now()
-	if !t.lastTransitionAt.IsZero() && now.Sub(t.lastTransitionAt) > inactivityLimit {
-		return fmt.Errorf("watchdog: stuck in state %s for %s",
-			t.currentState, now.Sub(t.lastTransitionAt).Round(time.Second))
-	}
-	if t.spinnerActive && now.Sub(t.lastSpinnerProgressAt) > spinnerFreezeLimit {
-		return fmt.Errorf("watchdog: spinner counter frozen at %ds for %s",
-			t.lastSpinnerTotal, now.Sub(t.lastSpinnerProgressAt).Round(time.Second))
-	}
-	return nil
-}
 
 // --- generic predicate wait ---
 // copied from cmd/spike-one-turn/main.go — keep in sync until library extraction

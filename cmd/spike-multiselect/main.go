@@ -87,8 +87,11 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
 	defer cancelCause(errors.New("run: returning"))
 
-	tr := newTracker()
-	tr.recordTransition("start")
+	tr := tuidriver.NewTracker(tuidriver.TrackerOpts{
+		PTYQuietLimit:      ptyQuietLimit,
+		SpinnerFreezeLimit: spinnerFreezeLimit,
+	})
+	tr.RecordTransition("start")
 
 	// No --session-id flag — we're not driving a turn, just observing UI.
 	// No --permission-mode either; the picker is a UI affordance, doesn't
@@ -127,8 +130,8 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 				snap := rb.Snapshot()
 				stripped := tuidriver.StripANSI(snap)
 				_, total, ok := matchSpinner(stripped)
-				tr.observeSpinner(ok, total)
-				if werr := tr.checkWatchdog(rb); werr != nil {
+				tr.ObserveSpinner(ok, total)
+				if werr := tr.CheckWatchdog(rb); werr != nil {
 					logger.Printf("%v", werr)
 					cancelCause(werr)
 					return
@@ -141,7 +144,7 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	if err := tuidriver.WaitUntil(rootCtx, func() bool { return tuidriver.IsIdle(rb.Snapshot()) }); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
-	tr.recordTransition("idle-detected")
+	tr.RecordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
 	// Trust-folder dialog handling. Same shape as spike-one-turn.
@@ -153,7 +156,7 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 			if _, err := ptmx.Write([]byte("1\r")); err != nil {
 				return fmt.Errorf("write trust-accept keystroke: %w", err)
 			}
-			tr.recordTransition("trust-folder-accepted")
+			tr.RecordTransition("trust-folder-accepted")
 			logger.Printf("trust-folder-accepted bytes=31 0d")
 			if err := tuidriver.WaitUntil(rootCtx, func() bool {
 				snap := rb.Snapshot()
@@ -161,7 +164,7 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
 			}
-			tr.recordTransition("idle-detected-post-trust")
+			tr.RecordTransition("idle-detected-post-trust")
 			logger.Printf("idle-detected-post-trust")
 		}
 	}
@@ -172,7 +175,7 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	if _, err := ptmx.Write([]byte(trigger)); err != nil {
 		return fmt.Errorf("write trigger: %w", err)
 	}
-	tr.recordTransition("trigger-sent")
+	tr.RecordTransition("trigger-sent")
 	logger.Printf("trigger-sent bytes=%x", []byte(trigger))
 
 	// Settle window: let the picker/modal fully render. Configurable via
@@ -209,7 +212,7 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 			if _, err := ptmx.Write(keyBytes); err != nil {
 				return fmt.Errorf("write %q: %w", k, err)
 			}
-			tr.recordTransition("post-trigger-key-" + k)
+			tr.RecordTransition("post-trigger-key-" + k)
 			logger.Printf("post-trigger-key-sent name=%s bytes=%x", k, keyBytes)
 			// Brief settle between keys — claude redraws the highlighted row.
 			select {
@@ -228,7 +231,7 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	if err := os.WriteFile(dumpPath, snap, 0o644); err != nil {
 		logger.Printf("warning: write snapshot: %v", err)
 	}
-	tr.recordTransition("picker-snapshot")
+	tr.RecordTransition("picker-snapshot")
 	logger.Printf("picker-snapshot path=%s raw_len=%d stripped_len=%d", dumpPath, len(snap), len(stripped))
 
 	// Structural metrics — what's in the snapshot?
@@ -359,7 +362,7 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	if _, err := ptmx.Write([]byte{0x1b}); err != nil {
 		return fmt.Errorf("write esc: %w", err)
 	}
-	tr.recordTransition("picker-dismissed")
+	tr.RecordTransition("picker-dismissed")
 	logger.Printf("picker-dismissed bytes=1b")
 
 	// Brief verification window: confirm picker is gone (we want to know
@@ -381,63 +384,6 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	fmt.Printf("OBSERVED: picker snapshot at %s\n", dumpPath)
 	return nil
 }
-
-// --- shared primitives copied from cmd/spike-one-turn / cmd/spike-permission ---
-
-type tracker struct {
-	mu                    sync.Mutex
-	currentState          string
-	lastTransitionAt      time.Time
-	lastSpinnerProgressAt time.Time
-	lastSpinnerTotal      int
-	spinnerActive         bool
-}
-
-func newTracker() *tracker { return &tracker{} }
-
-func (t *tracker) recordTransition(state string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.currentState = state
-	t.lastTransitionAt = time.Now()
-}
-
-func (t *tracker) observeSpinner(visible bool, totalSeconds int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := time.Now()
-	if !visible {
-		t.spinnerActive = false
-		t.lastSpinnerTotal = 0
-		return
-	}
-	if !t.spinnerActive {
-		t.spinnerActive = true
-		t.lastSpinnerTotal = totalSeconds
-		t.lastSpinnerProgressAt = now
-		return
-	}
-	if totalSeconds > t.lastSpinnerTotal {
-		t.lastSpinnerTotal = totalSeconds
-		t.lastSpinnerProgressAt = now
-	}
-}
-
-func (t *tracker) checkWatchdog(rb *tuidriver.Buffer) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := time.Now()
-	if quiet := rb.QuietFor(); quiet > ptyQuietLimit {
-		return fmt.Errorf("watchdog: PTY quiet for %s (last state: %s)",
-			quiet.Round(time.Second), t.currentState)
-	}
-	if t.spinnerActive && now.Sub(t.lastSpinnerProgressAt) > spinnerFreezeLimit {
-		return fmt.Errorf("watchdog: spinner counter frozen at %ds for %s",
-			t.lastSpinnerTotal, now.Sub(t.lastSpinnerProgressAt).Round(time.Second))
-	}
-	return nil
-}
-
 
 
 func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
