@@ -782,14 +782,13 @@ func detectModalClass(snap []byte) string {
 //	△ needs auth...  → status="auth_required"
 //	✘ failed         → status="failed"
 //
-// CSI cursor-forward stripping collapses word boundaries (e.g.
-// "Manage MCP servers" → "ManageMCPservers"), so the parser uses
-// substring-contains rather than word-tokenized matching.
+// Uses tuidriver.Render (vt10x-backed) to interpret cursor-positioning
+// escapes faithfully. The previous regex-strip path produced truncated
+// names like "claude.ai Gmail" → "laude.ai Gmail" because cursor-forward
+// and cursor-up sequences were collapsed to single spaces, losing
+// adjacency information across rows.
 func parseMcpStatus(snap []byte) *McpStatus {
-	cleaned := oscRe.ReplaceAll(snap, nil)
-	stripped := csiCursorFwdRe.ReplaceAll(tuidriver.StripANSI(cleaned), []byte(" "))
-	// Normalize CR to LF, collapse multi-spaces within lines.
-	text := strings.ReplaceAll(string(stripped), "\r", "\n")
+	text := tuidriver.Render(snap, 120, 40)
 	lines := strings.Split(text, "\n")
 	for i := range lines {
 		l := lines[i]
@@ -913,9 +912,7 @@ func parseMcpStatus(snap []byte) *McpStatus {
 //	No subagents are currently running.        ← empty-state for Running tab
 //	←/→ to switch · ↑/↓ to navigate · Enter to select · Esc to close
 func parseAgentList(snap []byte) *AgentList {
-	cleaned := oscRe.ReplaceAll(snap, nil)
-	stripped := csiCursorFwdRe.ReplaceAll(tuidriver.StripANSI(cleaned), []byte(" "))
-	text := strings.ReplaceAll(string(stripped), "\r", "\n")
+	text := tuidriver.Render(snap, 120, 40)
 	lines := strings.Split(text, "\n")
 	for i := range lines {
 		l := lines[i]

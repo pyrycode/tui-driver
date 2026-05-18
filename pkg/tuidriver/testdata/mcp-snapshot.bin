@@ -1,0 +1,116 @@
+��───────────────────────────[39m
+❯ [7mT[27m[2mry[1C"write[1Ca[1Ctest[1Cfor[1Cgo.mod"[22m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[2C[38;5;246m?[1Cfor[1Cshortcuts[1C·[1C←[1Cfor[1Cagents[70C●[1Chigh[1C·[1C/effort[39m
+[2C[3A[>0q[c[2D[3B[2K[1A[2K[1A[2K[G[1A[1A[48;5;237m[38;5;239m❯ [38;5;231m/mcp[39m                                                                                                                  [1B[49m[K[1B[K[1B[K[2A
+[38;5;153m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[2C[38;5;153m[1mManage[1CMCP[1Cservers[22m[39m
+[2C[38;5;246m7[1Cservers[39m
+
+[4C[1mProject[1CMCPs[22m[38;5;246m (/Users/juhanailmoniemi/Workspace/Projects/tui-driver/.mcp.json)[39m
+[2C[38;5;153m❯[1Cqmd[1C[39m·[1C[38;5;246m◯[1C[39mconnecting…
+[4Csmart-connections[38;5;246m ·[1C◯[1Cconnecting…[39m
+
+[4C[1mUser[1CMCPs[22m[38;5;246m (/Users/juhanailmoniemi/.claude.json)[39m
+[4Ccodegraph[38;5;246m ·[1C◯[1Cconnecting…[39m
+
+[4C[1mBuilt-in[1CMCPs[22m[38;5;246m (always[1Cavailable)[39m
+[4Ccomputer-use[38;5;246m ·[1C◯[1Cdisabled[39m
+[4Cplugin:context7:context7[38;5;246m ·[1C◯[1Cconnecting…[39m
+[4Cplugin:figma:figma[38;5;246m ·[1C◯[1Cconnecting…[39m
+[4Cplugin:github:github[38;5;246m ·[1C◯[1Cconnecting…[39m
+
+[2C[38;5;246mhttps://code.claude.com/docs/en/mcp[1Cfor[1Chelp[39m
+[1C[38;5;246m[3m↑/↓[1Cto[1Cnavigate[1C·[1CEnter[1Cto[1Cconfirm[1C·[1CEsc[1Cto[1Ccancel[23m[39m
+[16C[10A[38;5;114m✔[8C[38;5;246med · 8 tools[39m
+
+
+
+
+
+
+
+
+
+[2C[17A[38;5;246m10 servers[4C[9B[39m[1mclaude.ai[22m[K[5C[1Blaude.ai Gmail[38;5;246m · ◯ connecting…[4C[1B[39mc[1Caude.ai Google Cal[1Cndar[38;5;246m · ◯ co[1Cnecting…[4C[1B[39mc[1Caude.a[1C Google Drive[1C[38;5;246m· ◯ connecting…[4C[1B[39m[K[4C[1B[1mBuilt-in MCPs[22m[38;5;246m (always available)[2C[1B[39m  computer-use[38;5;246m · ◯ disabled[39m[K[1C[1B   plugin:context7:context7[38;5;246m · ◯ connecting…[39m[K
+[4Cplugin:figma:figma[38;5;246m ·[1C◯[1Cconnecting…[39m
+[4Cplugin:github:github[38;5;246m ·[1C◯[1Cconnecting…[39m
+
+[2C[38;5;246mhttps://code.claude.com/docs/en/mcp[1Cfor[1Chelp[39m
+[1C[38;5;246m[3m↑/↓[1Cto[1Cnavigate[1C·[1CEnter[1Cto[1Cconfirm[1C·[1CEsc[1Cto[1Ccancel[23m[39m
+[32C[11A[38;5;220m△[1C[38;5;246mneeds authentication[39m
+
+
+
+
+
+
+
+
+
+
+[27C[4A[38;5;211m✘[1C[38;5;246mfail[1Cd[39m[K[2C[2B[38;5;246m※ Run clau[2C --debug to see error logs[39m[K[1C[1B [38;5;246mhttps://code.claude.com/docs/en/mcp for help[39m[K
+[1C[38;5;246m[3m↑/↓[1Cto[1Cnavigate[1C·[1CEnter[1Cto[1Cconfirm[1C·[1CEsc[1Cto[1Ccancel[23m[39m
+[10C[20A[38;5;114m✔[8C[39med ·[1C4[1Ctools
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[25C[6A[38;5;114m✔[8C[38;5;246med · 18 tools[39m
+
+
+
+
+
+[31C[7A[38;5;114m✔[8C[38;5;246med · 2 tools[39m
+
+
+
+
+
+
+[22C[13A[38;5;114m✔[8C[38;5;246med · 12 tools[29C[2B[38;5;114m✔[8C[38;5;246med · 8 tools[39m
+
+
+
+
+
+
+
+
+
+
+[24C[19A[38;5;114m✔[8C[38;5;246med · 3 tools[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
