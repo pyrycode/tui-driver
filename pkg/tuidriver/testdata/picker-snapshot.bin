@@ -1,0 +1,25 @@
+�────────────[39m
+[2C[38;5;246m?[1Cfor[1Cshortcuts[1C·[1C←[1Cfor[1Cagents[70C●[1Chigh[1C·[1C/effort[39m
+[2C[3A[>0q[c[2D[3B[2C[3A/[7m [27m[K[2C[2B                              
+[3C[3A[3D[3B[1A[38;5;153m/figma-use                                 (figma) **MANDATORY prerequisite** — you MUST invoke this skill BEFORE[39m[K
+[43C[38;5;153mevery[1C`use_figma`[1Ctool[1Ccall.[1CNEVER[1Ccall[1C`use_figma`[1Cdirectly[1Cwithout[1Cloa…[39m
+[38;5;246m/logo-creator[30CCreate[1Clogos[1Cusing[1CAI[1Cimage[1Cgeneration.[1CDiscuss[1Cstyle/ratio,[1Cgenerate[39m
+[43C[38;5;246mvariations,[1Citerate[1Cwith[1Cuser[1Cfeedback,[1Ccrop,[1Cremove[1Cbackground,[1Cand[1Cexp…[39m
+[38;5;246m/review[36CReview[1Ca[1Cpull[1Crequest[39m
+[38;5;246m/figma-generate-design[21C(figma)[1CUse[1Cthis[1Cskill[1Calongside[1Cfigma-use[1Cwhen[1Cthe[1Ctask[1Cinvolves[39m
+[43C[38;5;246mtranslating[1Can[1Capplication[1Cpage,[1Cview,[1Cor[1Cmulti-section[1Clayout[1Cinto[1CFigm…[39m
+[38;5;246m/claude-md-improver[24C(claude-md-management)[1CAudit[1Cand[1Cimprove[1CCLAUDE.md[1Cfiles[1Cin[1Crepositories.[39m
+[43C[38;5;246mUse[1Cwhen[1Cuser[1Casks[1Cto[1Ccheck,[1Caudit,[1Cupdate,[1Cimprove,[1Cor[1Cfix[1CCLAUDE.md[1Cfi…[39m
+[38;5;246m/add-dir[35CAdd[1Ca[1Cnew[1Cworking[1Cdirectory[39m
+[38;5;246m/advisor[35CConfigure[1Cthe[1CAdvisor[1CTool[1Cto[1Cconsult[1Ca[1Cstronger[1Cmodel[1Cfor[1Cguidance[1Cat[39m
+[43C[38;5;246mkey[1Cmoments[1Cduring[1Ca[1Ctask[39m
+[38;5;246m/agents[36CManage[1Cagent[1Cconfigurations[39m
+[38;5;246m/autofix-pr[32CMonitor[1Cand[1Cautofix[1Cany[1Cissues[1Cwith[1Cthe[1Ccurrent[1CPR[39m
+[38;5;246m/background[32CSend[1Cthis[1Csession[1Cto[1Cthe[1Cbackground[1Cand[1Cfree[1Cthe[1Cterminal[39m
+[38;5;246m/branch[36CCreate[1Ca[1Cbranch[1Cof[1Cthe[1Ccurrent[1Cconversation[1Cat[1Cthis[1Cpoint[39m
+[38;5;246m/btw[39CAsk[1Ca[1Cquick[1Cside[1Cquestion[1Cwithout[1Cinterrupting[1Cthe[1Cmain[1Cconversation[39m
+[38;5;246m/chrome[36CClaude[1Cin[1CChrome[1C(beta)[1Csettings[39m
+[38;5;246m/clear[37CStart[1Ca[1Cnew[1Csession[1Cwith[1Cempty[1Ccontext;[1Cprevious[1Csession[1Cstays[1Con[1Cdisk[39m
+[43C[38;5;246m(resumable[1Cwith[1C/resume)[39m
+[3C[22A[3D[22B[43C[20A[38;5;153m     (figma) **MANDATORY prerequisite** — you[1CMUST invoke[1Cth[1Cs skill[39m[K[43C[1B     [38;5;153mBEFORE every[1C`use_figma` tool[5C. NEVER call[1C`us[1C_figma` directly[43C[1B[38;5;246m     Create logos using AI imag[1C generation. Discuss style/ratio,[39m[K[43C[1B     [38;5;246mgenerate variations, iterat[1C with user feedback, crop, remove backg[43C[1B     Review a[1Cpull request[43C[1B     (figma) Use[1Cth[1Cs skill alongs[1Cde figma-use[1Cw[2Cn the[1Ctask involves[43C[1B[39m     [38;5;246mtranslating an application pag[1C, view, or multi-section layout[1Cinto[43C[1B     (claude-md-management) Audit and improve CLAUDE.md f[1Cles in[39m[K[43C[1B     [38;5;246mr[1Cpositories.[1CUse when user asks to check, audit, update, improve, [43C[1B   [1C Add a new work[1Cng di[1Cectory[43C[1B     Configure the Advis[1Cr[1CT[1Col to consul[1C a st[1Conger model for guid[1Cnce[43C[1B[39m     [38;5;246mat key[1Cmome[1Cts during a task[43C[1B     Manage age[1Ct configurations[43C[1B     Monitor and autofix any issues[1Cwith the current PR[43C[1B    [1CSend[1Cthi[1C session to the background and[1Cfr[1Ce the terminal[43C[1B     Create a branch of the curre[1Ct conversation at[1Cth[1Cs point[43C[1B   [1C Ask a qu[1Cck[1Cside quest[1Con without interrup[1Cing the[1Cmain conversation[43C[1B     Claude in Chrome (beta) settings[43C[1B     Start a new sess[1Con[1Cwith empty context; previou[1C ses[1Cion stays on[43C[1B[39m     [38;5;246mdisk (resumable with /resume)[39m
+[3C[22A
