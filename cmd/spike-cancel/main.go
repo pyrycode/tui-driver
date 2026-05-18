@@ -943,15 +943,18 @@ func projectsDir() (string, error) {
 	return filepath.Join(home, ".claude", "projects", encodeCwd(cwd)), nil
 }
 
+// encodeCwd: claude's empirically-confirmed rule — every non-alphanumeric
+// byte → '-' (one-to-one). See cmd/spike-one-turn/main.go for the
+// derivation (loop 2 exp B-4, 2026-05-18).
 func encodeCwd(cwd string) string {
 	var b strings.Builder
 	b.Grow(len(cwd))
 	for i := 0; i < len(cwd); i++ {
 		c := cwd[i]
-		if c == '/' || c == '.' || c == ' ' {
-			b.WriteByte('-')
-		} else {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
 			b.WriteByte(c)
+		} else {
+			b.WriteByte('-')
 		}
 	}
 	return b.String()

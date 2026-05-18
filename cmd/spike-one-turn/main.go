@@ -423,15 +423,21 @@ func projectsDir() (string, error) {
 	return filepath.Join(home, ".claude", "projects", encodeCwd(cwd)), nil
 }
 
+// encodeCwd matches claude's empirically-confirmed projects-dir
+// encoding rule (loop 2 exp B-4, 2026-05-18): every non-alphanumeric
+// byte → '-' (one-to-one substitution, not run-collapsed). Tested
+// against /private/tmp/encode test (with) [brackets] & amp+plus_under
+// which claude wrote to `-private-tmp-encode-test--with---brackets----amp-plus-under`
+// — every special char including `_` became exactly one '-'.
 func encodeCwd(cwd string) string {
 	var b strings.Builder
 	b.Grow(len(cwd))
 	for i := 0; i < len(cwd); i++ {
 		c := cwd[i]
-		if c == '/' || c == '.' || c == ' ' {
-			b.WriteByte('-')
-		} else {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
 			b.WriteByte(c)
+		} else {
+			b.WriteByte('-')
 		}
 	}
 	return b.String()
