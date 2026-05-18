@@ -948,7 +948,7 @@ func encodeCwd(cwd string) string {
 	b.Grow(len(cwd))
 	for i := 0; i < len(cwd); i++ {
 		c := cwd[i]
-		if c == '/' || c == '.' {
+		if c == '/' || c == '.' || c == ' ' {
 			b.WriteByte('-')
 		} else {
 			b.WriteByte(c)

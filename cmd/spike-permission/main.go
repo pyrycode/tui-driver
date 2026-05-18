@@ -74,7 +74,12 @@ const (
 	sessionFileWait    = 10 * time.Second
 	sessionFilePoll    = 100 * time.Millisecond
 	watchdogTick       = 1 * time.Second
-	inactivityLimit    = 60 * time.Second
+	// inactivityLimit: session-level umbrella watchdog. Must exceed the
+	// largest probe-level ceiling (endTurnAfterApproveLimit = 90 s) or
+	// it becomes the binding constraint during streaming tool responses
+	// post-approve (no state transitions fire between modal-cleared and
+	// end-turn-detected while claude streams). See finding #22.
+	inactivityLimit    = 120 * time.Second
 	spinnerFreezeLimit = 30 * time.Second
 	shutdownGrace      = 3 * time.Second
 
@@ -114,8 +119,11 @@ const (
 	modalClearedLimit = 30 * time.Second
 
 	// endTurnAfterApproveLimit: Probe 2's window for "modal cleared →
-	// end_turn arrives." Aggressive for the same reason.
-	endTurnAfterApproveLimit = 30 * time.Second
+	// end_turn arrives." Sized to absorb streaming tool responses
+	// (e.g. `ls -la /tmp` line-by-line listing) which can exceed 30 s
+	// end-to-end. SUCCESS exits as soon as end_turn arrives — the
+	// budget is a ceiling, not a floor. See finding #20.
+	endTurnAfterApproveLimit = 90 * time.Second
 )
 
 // copied from cmd/spike-cancel/main.go — keep in sync until library extraction
@@ -638,7 +646,14 @@ func runAutoRespond(
 		gotEndTurn         bool
 	)
 
-	// Wait for modal-cleared: !hasModal AND isIdle AND quietFor >= window.
+	// Wait for modal-cleared: !hasModal AND isIdle.
+	// The earlier quietFor >= ptyQuietWindow clause was inherited from
+	// spike-cancel's post-cancel predicate where it makes sense (post-cancel
+	// claude IS quiet); under post-approve, claude is actively producing the
+	// response, and streaming-heavy tool output (e.g. `ls -la /tmp` dot-anim)
+	// kept quietFor under 1.5 s for the full 30 s budget on ~50% of runs.
+	// Modal-gone is the actual signal; quiescence is a proxy that fails under
+	// streaming. See finding #19.
 	clearedDeadline := keystrokeSentAt.Add(modalClearedLimit)
 	ticker := time.NewTicker(statePollInterval)
 	defer ticker.Stop()
@@ -658,7 +673,7 @@ clearedLoop:
 			}
 		case <-ticker.C:
 			snap := rb.snapshot()
-			if !hasModal(snap, pred) && isIdle(snap) && rb.quietFor() >= ptyQuietWindow {
+			if !hasModal(snap, pred) && isIdle(snap) {
 				break clearedLoop
 			}
 			if time.Now().After(clearedDeadline) {
@@ -1267,7 +1282,7 @@ func encodeCwd(cwd string) string {
 	b.Grow(len(cwd))
 	for i := 0; i < len(cwd); i++ {
 		c := cwd[i]
-		if c == '/' || c == '.' {
+		if c == '/' || c == '.' || c == ' ' {
 			b.WriteByte('-')
 		} else {
 			b.WriteByte(c)
