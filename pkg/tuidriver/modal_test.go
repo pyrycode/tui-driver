@@ -24,8 +24,26 @@ func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 		{"mcp space-stripped", []byte("...ManageMCPservers..."), ModalClassMCP},
 		{"agents header + running tab", []byte("...Agents...Running..."), ModalClassAgents},
 		{"agents header + library tab", []byte("...Agents...Library..."), ModalClassAgents},
-		{"slash-picker stripped", []byte("...?forshortcuts..."), ModalClassSlashPicker},
-		{"slash-picker spaced", []byte("...? for shortcuts..."), ModalClassSlashPicker},
+		{
+			"slash-picker SGR row 246",
+			[]byte("noise\x1b[38;5;246m/figma-use more"),
+			ModalClassSlashPicker,
+		},
+		{
+			"slash-picker SGR row 153 highlighted",
+			[]byte("noise\x1b[38;5;153m/clear more"),
+			ModalClassSlashPicker,
+		},
+		{
+			"slash-picker filtered (color + nested color)",
+			[]byte("noise\x1b[38;5;246m/\x1b[38;5;153mp\x1b[38;5;246mlugin more"),
+			ModalClassSlashPicker,
+		},
+		{
+			"hint-bar text alone is NOT a picker (welcome banner false-positive guard)",
+			[]byte("...? for shortcuts · ← for agents..."),
+			ModalClassUnknown,
+		},
 		{"ask-user stripped", []byte("...Entertoselect..."), ModalClassAskUserQuestion},
 		{"ask-user spaced", []byte("...Enter to select..."), ModalClassAskUserQuestion},
 		{"trust-folder", []byte("...Quicksafetycheck..."), ModalClassTrustFolder},
