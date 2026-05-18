@@ -85,13 +85,15 @@ const (
 	// discrete milestones, not heartbeats — wrong primitive for streaming.
 	// 30 s is well above any observed PTY-quiet gap during normal activity.
 	// See findings #19-#24 + Open Questions architectural section.
+	//
+	// No wall-clock cap — empirically the wall-cap was a 100% false-positive
+	// in loop 2 exp B-1 (4/10 runs fired during genuine long-streaming).
+	// The user can Ctrl-C the spike at any point if a session runs longer
+	// than they want to wait. PTY-quiet catches real wedges; spinner-freeze
+	// catches thinking-stalls; that's enough. Library extraction should
+	// surface elapsed-time as a metric the consumer reacts to, not as a
+	// hard auto-fail.
 	ptyQuietLimit = 30 * time.Second
-
-	// sessionWallCap: outermost safety net for genuinely runaway sessions
-	// where claude emits bytes but doesn't progress (e.g. theoretical loop
-	// on a status banner redraw — not observed, cheap to defend against).
-	// Real probes complete in <60 s; 10 min is enormous headroom.
-	sessionWallCap = 10 * time.Minute
 
 	spinnerFreezeLimit = 30 * time.Second
 	shutdownGrace      = 3 * time.Second
@@ -411,12 +413,12 @@ func runSession(
 		}
 	}()
 
-	// Watchdog: PTY-quiet-for-30s liveness + 30s spinner-freeze + 10min
-	// session wall-cap. Session-scoped (resets when Session B starts).
+	// Watchdog: PTY-quiet-for-30s liveness + 30s spinner-freeze. No
+	// wall-clock cap — long sessions are fine if claude is actually
+	// producing; operator can Ctrl-C if they want to stop sooner.
 	// PTY-heartbeat replaces the prior state-transition-based stack
 	// (inactivityLimit / modalClearedLimit / endTurnAfterApproveLimit)
 	// per findings #19-#24 cascade observation.
-	sessionStart := time.Now()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -431,7 +433,7 @@ func runSession(
 				stripped := ansiRe.ReplaceAll(snap, nil)
 				_, total, ok := matchSpinner(stripped)
 				tr.observeSpinner(ok, total)
-				if werr := tr.checkWatchdog(rb, sessionStart); werr != nil {
+				if werr := tr.checkWatchdog(rb); werr != nil {
 					logger.Printf("%v", werr)
 					cancelCause(werr)
 					return
@@ -1226,11 +1228,12 @@ func (t *tracker) observeSpinner(visible bool, totalSeconds int) {
 }
 
 // checkWatchdog is called from the per-tick goroutine with the rolling
-// buffer + the session-start timestamp. Replaces the prior
-// state-transition-based inactivity check with a PTY-heartbeat check:
-// PTY bytes flowing == claude alive, regardless of which state the
-// probe thinks it's in.
-func (t *tracker) checkWatchdog(rb *rollingBuffer, sessionStart time.Time) error {
+// buffer. Replaces the prior state-transition-based inactivity check
+// with a PTY-heartbeat check: PTY bytes flowing == claude alive,
+// regardless of which state the probe thinks it's in. Spinner-freeze
+// stays as a separate signal (claude says it's thinking but isn't
+// progressing). No wall-clock cap — see ptyQuietLimit comment.
+func (t *tracker) checkWatchdog(rb *rollingBuffer) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := time.Now()
@@ -1241,10 +1244,6 @@ func (t *tracker) checkWatchdog(rb *rollingBuffer, sessionStart time.Time) error
 	if t.spinnerActive && now.Sub(t.lastSpinnerProgressAt) > spinnerFreezeLimit {
 		return fmt.Errorf("watchdog: spinner counter frozen at %ds for %s",
 			t.lastSpinnerTotal, now.Sub(t.lastSpinnerProgressAt).Round(time.Second))
-	}
-	if elapsed := now.Sub(sessionStart); elapsed > sessionWallCap {
-		return fmt.Errorf("watchdog: session exceeded wall-clock cap of %s (elapsed %s, last state: %s)",
-			sessionWallCap, elapsed.Round(time.Second), t.currentState)
 	}
 	return nil
 }
