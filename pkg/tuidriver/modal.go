@@ -8,23 +8,27 @@ import (
 // ModalClass identifies which of claude's modal/picker UI states a PTY
 // snapshot is currently rendering. Returned by DetectModalClass.
 //
-// Six classes have been mapped empirically across loops 1-6:
-//   - permission         (spike #13 / loop 1) — tool-permission prompt
-//   - trust-folder       (loop 2 B-5)         — first-use folder trust
-//   - slash-picker       (loop 3 C-2 / 4 D-1) — `/` command picker
-//   - ask-user-question  (loop 5 E-1)         — AskUserQuestion tool modal
-//   - mcp                (loop 6 F-1)         — `/mcp` status display
-//   - agents             (loop 6 F-1)         — `/agents` subagent list
+// Eight classes have been mapped empirically:
+//   - permission         (spike #13 / loop 1)        — tool-permission prompt
+//   - trust-folder       (loop 2 B-5)                — first-use folder trust
+//   - slash-picker       (loop 3 C-2 / 4 D-1)        — `/` command picker
+//   - ask-user-question  (loop 5 E-1)                — AskUserQuestion tool modal
+//   - mcp                (loop 6 F-1)                — `/mcp` status display
+//   - agents             (loop 6 F-1)                — `/agents` subagent list
+//   - model-select       (2026-05-18 evening probes) — `/model` model picker
+//   - permissions-config (2026-05-18 evening probes) — `/permissions` settings
 type ModalClass string
 
 const (
-	ModalClassUnknown         ModalClass = ""
-	ModalClassMCP             ModalClass = "mcp"
-	ModalClassAgents          ModalClass = "agents"
-	ModalClassSlashPicker     ModalClass = "slash-picker"
-	ModalClassAskUserQuestion ModalClass = "ask-user-question"
-	ModalClassTrustFolder     ModalClass = "trust-folder"
-	ModalClassPermission      ModalClass = "permission"
+	ModalClassUnknown           ModalClass = ""
+	ModalClassMCP               ModalClass = "mcp"
+	ModalClassAgents            ModalClass = "agents"
+	ModalClassSlashPicker       ModalClass = "slash-picker"
+	ModalClassAskUserQuestion   ModalClass = "ask-user-question"
+	ModalClassTrustFolder       ModalClass = "trust-folder"
+	ModalClassPermission        ModalClass = "permission"
+	ModalClassModelSelect       ModalClass = "model-select"
+	ModalClassPermissionsConfig ModalClass = "permissions-config"
 )
 
 // Modal-class detection anchors. Each is unique to its class — verified
@@ -36,12 +40,14 @@ const (
 // Anchors are unexported — consumers call DetectModalClass rather than
 // matching directly. The literal forms are documented here for readers.
 //
-//	mcp                → "ManageMCPservers"
-//	agents             → "Agents" header + "Running" or "Library" tab
-//	slash-picker       → SGR-colored picker row (`\x1b[38;5;{246|153}m/<letter>`)
-//	ask-user-question  → "Entertoselect" or "Enter to select"
-//	trust-folder       → "Quicksafetycheck"
-//	permission         → "Doyouwanttoproceed" or "Do you want to proceed"
+//	mcp                 → "ManageMCPservers"
+//	agents              → "Agents" header + "Running" or "Library" tab
+//	slash-picker        → SGR-colored picker row (`\x1b[38;5;{246|153}m/<letter>`)
+//	ask-user-question   → "Entertoselect" or "Enter to select"
+//	trust-folder        → "Quicksafetycheck"
+//	permission          → "Doyouwanttoproceed" or "Do you want to proceed"
+//	model-select        → "Selectmodel" or "Select model" (the `/model` modal)
+//	permissions-config  → "Permissions" header + one of Allow/Ask/Deny tabs
 //
 // slash-picker uses the SGR-row pattern rather than the "? for shortcuts"
 // hint-bar text. The hint-bar text appears at idle too (it's part of the
@@ -59,6 +65,12 @@ var (
 	anchorTrustFolder        = []byte("Quicksafetycheck")
 	anchorPermissionStripped = []byte("Doyouwanttoproceed")
 	anchorPermissionSpaced   = []byte("Do you want to proceed")
+	anchorModelSelectStripped = []byte("Selectmodel")
+	anchorModelSelectSpaced   = []byte("Select model")
+	anchorPermissionsHeader   = []byte("Permissions")
+	anchorPermissionsTabAllow = []byte("Allow")
+	anchorPermissionsTabAsk   = []byte("Ask")
+	anchorPermissionsTabDeny  = []byte("Deny")
 )
 
 // slashPickerRowRe matches a picker item-start. Identical pattern to
@@ -105,6 +117,14 @@ func DetectModalClass(snap []byte) ModalClass {
 	case bytes.Contains(stripped, anchorPermissionStripped) ||
 		bytes.Contains(stripped, anchorPermissionSpaced):
 		return ModalClassPermission
+	case bytes.Contains(stripped, anchorModelSelectStripped) ||
+		bytes.Contains(stripped, anchorModelSelectSpaced):
+		return ModalClassModelSelect
+	case bytes.Contains(stripped, anchorPermissionsHeader) &&
+		(bytes.Contains(stripped, anchorPermissionsTabAllow) ||
+			bytes.Contains(stripped, anchorPermissionsTabAsk) ||
+			bytes.Contains(stripped, anchorPermissionsTabDeny)):
+		return ModalClassPermissionsConfig
 	default:
 		return ModalClassUnknown
 	}

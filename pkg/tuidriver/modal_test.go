@@ -49,6 +49,12 @@ func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 		{"trust-folder", []byte("...Quicksafetycheck..."), ModalClassTrustFolder},
 		{"permission stripped", []byte("...Doyouwanttoproceed..."), ModalClassPermission},
 		{"permission spaced", []byte("...Do you want to proceed..."), ModalClassPermission},
+		{"model-select stripped", []byte("...Selectmodel..."), ModalClassModelSelect},
+		{"model-select spaced", []byte("...Select model..."), ModalClassModelSelect},
+		{"permissions-config + Allow tab", []byte("Permissions header...Allow rules"), ModalClassPermissionsConfig},
+		{"permissions-config + Ask tab", []byte("Permissions...Ask before"), ModalClassPermissionsConfig},
+		{"permissions-config + Deny tab", []byte("Permissions...Deny list"), ModalClassPermissionsConfig},
+		{"permissions header alone is NOT a config modal", []byte("see Permissions docs for details"), ModalClassUnknown},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
