@@ -46,13 +46,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/creack/pty"
 	"github.com/google/uuid"
+	"github.com/pyrycode/tui-driver/pkg/tuidriver"
 )
 
 const (
-	// copied from cmd/spike-multi-turn/main.go — keep in sync until library extraction
-	rollingBufferCap   = 4096
 	statePollInterval  = 50 * time.Millisecond
 	jsonlTailInterval  = 50 * time.Millisecond
 	sessionFileWait    = 10 * time.Second
@@ -64,9 +62,6 @@ const (
 
 	disappearedWindow = 500 * time.Millisecond
 	idleStableWindow  = 250 * time.Millisecond
-
-	ptyRows = 40
-	ptyCols = 120
 
 	// cancelRecoveryLimit: post-cancel watchdog window per AC. Cancellation
 	// should be near-instant; if ❯-reappeared doesn't fire within this
@@ -105,7 +100,6 @@ const (
 var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
 
 // copied from cmd/spike-multi-turn/main.go — keep in sync until library extraction
-var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
 
 // copied from cmd/spike-multi-turn/main.go — keep in sync until library extraction
 var idleGlyph = []byte("\xe2\x9d\xaf")
@@ -223,11 +217,10 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
 	defer cancelCause(errors.New("run: returning"))
 
-	rb := &rollingBuffer{}
+	rb := tuidriver.NewBuffer(0)
 	tr := newTracker()
 	tr.recordTransition("start")
 
-	// copied from cmd/spike-multi-turn/main.go — keep in sync until library extraction
 	// --permission-mode bypassPermissions: Probe 2's "recursively list all
 	// files under /tmp" invokes claude's Bash tool. Under the default
 	// permission mode, claude renders a modal that wedges the spike.
@@ -235,14 +228,11 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 		"--session-id", sessionID,
 		"--permission-mode", "bypassPermissions",
 	)
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	tuidriver.EnsureClaudeEnv(cmd)
 
-	ptmx, err := pty.Start(cmd)
+	ptmx, err := tuidriver.StartPTY(cmd)
 	if err != nil {
 		return fmt.Errorf("pty.Start: %w", err)
-	}
-	if err := pty.Setsize(ptmx, &pty.Winsize{Rows: ptyRows, Cols: ptyCols}); err != nil {
-		logger.Printf("warning: pty.Setsize: %v", err)
 	}
 
 	cmdExited := make(chan error, 1)
@@ -277,7 +267,7 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 			n, rerr := ptmx.Read(buf)
 			if n > 0 {
 				chunk := buf[:n]
-				rb.append(chunk)
+				rb.Append(chunk)
 				_, _ = os.Stderr.Write(chunk)
 			}
 			if rerr != nil {
@@ -297,8 +287,8 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 			case <-rootCtx.Done():
 				return
 			case <-ticker.C:
-				snap := rb.snapshot()
-				stripped := ansiRe.ReplaceAll(snap, nil)
+				snap := rb.Snapshot()
+				stripped := tuidriver.StripANSI(snap)
 				_, total, ok := matchSpinner(stripped)
 				tr.observeSpinner(ok, total)
 				if werr := tr.checkWatchdog(); werr != nil {
@@ -313,14 +303,14 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 	// --- linear state machine (session-level) ---
 
 	if err := waitUntil(rootCtx, func() bool {
-		return isIdle(rb.snapshot())
+		return isIdle(rb.Snapshot())
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
 	tr.recordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
-	if hasTrustModal(rb.snapshot()) {
+	if tuidriver.HasTrustModal(rb.Snapshot()) {
 		switch trustFolderPolicy {
 		case "fail":
 			return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike. Or pass `-trust-folder accept` to auto-trust")
@@ -331,8 +321,8 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 			tr.recordTransition("trust-folder-accepted")
 			logger.Printf("trust-folder-accepted bytes=31 0d")
 			if err := waitUntil(rootCtx, func() bool {
-				snap := rb.snapshot()
-				return !hasTrustModal(snap) && isIdle(snap)
+				snap := rb.Snapshot()
+				return !tuidriver.HasTrustModal(snap) && isIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
 			}
@@ -398,7 +388,7 @@ func runProbe(
 	cancelKey []byte,
 	cancelHex string,
 	ptmx *os.File,
-	rb *rollingBuffer,
+	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
 	tr *tracker,
 	postPromptHook func() error,
@@ -458,7 +448,7 @@ func runCancel(
 	cancelKey []byte,
 	cancelHex string,
 	ptmx *os.File,
-	rb *rollingBuffer,
+	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
 	tr *tracker,
 ) error {
@@ -468,7 +458,7 @@ func runCancel(
 
 	// Snapshot whether the spinner glyph is currently visible. Used to
 	// decide which ❯-reappeared predicate to apply (see waitReappeared).
-	preCancelHadSpinner := hasSpinnerGlyph(rb.snapshot())
+	preCancelHadSpinner := hasSpinnerGlyph(rb.Snapshot())
 
 	if err := sendCancel(ptmx, cancelKey); err != nil {
 		return fmt.Errorf("send cancel: %w", err)
@@ -502,7 +492,7 @@ func waitForKickoff(
 	logger *log.Logger,
 	probeN int,
 	kind ProbeKind,
-	rb *rollingBuffer,
+	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
 	tr *tracker,
 ) error {
@@ -513,7 +503,7 @@ func waitForKickoff(
 	switch kind {
 	case kindThinking:
 		for {
-			if hasSpinnerGlyph(rb.snapshot()) {
+			if hasSpinnerGlyph(rb.Snapshot()) {
 				tr.recordTransition(fmt.Sprintf("probe=%d spinner-or-tool-visible", probeN))
 				logger.Printf("probe=%d spinner-or-tool-visible kind=spinner-glyph", probeN)
 				return nil
@@ -583,7 +573,7 @@ func waitReappeared(
 	probeN int,
 	preCancelHadSpinner bool,
 	cancelSentAt time.Time,
-	rb *rollingBuffer,
+	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
 ) error {
 	_ = preCancelHadSpinner
@@ -592,10 +582,10 @@ func waitReappeared(
 	defer ticker.Stop()
 
 	stable := func() bool {
-		if !isIdle(rb.snapshot()) {
+		if !isIdle(rb.Snapshot()) {
 			return false
 		}
-		return rb.quietFor() >= ptyQuietWindow
+		return rb.QuietFor() >= ptyQuietWindow
 	}
 
 	for {
@@ -647,7 +637,7 @@ func runRecovery(
 	ctx context.Context,
 	logger *log.Logger,
 	probeN int,
-	rb *rollingBuffer,
+	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
 	tr *tracker,
 ) error {
@@ -659,7 +649,7 @@ func runRecovery(
 		ticker := time.NewTicker(statePollInterval)
 		defer ticker.Stop()
 		for {
-			if !isIdle(rb.snapshot()) {
+			if !isIdle(rb.Snapshot()) {
 				logger.Printf("probe=%d ❯-disappeared", probeN)
 				return
 			}
@@ -688,7 +678,7 @@ func runRecovery(
 		if !gotEndTurn {
 			return false
 		}
-		if !isIdle(rb.snapshot()) {
+		if !isIdle(rb.Snapshot()) {
 			idleSince = time.Time{}
 			return false
 		}
@@ -762,7 +752,7 @@ func clearInputLine(ptmx *os.File) error {
 // signal because spinnerRe never matches in practice (spike-multi-turn
 // finding 8).
 func hasSpinnerGlyph(snap []byte) bool {
-	stripped := ansiRe.ReplaceAll(snap, nil)
+	stripped := tuidriver.StripANSI(snap)
 	return bytes.Contains(stripped, spinnerGlyph)
 }
 
@@ -826,46 +816,6 @@ func msgIDOf(ev map[string]any) string {
 	return id
 }
 
-// --- rolling buffer ---
-// copied from cmd/spike-multi-turn/main.go — keep in sync until library extraction
-
-type rollingBuffer struct {
-	mu           sync.Mutex
-	buf          []byte
-	lastAppendAt time.Time
-}
-
-func (r *rollingBuffer) append(p []byte) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.buf = append(r.buf, p...)
-	if len(r.buf) > rollingBufferCap {
-		fresh := make([]byte, rollingBufferCap)
-		copy(fresh, r.buf[len(r.buf)-rollingBufferCap:])
-		r.buf = fresh
-	}
-	r.lastAppendAt = time.Now()
-}
-
-func (r *rollingBuffer) snapshot() []byte {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]byte, len(r.buf))
-	copy(out, r.buf)
-	return out
-}
-
-// quietFor reports how long it has been since the last PTY byte arrived.
-// Returns 0 if nothing has ever been appended.
-func (r *rollingBuffer) quietFor() time.Duration {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.lastAppendAt.IsZero() {
-		return 0
-	}
-	return time.Since(r.lastAppendAt)
-}
-
 // --- pattern matching ---
 // copied from cmd/spike-multi-turn/main.go — keep in sync until library extraction
 
@@ -882,16 +832,8 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	return string(m[1]), minutes*60 + seconds, true
 }
 
-// hasTrustModal: anchored on the modal HEADER "Quicksafetycheck" — NOT
-// the post-accept confirmation. See cmd/spike-one-turn/main.go for
-// derivation (loop 3 C-1).
-func hasTrustModal(snap []byte) bool {
-	stripped := ansiRe.ReplaceAll(snap, nil)
-	return bytes.Contains(stripped, []byte("Quicksafetycheck"))
-}
-
 func isIdle(snap []byte) bool {
-	stripped := ansiRe.ReplaceAll(snap, nil)
+	stripped := tuidriver.StripANSI(snap)
 	if !bytes.Contains(stripped, idleGlyph) {
 		return false
 	}
@@ -988,25 +930,9 @@ func projectsDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".claude", "projects", encodeCwd(cwd)), nil
+	return filepath.Join(home, ".claude", "projects", tuidriver.EncodeCwd(cwd)), nil
 }
 
-// encodeCwd: claude's empirically-confirmed rule — every non-alphanumeric
-// byte → '-' (one-to-one). See cmd/spike-one-turn/main.go for the
-// derivation (loop 2 exp B-4, 2026-05-18).
-func encodeCwd(cwd string) string {
-	var b strings.Builder
-	b.Grow(len(cwd))
-	for i := 0; i < len(cwd); i++ {
-		c := cwd[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
-			b.WriteByte(c)
-		} else {
-			b.WriteByte('-')
-		}
-	}
-	return b.String()
-}
 
 func resolveSession(flagValue string, dir string) (sessionID string, jsonlPath string, err error) {
 	if flagValue == "" {
