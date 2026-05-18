@@ -13,6 +13,28 @@
 // the architecture across 19 experiments. See the project's Findings.md in
 // the vault for empirical context.
 //
+// # Attaching files (and images) to prompts
+//
+// claude's `@<path>` prompt syntax works for both text files AND images.
+// The path is read from disk at prompt-submit time; the file's bytes get
+// base64-encoded into the JSONL `attachment` event. Mobile / remote
+// consumers can therefore attach images by:
+//
+//  1. Writing the image bytes to a temp file accessible from claude's cwd.
+//  2. Injecting `@<absolute-path>` (or a relative path) into the prompt.
+//  3. Sending the prompt + CR.
+//
+// JSONL attachment shape (out of library scope, documented for consumers):
+//
+//	{"type":"attachment","attachment":{"type":"file",
+//	  "filename":"/tmp/x.png",
+//	  "content":{"type":"image","file":{
+//	    "base64":"...","type":"image/png","originalSize":515,
+//	    "dimensions":{"originalWidth":100,"originalHeight":100,...}}},
+//	  "displayPath":"../../tmp/x.png"}}
+//
+// Confirmed empirically 2026-05-18 with a 100×100 PNG.
+//
 // # MCP server reliability
 //
 // claude renders a "N MCP server failed · /mcp" status banner when one or
