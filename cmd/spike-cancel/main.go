@@ -55,7 +55,7 @@ const (
 	sessionFileWait    = 10 * time.Second
 	sessionFilePoll    = 100 * time.Millisecond
 	watchdogTick       = 1 * time.Second
-	inactivityLimit    = 60 * time.Second
+	ptyQuietLimit      = 60 * time.Second
 	spinnerFreezeLimit = 30 * time.Second
 	shutdownGrace      = 3 * time.Second
 
@@ -205,8 +205,11 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
 	defer cancelCause(errors.New("run: returning"))
 
-	tr := newTracker()
-	tr.recordTransition("start")
+	tr := tuidriver.NewTracker(tuidriver.TrackerOpts{
+		PTYQuietLimit:      ptyQuietLimit,
+		SpinnerFreezeLimit: spinnerFreezeLimit,
+	})
+	tr.RecordTransition("start")
 
 	// --permission-mode bypassPermissions: Probe 2's "recursively list all
 	// files under /tmp" invokes claude's Bash tool. Under the default
@@ -248,8 +251,8 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 				snap := rb.Snapshot()
 				stripped := tuidriver.StripANSI(snap)
 				_, total, ok := matchSpinner(stripped)
-				tr.observeSpinner(ok, total)
-				if werr := tr.checkWatchdog(); werr != nil {
+				tr.ObserveSpinner(ok, total)
+				if werr := tr.CheckWatchdog(rb); werr != nil {
 					logger.Printf("%v", werr)
 					cancelCause(werr)
 					return
@@ -265,7 +268,7 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
-	tr.recordTransition("idle-detected")
+	tr.RecordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
 	if tuidriver.HasTrustModal(rb.Snapshot()) {
@@ -276,7 +279,7 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 			if _, err := ptmx.Write([]byte("1\r")); err != nil {
 				return fmt.Errorf("write trust-accept keystroke: %w", err)
 			}
-			tr.recordTransition("trust-folder-accepted")
+			tr.RecordTransition("trust-folder-accepted")
 			logger.Printf("trust-folder-accepted bytes=31 0d")
 			if err := tuidriver.WaitUntil(rootCtx, func() bool {
 				snap := rb.Snapshot()
@@ -284,7 +287,7 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
 			}
-			tr.recordTransition("idle-detected-post-trust")
+			tr.RecordTransition("idle-detected-post-trust")
 			logger.Printf("idle-detected-post-trust")
 		}
 	}
@@ -348,11 +351,11 @@ func runProbe(
 	ptmx *os.File,
 	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
-	tr *tracker,
+	tr *tuidriver.Tracker,
 	postPromptHook func() error,
 ) error {
 	logger.Printf("probe=%d probe-start kind=%q prompt=%q", probeN, kind.String(), prompt)
-	tr.recordTransition(fmt.Sprintf("probe=%d probe-start", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d probe-start", probeN))
 
 	// Residual-event drain: discard any straggler events from a prior probe
 	// so this probe's wait conditions / accumulators don't see them.
@@ -379,7 +382,7 @@ drain:
 	if err := typePrompt(ptmx, prompt); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
 	}
-	tr.recordTransition(fmt.Sprintf("probe=%d prompt-written", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d prompt-written", probeN))
 	logger.Printf("probe=%d prompt-written", probeN)
 
 	if postPromptHook != nil {
@@ -408,7 +411,7 @@ func runCancel(
 	ptmx *os.File,
 	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
-	tr *tracker,
+	tr *tuidriver.Tracker,
 ) error {
 	if err := waitForKickoff(ctx, logger, probeN, kind, rb, eventCh, tr); err != nil {
 		return err
@@ -422,17 +425,17 @@ func runCancel(
 		return fmt.Errorf("send cancel: %w", err)
 	}
 	cancelSentAt := time.Now()
-	tr.recordTransition(fmt.Sprintf("probe=%d cancel-sent", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d cancel-sent", probeN))
 	logger.Printf("probe=%d cancel-sent keystroke=%s", probeN, cancelHex)
 
 	if err := waitReappeared(ctx, logger, probeN, preCancelHadSpinner, cancelSentAt, rb, eventCh); err != nil {
 		return err
 	}
-	tr.recordTransition(fmt.Sprintf("probe=%d ❯-reappeared", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d ❯-reappeared", probeN))
 	logger.Printf("probe=%d ❯-reappeared", probeN)
 
 	elapsed := time.Since(cancelSentAt).Round(time.Millisecond)
-	tr.recordTransition(fmt.Sprintf("probe=%d elapsed-after-cancel", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d elapsed-after-cancel", probeN))
 	logger.Printf("probe=%d elapsed-after-cancel=%s", probeN, elapsed)
 
 	return nil
@@ -452,7 +455,7 @@ func waitForKickoff(
 	kind ProbeKind,
 	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
-	tr *tracker,
+	tr *tuidriver.Tracker,
 ) error {
 	deadline := time.Now().Add(waitConditionLimit)
 	ticker := time.NewTicker(statePollInterval)
@@ -462,7 +465,7 @@ func waitForKickoff(
 	case kindThinking:
 		for {
 			if hasSpinnerGlyph(rb.Snapshot()) {
-				tr.recordTransition(fmt.Sprintf("probe=%d spinner-or-tool-visible", probeN))
+				tr.RecordTransition(fmt.Sprintf("probe=%d spinner-or-tool-visible", probeN))
 				logger.Printf("probe=%d spinner-or-tool-visible kind=spinner-glyph", probeN)
 				return nil
 			}
@@ -484,7 +487,7 @@ func waitForKickoff(
 			case ev := <-eventCh:
 				if isToolUse(ev) {
 					msgID := msgIDOf(ev)
-					tr.recordTransition(fmt.Sprintf("probe=%d spinner-or-tool-visible", probeN))
+					tr.RecordTransition(fmt.Sprintf("probe=%d spinner-or-tool-visible", probeN))
 					logger.Printf("probe=%d spinner-or-tool-visible kind=tool-use-stop-reason msg_id=%s",
 						probeN, msgID)
 					// Give the tool subprocess a moment to actually start.
@@ -597,7 +600,7 @@ func runRecovery(
 	probeN int,
 	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
-	tr *tracker,
+	tr *tuidriver.Tracker,
 ) error {
 	// ❯-disappeared observer: optional, same shape as spike-multi-turn's.
 	observerDone := make(chan struct{})
@@ -665,20 +668,20 @@ func runRecovery(
 	}
 	<-observerDone
 
-	tr.recordTransition(fmt.Sprintf("probe=%d end-turn-detected", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d end-turn-detected", probeN))
 	logger.Printf("probe=%d end-turn-detected msg_id=%s", probeN, latestEndTurnMsgID)
 
-	tr.recordTransition(fmt.Sprintf("probe=%d ❯-reappeared", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d ❯-reappeared", probeN))
 	logger.Printf("probe=%d ❯-reappeared", probeN)
 
 	text := extractByMsgID(events, latestEndTurnMsgID)
-	tr.recordTransition(fmt.Sprintf("probe=%d assistant-text-extracted", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d assistant-text-extracted", probeN))
 	logger.Printf("probe=%d assistant-text-extracted len=%d", probeN, len(text))
 
 	fmt.Printf("SUCCESS: %s\n", text)
 
 	if len(text) > 0 {
-		tr.recordTransition(fmt.Sprintf("probe=%d recovery-turn-success", probeN))
+		tr.RecordTransition(fmt.Sprintf("probe=%d recovery-turn-success", probeN))
 		logger.Printf("probe=%d recovery-turn-success len=%d", probeN, len(text))
 	}
 	return nil
@@ -789,67 +792,6 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	seconds, _ := strconv.Atoi(string(m[3]))
 	return string(m[1]), minutes*60 + seconds, true
 }
-
-// --- tracker (state + watchdog bookkeeping) ---
-// copied from cmd/spike-multi-turn/main.go — keep in sync until library extraction
-
-type tracker struct {
-	mu                    sync.Mutex
-	currentState          string
-	lastTransitionAt      time.Time
-	lastSpinnerProgressAt time.Time
-	lastSpinnerTotal      int
-	spinnerActive         bool
-}
-
-func newTracker() *tracker { return &tracker{} }
-
-func (t *tracker) recordTransition(state string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.currentState = state
-	t.lastTransitionAt = time.Now()
-}
-
-func (t *tracker) observeSpinner(visible bool, totalSeconds int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := time.Now()
-	if !visible {
-		t.spinnerActive = false
-		t.lastSpinnerTotal = 0
-		return
-	}
-	if !t.spinnerActive {
-		t.spinnerActive = true
-		t.lastSpinnerTotal = totalSeconds
-		t.lastSpinnerProgressAt = now
-		return
-	}
-	if totalSeconds > t.lastSpinnerTotal {
-		t.lastSpinnerTotal = totalSeconds
-		t.lastSpinnerProgressAt = now
-	}
-}
-
-func (t *tracker) checkWatchdog() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := time.Now()
-	if !t.lastTransitionAt.IsZero() && now.Sub(t.lastTransitionAt) > inactivityLimit {
-		return fmt.Errorf("watchdog: stuck in state %s for %s",
-			t.currentState, now.Sub(t.lastTransitionAt).Round(time.Second))
-	}
-	if t.spinnerActive && now.Sub(t.lastSpinnerProgressAt) > spinnerFreezeLimit {
-		return fmt.Errorf("watchdog: spinner counter frozen at %ds for %s",
-			t.lastSpinnerTotal, now.Sub(t.lastSpinnerProgressAt).Round(time.Second))
-	}
-	return nil
-}
-
-// --- generic predicate wait ---
-// copied from cmd/spike-multi-turn/main.go — keep in sync until library extraction
-
 
 // --- JSONL discovery + tailing ---
 // copied from cmd/spike-multi-turn/main.go — keep in sync until library extraction

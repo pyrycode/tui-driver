@@ -45,7 +45,7 @@ const (
 	sessionFileWait    = 10 * time.Second
 	sessionFilePoll    = 100 * time.Millisecond
 	watchdogTick       = 1 * time.Second
-	inactivityLimit    = 60 * time.Second
+	ptyQuietLimit      = 60 * time.Second
 	spinnerFreezeLimit = 30 * time.Second
 	shutdownGrace      = 3 * time.Second
 
@@ -95,8 +95,11 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
 	defer cancelCause(errors.New("run: returning"))
 
-	tr := newTracker()
-	tr.recordTransition("start")
+	tr := tuidriver.NewTracker(tuidriver.TrackerOpts{
+		PTYQuietLimit:      ptyQuietLimit,
+		SpinnerFreezeLimit: spinnerFreezeLimit,
+	})
+	tr.RecordTransition("start")
 
 	cmd := exec.Command("claude", "--session-id", sessionID)
 	tuidriver.EnsureClaudeEnv(cmd)
@@ -133,8 +136,8 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 				stripped := tuidriver.StripANSI(snap)
 				verb, total, ok := matchSpinner(stripped)
 				_ = verb
-				tr.observeSpinner(ok, total)
-				if werr := tr.checkWatchdog(); werr != nil {
+				tr.ObserveSpinner(ok, total)
+				if werr := tr.CheckWatchdog(rb); werr != nil {
 					logger.Printf("%v", werr)
 					cancelCause(werr)
 					return
@@ -150,7 +153,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
-	tr.recordTransition("idle-detected")
+	tr.RecordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
 	if tuidriver.HasTrustModal(rb.Snapshot()) {
@@ -161,7 +164,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			if _, err := ptmx.Write([]byte("1\r")); err != nil {
 				return fmt.Errorf("write trust-accept keystroke: %w", err)
 			}
-			tr.recordTransition("trust-folder-accepted")
+			tr.RecordTransition("trust-folder-accepted")
 			logger.Printf("trust-folder-accepted bytes=31 0d")
 			// Wait for claude to dismiss the modal and return to true idle.
 			// HasTrustModal must be false (modal text is gone) AND isIdle
@@ -172,7 +175,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
 			}
-			tr.recordTransition("idle-detected-post-trust")
+			tr.RecordTransition("idle-detected-post-trust")
 			logger.Printf("idle-detected-post-trust")
 		}
 	}
@@ -180,7 +183,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	if _, err := ptmx.Write([]byte(promptText)); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
 	}
-	tr.recordTransition("prompt-written")
+	tr.RecordTransition("prompt-written")
 	logger.Printf("prompt-written")
 
 	// Wait for the deterministic session JSONL to exist. Interactive claude
@@ -228,7 +231,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			if !gotEndTurn && isEndTurn(ev) {
 				assistantText = extractAssistantText(ev)
 				gotEndTurn = true
-				tr.recordTransition("end-turn-detected")
+				tr.RecordTransition("end-turn-detected")
 				logger.Printf("end-turn-detected")
 			}
 		case <-probe.C:
@@ -238,17 +241,17 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			case ok && !thinkingObserved:
 				thinkingVerb = v
 				thinkingObserved = true
-				tr.recordTransition("thinking-detected")
+				tr.RecordTransition("thinking-detected")
 				logger.Printf("thinking-detected verb=%q", thinkingVerb)
 			case !ok && thinkingObserved && !spinnerGone:
 				spinnerGone = true
-				tr.recordTransition("spinner-gone")
+				tr.RecordTransition("spinner-gone")
 				logger.Printf("spinner-gone")
 			}
 		}
 	}
 
-	tr.recordTransition("assistant-text-extracted")
+	tr.RecordTransition("assistant-text-extracted")
 	logger.Printf("assistant-text-extracted len=%d", len(assistantText))
 
 	fmt.Printf("SUCCESS: %s\n", assistantText)
@@ -272,68 +275,6 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	return string(m[1]), minutes*60 + seconds, true
 }
 
-
-// --- tracker (state + watchdog bookkeeping) ---
-
-type tracker struct {
-	mu                    sync.Mutex
-	currentState          string
-	lastTransitionAt      time.Time
-	lastSpinnerProgressAt time.Time
-	lastSpinnerTotal      int
-	spinnerActive         bool
-}
-
-func newTracker() *tracker { return &tracker{} }
-
-func (t *tracker) recordTransition(state string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.currentState = state
-	t.lastTransitionAt = time.Now()
-}
-
-// observeSpinner is called from the watchdog tick with whether the spinner
-// regex matched right now and its total-seconds reading. It manages the
-// freeze-detection bookkeeping: progress is "strictly greater than the
-// previous reading" while the spinner is continuously visible.
-func (t *tracker) observeSpinner(visible bool, totalSeconds int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := time.Now()
-	if !visible {
-		t.spinnerActive = false
-		t.lastSpinnerTotal = 0
-		return
-	}
-	if !t.spinnerActive {
-		t.spinnerActive = true
-		t.lastSpinnerTotal = totalSeconds
-		t.lastSpinnerProgressAt = now
-		return
-	}
-	if totalSeconds > t.lastSpinnerTotal {
-		t.lastSpinnerTotal = totalSeconds
-		t.lastSpinnerProgressAt = now
-	}
-}
-
-func (t *tracker) checkWatchdog() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := time.Now()
-	if !t.lastTransitionAt.IsZero() && now.Sub(t.lastTransitionAt) > inactivityLimit {
-		return fmt.Errorf("watchdog: stuck in state %s for %s",
-			t.currentState, now.Sub(t.lastTransitionAt).Round(time.Second))
-	}
-	if t.spinnerActive && now.Sub(t.lastSpinnerProgressAt) > spinnerFreezeLimit {
-		return fmt.Errorf("watchdog: spinner counter frozen at %ds for %s",
-			t.lastSpinnerTotal, now.Sub(t.lastSpinnerProgressAt).Round(time.Second))
-	}
-	return nil
-}
-
-// --- generic predicate wait ---
 
 
 // --- JSONL discovery + tailing ---

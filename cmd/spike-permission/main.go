@@ -349,8 +349,11 @@ func runSession(
 	ctx, cancelCause := context.WithCancelCause(parentCtx)
 	defer cancelCause(errors.New("runSession: returning"))
 
-	tr := newTracker()
-	tr.recordTransition(fmt.Sprintf("session=%s start", tag))
+	tr := tuidriver.NewTracker(tuidriver.TrackerOpts{
+		PTYQuietLimit:      ptyQuietLimit,
+		SpinnerFreezeLimit: spinnerFreezeLimit,
+	})
+	tr.RecordTransition(fmt.Sprintf("session=%s start", tag))
 
 	// Drop --permission-mode bypassPermissions (spikes #1/#9/#11 used it
 	// to skip the modal; we WANT the modal here). Let claude pick its own
@@ -394,8 +397,8 @@ func runSession(
 				snap := rb.Snapshot()
 				stripped := tuidriver.StripANSI(snap)
 				_, total, ok := matchSpinner(stripped)
-				tr.observeSpinner(ok, total)
-				if werr := tr.checkWatchdog(rb); werr != nil {
+				tr.ObserveSpinner(ok, total)
+				if werr := tr.CheckWatchdog(rb); werr != nil {
 					logger.Printf("%v", werr)
 					cancelCause(werr)
 					return
@@ -411,7 +414,7 @@ func runSession(
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
-	tr.recordTransition(fmt.Sprintf("session=%s idle-detected", tag))
+	tr.RecordTransition(fmt.Sprintf("session=%s idle-detected", tag))
 	logger.Printf("idle-detected tag=%s", tag)
 
 	if tuidriver.HasTrustModal(rb.Snapshot()) {
@@ -422,7 +425,7 @@ func runSession(
 			if _, err := ptmx.Write([]byte("1\r")); err != nil {
 				return fmt.Errorf("write trust-accept keystroke: %w", err)
 			}
-			tr.recordTransition(fmt.Sprintf("session=%s trust-folder-accepted", tag))
+			tr.RecordTransition(fmt.Sprintf("session=%s trust-folder-accepted", tag))
 			logger.Printf("trust-folder-accepted tag=%s bytes=31 0d", tag)
 			if err := tuidriver.WaitUntil(ctx, func() bool {
 				snap := rb.Snapshot()
@@ -430,7 +433,7 @@ func runSession(
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
 			}
-			tr.recordTransition(fmt.Sprintf("session=%s idle-detected-post-trust", tag))
+			tr.RecordTransition(fmt.Sprintf("session=%s idle-detected-post-trust", tag))
 			logger.Printf("idle-detected-post-trust tag=%s", tag)
 		}
 	}
@@ -502,11 +505,11 @@ func runObserve(
 	ptmx *os.File,
 	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
-	tr *tracker,
+	tr *tuidriver.Tracker,
 	postPromptHook func() error,
 ) error {
 	logger.Printf("probe=%d probe-start kind=%q prompt=%q", probeN, ProbeKind(kindObserve).String(), prompt)
-	tr.recordTransition(fmt.Sprintf("probe=%d probe-start", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d probe-start", probeN))
 
 	if err := clearInputLine(ptmx); err != nil {
 		return fmt.Errorf("clear input line: %w", err)
@@ -514,7 +517,7 @@ func runObserve(
 	if err := typePrompt(ptmx, prompt); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
 	}
-	tr.recordTransition(fmt.Sprintf("probe=%d prompt-written", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d prompt-written", probeN))
 	logger.Printf("probe=%d prompt-written", probeN)
 
 	if postPromptHook != nil {
@@ -527,12 +530,12 @@ func runObserve(
 	if err := waitForModal(ctx, rb, pred, modalDetectLimit); err != nil {
 		return fmt.Errorf("probe %d: %w", probeN, err)
 	}
-	tr.recordTransition(fmt.Sprintf("probe=%d modal-detected", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d modal-detected", probeN))
 	logger.Printf("probe=%d modal-detected pattern=%q", probeN, pred.String())
 
 	// Snapshot bytes + persist to tempfile + log truncated extracted text.
 	snap := rb.Snapshot()
-	tr.recordTransition(fmt.Sprintf("probe=%d modal-bytes-snapshot", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d modal-bytes-snapshot", probeN))
 	logger.Printf("probe=%d modal-bytes-snapshot len=%d", probeN, len(snap))
 
 	snapPath := fmt.Sprintf("/tmp/spike-permission-probe%d-bytes-%d.bin", probeN, time.Now().UnixNano())
@@ -543,13 +546,13 @@ func runObserve(
 	}
 
 	text := extractModalText(snap)
-	tr.recordTransition(fmt.Sprintf("probe=%d modal-text-extracted", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d modal-text-extracted", probeN))
 	logger.Printf("probe=%d modal-text-extracted text=%q", probeN, truncateForLog(text, 200))
 
 	// Drain JSONL events for observationWindow. Bump tracker once at start
 	// and once at end so the watchdog doesn't trip during a 5 s quiet
 	// window.
-	tr.recordTransition(fmt.Sprintf("probe=%d observation-window-start", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d observation-window-start", probeN))
 	logger.Printf("probe=%d observation-window-start window=%s", probeN, observationWindow)
 
 	count := 0
@@ -567,7 +570,7 @@ loop:
 		}
 	}
 
-	tr.recordTransition(fmt.Sprintf("probe=%d observation-window-end", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d observation-window-end", probeN))
 	logger.Printf("probe=%d observation-window-end events=%d", probeN, count)
 	return nil
 }
@@ -586,11 +589,11 @@ func runAutoRespond(
 	ptmx *os.File,
 	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
-	tr *tracker,
+	tr *tuidriver.Tracker,
 	postPromptHook func() error,
 ) error {
 	logger.Printf("probe=%d probe-start kind=%q prompt=%q", probeN, ProbeKind(kindAutoRespond).String(), prompt)
-	tr.recordTransition(fmt.Sprintf("probe=%d probe-start", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d probe-start", probeN))
 
 	if err := clearInputLine(ptmx); err != nil {
 		return fmt.Errorf("clear input line: %w", err)
@@ -598,7 +601,7 @@ func runAutoRespond(
 	if err := typePrompt(ptmx, prompt); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
 	}
-	tr.recordTransition(fmt.Sprintf("probe=%d prompt-written", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d prompt-written", probeN))
 	logger.Printf("probe=%d prompt-written", probeN)
 
 	if postPromptHook != nil {
@@ -610,7 +613,7 @@ func runAutoRespond(
 	if err := waitForModal(ctx, rb, pred, modalDetectLimit); err != nil {
 		return fmt.Errorf("probe %d: %w", probeN, err)
 	}
-	tr.recordTransition(fmt.Sprintf("probe=%d modal-detected", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d modal-detected", probeN))
 	logger.Printf("probe=%d modal-detected pattern=%q", probeN, pred.String())
 
 	text := extractModalText(rb.Snapshot())
@@ -619,7 +622,7 @@ func runAutoRespond(
 	if err := sendKeystroke(ptmx, approveKey); err != nil {
 		return fmt.Errorf("send approve: %w", err)
 	}
-	tr.recordTransition(fmt.Sprintf("probe=%d response-keystroke-sent", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d response-keystroke-sent", probeN))
 	logger.Printf("probe=%d response-keystroke-sent bytes=%s", probeN, approveHex)
 
 	// Single post-keystroke loop. Two transitions to log along the way:
@@ -676,7 +679,7 @@ func runAutoRespond(
 			events = append(events, ev)
 			if !modalCleared {
 				modalCleared = true
-				tr.recordTransition(fmt.Sprintf("probe=%d modal-cleared", probeN))
+				tr.RecordTransition(fmt.Sprintf("probe=%d modal-cleared", probeN))
 				logger.Printf("probe=%d modal-cleared", probeN)
 			}
 			if isEndTurn(ev) {
@@ -691,11 +694,11 @@ func runAutoRespond(
 		}
 	}
 
-	tr.recordTransition(fmt.Sprintf("probe=%d end-turn-detected", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d end-turn-detected", probeN))
 	logger.Printf("probe=%d end-turn-detected msg_id=%s", probeN, latestEndTurnMsgID)
 
 	out := extractByMsgID(events, latestEndTurnMsgID)
-	tr.recordTransition(fmt.Sprintf("probe=%d assistant-text-extracted", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d assistant-text-extracted", probeN))
 	logger.Printf("probe=%d assistant-text-extracted len=%d", probeN, len(out))
 
 	fmt.Printf("SUCCESS: %s\n", out)
@@ -715,10 +718,10 @@ func runEscalate(
 	ptmx *os.File,
 	rb *tuidriver.Buffer,
 	eventCh <-chan map[string]any,
-	tr *tracker,
+	tr *tuidriver.Tracker,
 ) error {
 	logger.Printf("probe=%d probe-start kind=%q prompt=%q", probeN, ProbeKind(kindEscalate).String(), prompt)
-	tr.recordTransition(fmt.Sprintf("probe=%d probe-start", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d probe-start", probeN))
 
 	// Drain any straggler events from Probe 2 so they don't pollute
 	// Probe 3's diagnostics.
@@ -737,13 +740,13 @@ drain:
 	if err := typePrompt(ptmx, prompt); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
 	}
-	tr.recordTransition(fmt.Sprintf("probe=%d prompt-written", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d prompt-written", probeN))
 	logger.Printf("probe=%d prompt-written", probeN)
 
 	if err := waitForModal(ctx, rb, pred, modalDetectLimit); err != nil {
 		return fmt.Errorf("probe %d: %w", probeN, err)
 	}
-	tr.recordTransition(fmt.Sprintf("probe=%d modal-detected", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d modal-detected", probeN))
 	logger.Printf("probe=%d modal-detected pattern=%q", probeN, pred.String())
 
 	snap := rb.Snapshot()
@@ -757,14 +760,14 @@ drain:
 
 	text := extractModalText(snap)
 	tool := extractToolName(snap)
-	tr.recordTransition(fmt.Sprintf("probe=%d modal-text-extracted", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d modal-text-extracted", probeN))
 	logger.Printf("probe=%d modal-text-extracted text=%q", probeN, truncateForLog(text, 200))
 
-	tr.recordTransition(fmt.Sprintf("probe=%d modal-escalation-callback-would-receive", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d modal-escalation-callback-would-receive", probeN))
 	logger.Printf("probe=%d modal-escalation-callback-would-receive text=%q tool=%s",
 		probeN, truncateForLog(text, 200), tool)
 
-	tr.recordTransition(fmt.Sprintf("probe=%d escalation-simulated", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d escalation-simulated", probeN))
 	logger.Printf("probe=%d escalation-simulated", probeN)
 
 	// Sleep escalationWindow; afterwards verify the modal is still up.
@@ -775,7 +778,7 @@ drain:
 	}
 
 	stillOpen := hasModal(rb.Snapshot(), pred)
-	tr.recordTransition(fmt.Sprintf("probe=%d modal-still-open", probeN))
+	tr.RecordTransition(fmt.Sprintf("probe=%d modal-still-open", probeN))
 	logger.Printf("probe=%d modal-still-open=%v", probeN, stillOpen)
 
 	return nil
@@ -1106,73 +1109,6 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	seconds, _ := strconv.Atoi(string(m[3]))
 	return string(m[1]), minutes*60 + seconds, true
 }
-
-
-// --- tracker (state + watchdog bookkeeping) ---
-// copied from cmd/spike-cancel/main.go — keep in sync until library extraction
-
-type tracker struct {
-	mu                    sync.Mutex
-	currentState          string
-	lastTransitionAt      time.Time
-	lastSpinnerProgressAt time.Time
-	lastSpinnerTotal      int
-	spinnerActive         bool
-}
-
-func newTracker() *tracker { return &tracker{} }
-
-func (t *tracker) recordTransition(state string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.currentState = state
-	t.lastTransitionAt = time.Now()
-}
-
-func (t *tracker) observeSpinner(visible bool, totalSeconds int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := time.Now()
-	if !visible {
-		t.spinnerActive = false
-		t.lastSpinnerTotal = 0
-		return
-	}
-	if !t.spinnerActive {
-		t.spinnerActive = true
-		t.lastSpinnerTotal = totalSeconds
-		t.lastSpinnerProgressAt = now
-		return
-	}
-	if totalSeconds > t.lastSpinnerTotal {
-		t.lastSpinnerTotal = totalSeconds
-		t.lastSpinnerProgressAt = now
-	}
-}
-
-// checkWatchdog is called from the per-tick goroutine with the rolling
-// buffer. Replaces the prior state-transition-based inactivity check
-// with a PTY-heartbeat check: PTY bytes flowing == claude alive,
-// regardless of which state the probe thinks it's in. Spinner-freeze
-// stays as a separate signal (claude says it's thinking but isn't
-// progressing). No wall-clock cap — see ptyQuietLimit comment.
-func (t *tracker) checkWatchdog(rb *tuidriver.Buffer) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := time.Now()
-	if quiet := rb.QuietFor(); quiet > ptyQuietLimit {
-		return fmt.Errorf("watchdog: PTY quiet for %s (last state: %s)",
-			quiet.Round(time.Second), t.currentState)
-	}
-	if t.spinnerActive && now.Sub(t.lastSpinnerProgressAt) > spinnerFreezeLimit {
-		return fmt.Errorf("watchdog: spinner counter frozen at %ds for %s",
-			t.lastSpinnerTotal, now.Sub(t.lastSpinnerProgressAt).Round(time.Second))
-	}
-	return nil
-}
-
-// --- generic predicate wait ---
-// copied from cmd/spike-cancel/main.go — keep in sync until library extraction
 
 
 // --- JSONL discovery + tailing ---
