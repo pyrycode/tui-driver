@@ -160,7 +160,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 		}
 	}()
 
-	if err := waitUntil(rootCtx, func() bool { return tuidriver.IsIdle(rb.Snapshot()) }); err != nil {
+	if err := tuidriver.WaitUntil(rootCtx, func() bool { return tuidriver.IsIdle(rb.Snapshot()) }); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
 	tr.recordTransition("idle-detected")
@@ -176,7 +176,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 			}
 			tr.recordTransition("trust-folder-accepted")
 			logger.Printf("trust-folder-accepted")
-			if err := waitUntil(rootCtx, func() bool {
+			if err := tuidriver.WaitUntil(rootCtx, func() bool {
 				snap := rb.Snapshot()
 				return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
 			}); err != nil {
@@ -374,20 +374,6 @@ func (t *tracker) checkWatchdog(rb *tuidriver.Buffer) error {
 	return nil
 }
 
-func waitUntil(ctx context.Context, predicate func() bool) error {
-	ticker := time.NewTicker(statePollInterval)
-	defer ticker.Stop()
-	for {
-		if predicate() {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
-}
 
 // hasAskUserModal: claude's AskUserQuestion tool renders an interactive
 // modal in the TUI with a unique hint-bar at the bottom:

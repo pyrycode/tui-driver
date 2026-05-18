@@ -406,7 +406,7 @@ func runSession(
 
 	// Wait for idle (❯ glyph + no spinner). Same predicate as the other
 	// spikes.
-	if err := waitUntil(ctx, func() bool {
+	if err := tuidriver.WaitUntil(ctx, func() bool {
 		return tuidriver.IsIdle(rb.Snapshot())
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
@@ -424,7 +424,7 @@ func runSession(
 			}
 			tr.recordTransition(fmt.Sprintf("session=%s trust-folder-accepted", tag))
 			logger.Printf("trust-folder-accepted tag=%s bytes=31 0d", tag)
-			if err := waitUntil(ctx, func() bool {
+			if err := tuidriver.WaitUntil(ctx, func() bool {
 				snap := rb.Snapshot()
 				return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
 			}); err != nil {
@@ -1174,23 +1174,6 @@ func (t *tracker) checkWatchdog(rb *tuidriver.Buffer) error {
 // --- generic predicate wait ---
 // copied from cmd/spike-cancel/main.go — keep in sync until library extraction
 
-func waitUntil(ctx context.Context, predicate func() bool) error {
-	if predicate() {
-		return nil
-	}
-	ticker := time.NewTicker(statePollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		case <-ticker.C:
-			if predicate() {
-				return nil
-			}
-		}
-	}
-}
 
 // --- JSONL discovery + tailing ---
 // copied from cmd/spike-cancel/main.go — keep in sync until library extraction
