@@ -59,7 +59,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -350,7 +349,6 @@ func runSession(
 	ctx, cancelCause := context.WithCancelCause(parentCtx)
 	defer cancelCause(errors.New("runSession: returning"))
 
-	rb := tuidriver.NewBuffer(0)
 	tr := newTracker()
 	tr.recordTransition(fmt.Sprintf("session=%s start", tag))
 
@@ -360,51 +358,22 @@ func runSession(
 	cmd := exec.Command("claude", "--session-id", sessionID)
 	tuidriver.EnsureClaudeEnv(cmd)
 
-	ptmx, err := tuidriver.StartPTY(cmd)
+	session, err := tuidriver.Spawn(cmd, tuidriver.SpawnOpts{
+		Mirror:        os.Stderr,
+		ShutdownGrace: shutdownGrace,
+	})
 	if err != nil {
 		return fmt.Errorf("pty.Start: %w", err)
 	}
-
-	cmdExited := make(chan error, 1)
-	go func() { cmdExited <- cmd.Wait() }()
+	defer func() {
+		logger.Printf("shutdown-signalled tag=%s", tag)
+		_ = session.Close()
+		cancelCause(errors.New("shutdown"))
+	}()
+	rb := session.Buffer
+	ptmx := session.PTY
 
 	var wg sync.WaitGroup
-
-	var shutdownOnce sync.Once
-	shutdown := func() {
-		shutdownOnce.Do(func() {
-			logger.Printf("shutdown-signalled tag=%s", tag)
-			_ = cmd.Process.Signal(syscall.SIGTERM)
-			select {
-			case <-cmdExited:
-			case <-time.After(shutdownGrace):
-				_ = cmd.Process.Signal(syscall.SIGKILL)
-				<-cmdExited
-			}
-			_ = ptmx.Close()
-			cancelCause(errors.New("shutdown"))
-			wg.Wait()
-		})
-	}
-	defer shutdown()
-
-	// PTY reader: append to rolling buffer + mirror raw bytes to stderr.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, 4096)
-		for {
-			n, rerr := ptmx.Read(buf)
-			if n > 0 {
-				chunk := buf[:n]
-				rb.Append(chunk)
-				_, _ = os.Stderr.Write(chunk)
-			}
-			if rerr != nil {
-				return
-			}
-		}
-	}()
 
 	// Watchdog: PTY-quiet-for-30s liveness + 30s spinner-freeze. No
 	// wall-clock cap — long sessions are fine if claude is actually

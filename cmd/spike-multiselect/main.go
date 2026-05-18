@@ -37,7 +37,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/pyrycode/tui-driver/pkg/tuidriver"
@@ -88,7 +87,6 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
 	defer cancelCause(errors.New("run: returning"))
 
-	rb := tuidriver.NewBuffer(0)
 	tr := newTracker()
 	tr.recordTransition("start")
 
@@ -98,50 +96,22 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	cmd := exec.Command("claude")
 	tuidriver.EnsureClaudeEnv(cmd)
 
-	ptmx, err := tuidriver.StartPTY(cmd)
+	session, err := tuidriver.Spawn(cmd, tuidriver.SpawnOpts{
+		Mirror:        os.Stderr,
+		ShutdownGrace: shutdownGrace,
+	})
 	if err != nil {
 		return fmt.Errorf("pty.Start: %w", err)
 	}
-
-	cmdExited := make(chan error, 1)
-	go func() { cmdExited <- cmd.Wait() }()
+	defer func() {
+		logger.Printf("shutdown-signalled")
+		_ = session.Close()
+		cancelCause(errors.New("shutdown"))
+	}()
+	rb := session.Buffer
+	ptmx := session.PTY
 
 	var wg sync.WaitGroup
-	var shutdownOnce sync.Once
-	shutdown := func() {
-		shutdownOnce.Do(func() {
-			logger.Printf("shutdown-signalled")
-			_ = cmd.Process.Signal(syscall.SIGTERM)
-			select {
-			case <-cmdExited:
-			case <-time.After(shutdownGrace):
-				_ = cmd.Process.Signal(syscall.SIGKILL)
-				<-cmdExited
-			}
-			_ = ptmx.Close()
-			cancelCause(errors.New("shutdown"))
-			wg.Wait()
-		})
-	}
-	defer shutdown()
-
-	// PTY reader.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, 4096)
-		for {
-			n, rerr := ptmx.Read(buf)
-			if n > 0 {
-				chunk := buf[:n]
-				rb.Append(chunk)
-				_, _ = os.Stderr.Write(chunk)
-			}
-			if rerr != nil {
-				return
-			}
-		}
-	}()
 
 	// Watchdog: PTY-quiet + spinner-freeze. No wall-cap (per loop 2 wrap-up).
 	wg.Add(1)
