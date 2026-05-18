@@ -120,11 +120,13 @@ var pickerCategoryRe = regexp.MustCompile(`^\(([^)]+)\)\s*(.*)`)
 
 func main() {
 	triggerFlag := flag.String("trigger", "/",
-		"keystroke to trigger the picker: '/' (slash-command autocomplete, default), '@' (file picker), '#' (memory)")
+		"keystroke(s) to trigger the picker/modal. '/' = slash-command picker (default), '@' = file/agent picker, '/mcp\\r' = MCP status modal, '/agents\\r' = agents modal, etc. Use printf '\\r' for CR.")
 	trustFolderFlag := flag.String("trust-folder", "fail",
 		"policy when claude's trust-folder dialog appears at idle: 'fail' (default — return clear error) or 'accept' (send `1\\r` to auto-trust this cwd, then proceed)")
 	postKeysFlag := flag.String("post-trigger-keys", "",
 		"comma-separated keys to send AFTER trigger and BEFORE snapshot: 'down' (\\x1b[B), 'up' (\\x1b[A), 'left' (\\x1b[D), 'right' (\\x1b[C). Each key gets a brief settle delay. Use for D-3 highlight-via-navigation probes.")
+	settleFlag := flag.Duration("settle", 1500*time.Millisecond,
+		"how long to wait after trigger (and any post-trigger keys) before snapshotting. Bump for modals whose state resolves over time (e.g. /mcp's MCP-server-connecting state).")
 	flag.Parse()
 
 	if *trustFolderFlag != "fail" && *trustFolderFlag != "accept" {
@@ -132,13 +134,13 @@ func main() {
 		os.Exit(2)
 	}
 
-	if err := run(*triggerFlag, *trustFolderFlag, *postKeysFlag); err != nil {
+	if err := run(*triggerFlag, *trustFolderFlag, *postKeysFlag, *settleFlag); err != nil {
 		fmt.Fprintf(os.Stderr, "spike failed: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(trigger string, trustFolderPolicy string, postTriggerKeys string) error {
+func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settle time.Duration) error {
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
 	startedAt := time.Now()
 	logger.Printf("trigger=%q", trigger)
@@ -266,11 +268,13 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string) error
 	tr.recordTransition("trigger-sent")
 	logger.Printf("trigger-sent bytes=%x", []byte(trigger))
 
-	// Settle window: let the picker fully render.
+	// Settle window: let the picker/modal fully render. Configurable via
+	// -settle flag (default 1.5s) — bump for modals whose state resolves
+	// over time (e.g. /mcp's MCP-server-connecting state).
 	select {
 	case <-rootCtx.Done():
 		return context.Cause(rootCtx)
-	case <-time.After(settleWindow):
+	case <-time.After(settle):
 	}
 
 	// Loop 4 D-3: post-trigger navigation keys. Send each, settle briefly,
@@ -351,36 +355,82 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string) error
 	logger.Printf("picker-shape has_box_drawing=%v line_count=%d longest_line=%d numbered_options=%v slash_command_lines=%d",
 		hasBox, len(lines), longest, numberedOptions, slashLines)
 
-	// Loop 4 D-1: parse the picker into structured items and dump as JSON
-	// to a sibling file. The mobile-app use case: pyry acp forwards this
-	// list to the host UI, user picks an item, pyry acp sends the matching
-	// keystrokes back through the PTY.
-	items := parsePickerItems(snap)
-	logger.Printf("picker-parsed item_count=%d", len(items))
-	for i, it := range items {
-		marker := " "
-		if it.Highlighted {
-			marker = "*"
+	// Loop 6 F-1: dispatch to the right parser based on detected modal class.
+	// All three classes (slash-picker, /mcp, /agents) parse into structured
+	// JSON that pyry acp can forward to a mobile host UI.
+	modalClass := detectModalClass(snap)
+	logger.Printf("modal-class detected=%s", modalClass)
+
+	jsonPath := strings.TrimSuffix(dumpPath, ".bin") + ".parsed.json"
+	switch modalClass {
+	case "slash-picker":
+		items := parsePickerItems(snap)
+		logger.Printf("picker-parsed item_count=%d", len(items))
+		for i, it := range items {
+			marker := " "
+			if it.Highlighted {
+				marker = "*"
+			}
+			cat := ""
+			if it.Category != "" {
+				cat = "[" + it.Category + "] "
+			}
+			desc := it.Description
+			if len(desc) > 80 {
+				desc = desc[:80] + "…"
+			}
+			logger.Printf("picker-item[%02d]%s %s %s%s", i, marker, it.Command, cat, desc)
 		}
-		cat := ""
-		if it.Category != "" {
-			cat = "[" + it.Category + "] "
+		if len(items) > 0 {
+			jsonBytes, _ := json.MarshalIndent(items, "", "  ")
+			if err := os.WriteFile(jsonPath, jsonBytes, 0o644); err != nil {
+				logger.Printf("warning: write json: %v", err)
+			} else {
+				logger.Printf("parsed-json path=%s", jsonPath)
+			}
 		}
-		// Truncate description for compact logging
-		desc := it.Description
-		if len(desc) > 80 {
-			desc = desc[:80] + "…"
+	case "mcp":
+		mcp := parseMcpStatus(snap)
+		logger.Printf("mcp-parsed total_servers=%d category_count=%d", mcp.TotalServers, len(mcp.Categories))
+		for _, g := range mcp.Categories {
+			logger.Printf("mcp-category name=%q path=%q server_count=%d", g.Name, g.Path, len(g.Servers))
+			for _, s := range g.Servers {
+				marker := " "
+				if s.Highlighted {
+					marker = "*"
+				}
+				toolStr := ""
+				if s.ToolCount > 0 {
+					toolStr = fmt.Sprintf(" (%d tools)", s.ToolCount)
+				}
+				logger.Printf("mcp-server%s %s — %s%s", marker, s.Name, s.Status, toolStr)
+			}
 		}
-		logger.Printf("picker-item[%02d]%s %s %s%s", i, marker, it.Command, cat, desc)
-	}
-	if len(items) > 0 {
-		jsonPath := strings.TrimSuffix(dumpPath, ".bin") + ".items.json"
-		jsonBytes, _ := json.MarshalIndent(items, "", "  ")
+		jsonBytes, _ := json.MarshalIndent(mcp, "", "  ")
 		if err := os.WriteFile(jsonPath, jsonBytes, 0o644); err != nil {
-			logger.Printf("warning: write items json: %v", err)
+			logger.Printf("warning: write json: %v", err)
 		} else {
-			logger.Printf("picker-items-json path=%s", jsonPath)
+			logger.Printf("parsed-json path=%s", jsonPath)
 		}
+	case "agents":
+		al := parseAgentList(snap)
+		logger.Printf("agents-parsed current_tab=%q item_count=%d empty=%q",
+			al.CurrentTab, len(al.Items), al.EmptyText)
+		for i, a := range al.Items {
+			marker := " "
+			if a.Highlighted {
+				marker = "*"
+			}
+			logger.Printf("agents-item[%02d]%s %s", i, marker, a.Name)
+		}
+		jsonBytes, _ := json.MarshalIndent(al, "", "  ")
+		if err := os.WriteFile(jsonPath, jsonBytes, 0o644); err != nil {
+			logger.Printf("warning: write json: %v", err)
+		} else {
+			logger.Printf("parsed-json path=%s", jsonPath)
+		}
+	default:
+		logger.Printf("no-parser-for-modal-class class=%s", modalClass)
 	}
 
 	// Look for some specific picker hints we might recognize.
@@ -574,6 +624,38 @@ type PickerItem struct {
 	Highlighted bool   `json:"highlighted"`
 }
 
+// McpStatus represents the parsed /mcp modal contents. Loop 6 F-1.
+type McpStatus struct {
+	TotalServers int        `json:"total_servers"`
+	Categories   []McpGroup `json:"categories"`
+}
+
+type McpGroup struct {
+	Name    string      `json:"name"`           // "Project MCPs", "User MCPs", "Built-in MCPs"
+	Path    string      `json:"path,omitempty"` // path/parenthetical context
+	Servers []McpServer `json:"servers"`
+}
+
+type McpServer struct {
+	Name        string `json:"name"`
+	Status      string `json:"status"`               // "connecting", "connected", "disabled", "auth_required", "failed"
+	ToolCount   int    `json:"tool_count,omitempty"` // when status=connected
+	Highlighted bool   `json:"highlighted"`          // ❯ marker
+}
+
+// AgentList represents the parsed /agents modal contents. Loop 6 F-1.
+type AgentList struct {
+	Tabs       []string `json:"tabs"`        // ["Running", "Library"]
+	CurrentTab string   `json:"current_tab"` // active tab name
+	Items      []Agent  `json:"items"`       // items in the current tab
+	EmptyText  string   `json:"empty_text,omitempty"`
+}
+
+type Agent struct {
+	Name        string `json:"name"`
+	Highlighted bool   `json:"highlighted"`
+}
+
 // parsePickerItems extracts structured items from a raw PTY snapshot of
 // claude's `/` slash-command picker. Returns items in render order
 // (top-to-bottom). Handles both UNFILTERED and FILTERED modes (see
@@ -687,6 +769,236 @@ func parsePickerItems(snap []byte) []PickerItem {
 		})
 	}
 	return items
+}
+
+// detectModalClass returns the modal currently rendered in the snapshot.
+// Anchors per class (loop 6 F-1):
+//   - "ManageMCPservers"  → /mcp status modal
+//   - "Agents" header + (Running OR Library tabs) → /agents modal
+//   - "?forshortcuts"  → / slash-command picker (unfiltered or filtered)
+//   - "Entertoselect"  → AskUserQuestion modal (loop 5 E-1)
+//   - "Quicksafetycheck" → trust-folder modal (loop 2 B-5)
+//   - "Doyouwanttoproceed" → permission modal (spike #13)
+//
+// Each anchor is unique to its class (verified empirically). Returns
+// "unknown" if no anchor matches.
+func detectModalClass(snap []byte) string {
+	stripped := oscRe.ReplaceAll(ansiRe.ReplaceAll(snap, nil), nil)
+	switch {
+	case bytes.Contains(stripped, []byte("ManageMCPservers")):
+		return "mcp"
+	case bytes.Contains(stripped, []byte("Agents")) &&
+		(bytes.Contains(stripped, []byte("Running")) || bytes.Contains(stripped, []byte("Library"))):
+		return "agents"
+	case bytes.Contains(stripped, []byte("?forshortcuts")) ||
+		bytes.Contains(stripped, []byte("? for shortcuts")):
+		return "slash-picker"
+	case bytes.Contains(stripped, []byte("Entertoselect")) ||
+		bytes.Contains(stripped, []byte("Enter to select")):
+		return "ask-user-question"
+	case bytes.Contains(stripped, []byte("Quicksafetycheck")):
+		return "trust-folder"
+	case bytes.Contains(stripped, []byte("Doyouwanttoproceed")) ||
+		bytes.Contains(stripped, []byte("Do you want to proceed")):
+		return "permission"
+	default:
+		return "unknown"
+	}
+}
+
+// parseMcpStatus extracts /mcp modal contents into structured McpStatus.
+//
+// Layout observed (loop 6 F-1):
+//
+//	Manage MCP servers
+//	N servers                                ← total count
+//	Project MCPs (/path/to/.mcp.json)        ← category header
+//	❯ <name> · <status indicator>            ← ❯ marker = highlighted
+//	  <name> · <status indicator>
+//	User MCPs (/path/to/.claude.json)        ← next category
+//	  <name> · <status indicator>
+//	Built-in MCPs (always available)
+//	  <name> · <status indicator>
+//	https://...                              ← footer URL
+//	↑/↓ to navigate · Enter to confirm · Esc to cancel
+//
+// Status indicator vocabulary:
+//
+//	◯ connecting…    → status="connecting"
+//	◯ disabled       → status="disabled"
+//	✔ed · N tools    → status="connected", tool_count=N
+//	△ needs auth...  → status="auth_required"
+//	✘ failed         → status="failed"
+//
+// CSI cursor-forward stripping collapses word boundaries (e.g.
+// "Manage MCP servers" → "ManageMCPservers"), so the parser uses
+// substring-contains rather than word-tokenized matching.
+func parseMcpStatus(snap []byte) *McpStatus {
+	cleaned := oscRe.ReplaceAll(snap, nil)
+	stripped := csiCursorFwdRe.ReplaceAll(ansiRe.ReplaceAll(cleaned, nil), []byte(" "))
+	// Normalize CR to LF, collapse multi-spaces within lines.
+	text := strings.ReplaceAll(string(stripped), "\r", "\n")
+	lines := strings.Split(text, "\n")
+	for i := range lines {
+		l := lines[i]
+		for strings.Contains(l, "  ") {
+			l = strings.ReplaceAll(l, "  ", " ")
+		}
+		lines[i] = strings.TrimSpace(l)
+	}
+
+	status := &McpStatus{}
+	var currentGroup *McpGroup
+
+	// Track which categories we've already added so re-renders (same /mcp
+	// modal redrawn after MCP servers finish connecting) don't duplicate.
+	seenCategory := map[string]bool{}
+
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		// Skip hint-bar lines (contain navigation hints) and URL footers.
+		if strings.Contains(line, "↑/↓") || strings.Contains(line, "Esc to cancel") ||
+			strings.HasPrefix(line, "https://") {
+			continue
+		}
+		// Total-server count line: "N servers" or "N server". Allow no-space
+		// variants from cursor-forward stripping (e.g. "10servers"). Match
+		// last-wins so the final count after re-renders is captured.
+		if m := regexp.MustCompile(`^(\d+)\s*servers?$`).FindStringSubmatch(line); m != nil {
+			fmt.Sscanf(m[1], "%d", &status.TotalServers)
+			continue
+		}
+		// Category header: "Project MCPs ..." / "User MCPs ..." / "Built-in MCPs ..."
+		// Tolerate missing space between word and "MCPs" (CSI cursor-forward
+		// rendering may produce "ProjectMCPs" with no separator). Dedup by
+		// canonical name across re-renders.
+		if m := regexp.MustCompile(`^(Project|User|Built-in)\s*MCPs\s*(.*)$`).FindStringSubmatch(line); m != nil {
+			canonical := m[1] + " MCPs"
+			if !seenCategory[canonical] {
+				seenCategory[canonical] = true
+				status.Categories = append(status.Categories, McpGroup{Name: canonical, Path: strings.TrimSpace(m[2])})
+			}
+			// Either way, point currentGroup at this canonical category so
+			// subsequent items get attributed correctly.
+			for i := range status.Categories {
+				if status.Categories[i].Name == canonical {
+					currentGroup = &status.Categories[i]
+					break
+				}
+			}
+			continue
+		}
+		// Item line: optional ❯ marker, name, ·, status. Detect ·.
+		if strings.Contains(line, "·") && currentGroup != nil {
+			highlighted := strings.HasPrefix(line, "❯")
+			body := strings.TrimPrefix(line, "❯")
+			body = strings.TrimSpace(body)
+			// Split on first ·
+			idx := strings.Index(body, "·")
+			if idx < 0 {
+				continue
+			}
+			name := strings.TrimSpace(body[:idx])
+			statusPart := strings.TrimSpace(body[idx+len("·"):])
+
+			srv := McpServer{Name: name, Highlighted: highlighted}
+			switch {
+			case strings.Contains(statusPart, "connecting"):
+				srv.Status = "connecting"
+			case strings.Contains(statusPart, "disabled"):
+				srv.Status = "disabled"
+			case strings.Contains(statusPart, "✔"):
+				srv.Status = "connected"
+				if tm := regexp.MustCompile(`(\d+)\s*tools?`).FindStringSubmatch(statusPart); tm != nil {
+					fmt.Sscanf(tm[1], "%d", &srv.ToolCount)
+				}
+			case strings.Contains(statusPart, "△"):
+				srv.Status = "auth_required"
+			case strings.Contains(statusPart, "✘"):
+				srv.Status = "failed"
+			default:
+				srv.Status = "unknown"
+			}
+			// Skip placeholder/garbage rows: empty name, or name that's
+			// actually a status indicator (e.g. "✔ed" standalone — claude
+			// sometimes re-renders just the status string for a server
+			// whose name has already been written further up).
+			if srv.Name == "" {
+				continue
+			}
+			if strings.HasPrefix(srv.Name, "✔") || strings.HasPrefix(srv.Name, "✘") ||
+				strings.HasPrefix(srv.Name, "△") || strings.HasPrefix(srv.Name, "◯") {
+				continue
+			}
+			// Dedupe by name within the current group: re-renders may emit
+			// the same server multiple times with progressively-resolved
+			// status. Keep the last observation (most-resolved state).
+			replaced := false
+			for i := range currentGroup.Servers {
+				if currentGroup.Servers[i].Name == srv.Name {
+					currentGroup.Servers[i] = srv
+					replaced = true
+					break
+				}
+			}
+			if !replaced {
+				currentGroup.Servers = append(currentGroup.Servers, srv)
+			}
+		}
+	}
+	return status
+}
+
+// parseAgentList extracts /agents modal contents into structured AgentList.
+// The modal has a tabbed shape with Running / Library tabs; this parser
+// captures the currently-visible tab's items + tab structure.
+//
+// Layout observed (loop 6 F-1):
+//
+//	Agents  Running   Library                  ← tab bar
+//	No subagents are currently running.        ← empty-state for Running tab
+//	←/→ to switch · ↑/↓ to navigate · Enter to select · Esc to close
+func parseAgentList(snap []byte) *AgentList {
+	cleaned := oscRe.ReplaceAll(snap, nil)
+	stripped := csiCursorFwdRe.ReplaceAll(ansiRe.ReplaceAll(cleaned, nil), []byte(" "))
+	text := strings.ReplaceAll(string(stripped), "\r", "\n")
+	lines := strings.Split(text, "\n")
+	for i := range lines {
+		l := lines[i]
+		for strings.Contains(l, "  ") {
+			l = strings.ReplaceAll(l, "  ", " ")
+		}
+		lines[i] = strings.TrimSpace(l)
+	}
+
+	agents := &AgentList{Tabs: []string{"Running", "Library"}}
+
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		// Tab bar: contains "Agents" + Running/Library (selected one
+		// rendered with different ANSI in raw but normalized here).
+		if strings.HasPrefix(line, "Agents") && (strings.Contains(line, "Running") || strings.Contains(line, "Library")) {
+			// Default heuristic: the tab listed first after "Agents " is
+			// the current one. Empirically the rendered ordering puts the
+			// current tab adjacent to the header.
+			if strings.Index(line, "Running") < strings.Index(line, "Library") {
+				agents.CurrentTab = "Running"
+			} else {
+				agents.CurrentTab = "Library"
+			}
+			continue
+		}
+		// Empty-state text for the Running tab.
+		if strings.Contains(line, "subagents") && strings.Contains(line, "running") {
+			agents.EmptyText = line
+			continue
+		}
+	}
+	return agents
 }
 
 // Compile-time references so we keep parity with the rest of the spike suite.
