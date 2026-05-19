@@ -63,6 +63,58 @@ func TestEnsureClaudeEnvIdempotent(t *testing.T) {
 	}
 }
 
+func TestEnsureClaudeEnvStrictMcpUnsetLeavesArgs(t *testing.T) {
+	t.Setenv(StrictMcpConfigEnv, "")
+	cmd := &exec.Cmd{Path: "claude", Args: []string{"claude", "--session-id", "x"}}
+	EnsureClaudeEnv(cmd)
+	for _, a := range cmd.Args {
+		if a == "--strict-mcp-config" {
+			t.Errorf("Args = %v, contains --strict-mcp-config but env unset", cmd.Args)
+		}
+	}
+}
+
+func TestEnsureClaudeEnvStrictMcpEnabledAppends(t *testing.T) {
+	t.Setenv(StrictMcpConfigEnv, "1")
+	cmd := &exec.Cmd{Path: "claude", Args: []string{"claude", "--session-id", "x"}}
+	EnsureClaudeEnv(cmd)
+	count := 0
+	for _, a := range cmd.Args {
+		if a == "--strict-mcp-config" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("got %d --strict-mcp-config entries, want 1: %v", count, cmd.Args)
+	}
+}
+
+func TestEnsureClaudeEnvStrictMcpEnabledNoDoubleAppend(t *testing.T) {
+	t.Setenv(StrictMcpConfigEnv, "1")
+	cmd := &exec.Cmd{Path: "claude", Args: []string{"claude", "--strict-mcp-config", "--session-id", "x"}}
+	EnsureClaudeEnv(cmd)
+	count := 0
+	for _, a := range cmd.Args {
+		if a == "--strict-mcp-config" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("got %d --strict-mcp-config entries, want 1 (no double-append): %v", count, cmd.Args)
+	}
+}
+
+func TestEnsureClaudeEnvStrictMcpOtherValueIgnored(t *testing.T) {
+	t.Setenv(StrictMcpConfigEnv, "true")
+	cmd := &exec.Cmd{Path: "claude", Args: []string{"claude", "--session-id", "x"}}
+	EnsureClaudeEnv(cmd)
+	for _, a := range cmd.Args {
+		if a == "--strict-mcp-config" {
+			t.Errorf("Args = %v, contains --strict-mcp-config but env was %q (want exact \"1\")", cmd.Args, "true")
+		}
+	}
+}
+
 func contains(haystack []string, needle string) bool {
 	for _, s := range haystack {
 		if s == needle {

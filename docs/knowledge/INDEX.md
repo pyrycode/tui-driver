@@ -14,7 +14,7 @@ One-line summary per evergreen doc. Cross-reference target — keep it terse.
 
 ## Features
 
-(none yet — the code is four throwaway spikes in `cmd/spike-one-turn/`, `cmd/spike-multi-turn/`, `cmd/spike-cancel/`, and `cmd/spike-permission/`; see the per-ticket notes under `codebase/` for what each ticket touched)
+- [e2e harness](features/e2e-harness.md) — `make e2e` runs every spike + probe serially against real `claude` and emits `e2e-report.json` (pass/fail/timeout per check, single CI artifact); headless-MCP plumbing rides the `EnsureClaudeEnv` seam via `TUIDRIVER_STRICT_MCP_CONFIG=1`
 
 ## Per-ticket notes
 

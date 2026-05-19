@@ -101,8 +101,17 @@ Shutdown is a `defer` with a `sync.Once`-guarded body: SIGTERM → 3 s grace rac
 - **Modal text extraction:** last `─{20,}` run BEFORE the proceed-marker is the start anchor; the line containing `Esctocancel` is the end anchor. Per-line, strip leading/trailing box-drawing border chars + whitespace, drop empty lines, join with `\n`. Robust across both Bash and Read modal variants (the alternatives — `modalSepRe.Split`, walk-back-N-newlines from the marker — fail for one or the other). Implemented in `cmd/spike-permission/main.go` as `extractModalText`. See [#13](../codebase/13.md).
 - **Approve keystroke (permission modals):** `1\r` (`0x31 0x0d`) — single bulk `pty.Write`, no inter-byte delay. Matches the on-screen `❯1.Yes` numbered default ("Yes, once" — narrowest grant). `y\r`, bare `\r`, and `\x1b[B\r` (down + enter) also work; the down-arrow variant selects option 2 (project- or session-scope grant, tool-dependent) and is ~1 s slower. Library default for "approve once" should be `1\r`; "approve broader scope" is a separate product affordance, not a fallback. Same single-byte single-write semantics as the cancel keystroke — both go through `sendKeystroke` (which is the same body spike #11 introduced as `sendCancel`, renamed because cancel and approve share semantics). See [#13](../codebase/13.md).
 
+## e2e harness
+
+Top-level orchestrator at `cmd/e2e-runner/`, invoked by `make e2e`. Operates orthogonally to the rest of the system — it does not import `pkg/tuidriver/`, just shells out to the prebuilt spike + probe binaries under `./bin/<name>` and emits a single-file `e2e-report.json` artifact. Runs sequentially in one goroutine; `exec.CommandContext` handles subprocess lifecycle (SIGKILL on cancel) so no manual signal plumbing is required.
+
+Headless-CI plumbing rides a single seam in `pkg/tuidriver/pty.go`: when `TUIDRIVER_STRICT_MCP_CONFIG=1` is set in the env, `EnsureClaudeEnv(cmd)` additionally appends `--strict-mcp-config` to `cmd.Args` (idempotent — skipped if already present). Every spike+probe already calls `EnsureClaudeEnv` between `exec.Command("claude", ...)` and `pty.Start`; the runner sets the env var on each child process, so the flag flows transparently with zero spike-side changes. Exported constant `tuidriver.StrictMcpConfigEnv` is the contract for the env-var name.
+
+See [features/e2e-harness.md](../features/e2e-harness.md) for the operator runbook, report schema, and CLI flags. See [#34](../codebase/34.md) for the build notes.
+
 ## Related
 
 - [ADR-0001 — Hybrid JSONL + TUI](../decisions/0001-hybrid-jsonl-tui.md)
 - [ADR-0002 — Pattern matching over emulation](../decisions/0002-pattern-matching-over-emulation.md)
 - [JSONL layout](jsonl-layout.md)
+- [e2e harness feature doc](../features/e2e-harness.md)

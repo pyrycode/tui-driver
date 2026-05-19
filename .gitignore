@@ -12,7 +12,9 @@ tui-driver
 /spike-multiselect
 /spike-ask-user
 /probe-first-prompt-hang
+/e2e-runner
 /bin/
+/e2e-report.json
 
 # Test
 *.test
@@ -38,7 +40,7 @@ go.work.sum
 
 # CodeGraph index (per-machine; populated by `codegraph init -i` + refreshed
 # automatically by the dispatcher's post-merge hook on agent-driven changes)
-.codegraph/
+.codegraph
 
 # Dispatcher's per-target lock file (prevents two dispatchers from racing the
 # same target repo).
