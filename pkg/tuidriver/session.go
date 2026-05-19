@@ -119,6 +119,46 @@ func (s *Session) Write(p []byte) (int, error) {
 	return s.PTY.Write(p)
 }
 
+// WritePrompt sends text to the PTY wrapped in bracketed-paste escape
+// sequences (\x1b[200~ ... \x1b[201~) followed by \r OUTSIDE the markers.
+// Use this for any prompt longer than ~1 KB or containing newlines.
+//
+// Why: claude's TUI auto-detects pastes (input bytes arriving faster than
+// human typing trigger paste-detection). When it fires, the input is held
+// in the input area as "[Pasted text +N lines]" chips and claude waits for
+// an explicit Enter to commit. A naive Session.Write(prompt + "\r") for a
+// long or multi-line prompt gets the \r swallowed into the paste body, so
+// the turn never commits and claude stays idle indefinitely.
+//
+// WritePrompt makes the boundaries explicit: \x1b[200~ opens the paste,
+// the text follows verbatim (newlines OK), \x1b[201~ closes it, and the
+// trailing \r is the commit signal.
+//
+// Empirically validated 2026-05-19 against claude 2.1.144 with a 3.5 KB
+// multi-line prompt containing markers at start/middle/end — claude
+// received all three. The naive path (Write of the same bytes + \r) left
+// the input pending with three "Pasted text" chips and never committed.
+//
+// Returns the first non-nil error from the underlying PTY write. Short
+// prompts (e.g. single-token responses to modals like "1\r" for permission
+// approval) should still use Write, not WritePrompt — paste-wrapping a
+// single token has no upside.
+func (s *Session) WritePrompt(text string) error {
+	_, err := s.PTY.Write(bracketedPaste(text))
+	return err
+}
+
+// bracketedPaste builds the byte payload WritePrompt writes: open marker,
+// text verbatim, close marker, trailing \r outside the markers. Factored
+// out so the wire shape can be unit-tested without spawning a PTY.
+func bracketedPaste(text string) []byte {
+	out := make([]byte, 0, len(text)+13)
+	out = append(out, "\x1b[200~"...)
+	out = append(out, text...)
+	out = append(out, "\x1b[201~\r"...)
+	return out
+}
+
 // Wait blocks until the underlying process exits. Returns the exit error
 // (or nil for clean exit). Safe to call from multiple goroutines and
 // before/after Close.
