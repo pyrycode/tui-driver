@@ -83,6 +83,70 @@ func TestSpawnWriteSendsToPTY(t *testing.T) {
 	t.Errorf("Buffer never received echoed input; snap=%q", s.Buffer.Snapshot())
 }
 
+func TestBracketedPasteWrapping(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want []byte
+	}{
+		{
+			name: "short single line",
+			in:   "hi",
+			want: []byte("\x1b[200~hi\x1b[201~\r"),
+		},
+		{
+			name: "multi-line preserves embedded newlines verbatim",
+			in:   "line one\nline two\nline three",
+			want: []byte("\x1b[200~line one\nline two\nline three\x1b[201~\r"),
+		},
+		{
+			name: "empty input still emits markers + commit",
+			in:   "",
+			want: []byte("\x1b[200~\x1b[201~\r"),
+		},
+		{
+			name: "embedded CR survives unchanged inside body",
+			in:   "before\rafter",
+			want: []byte("\x1b[200~before\rafter\x1b[201~\r"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := bracketedPaste(tt.in)
+			if !bytes.Equal(got, tt.want) {
+				t.Errorf("bracketedPaste(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSessionWritePromptSendsBracketedPaste(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PTY tests skipped on Windows")
+	}
+	// `cat` echoes whatever bytes hit its stdin back to stdout — the PTY
+	// master sees both, so the buffer captures exactly what we wrote.
+	cmd := exec.Command("cat")
+	s, err := Spawn(cmd, SpawnOpts{})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.WritePrompt("ping"); err != nil {
+		t.Fatalf("WritePrompt: %v", err)
+	}
+	expected := []byte("\x1b[200~ping\x1b[201~")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if bytes.Contains(s.Buffer.Snapshot(), expected) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("Buffer never received bracketed-paste sequence; snap=%q", s.Buffer.Snapshot())
+}
+
 func TestSessionCloseIsIdempotent(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY tests skipped on Windows")
