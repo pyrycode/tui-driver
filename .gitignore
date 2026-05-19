@@ -8,6 +8,10 @@ tui-driver
 /spike-one-turn
 /spike-cancel
 /spike-permission
+/spike-multi-turn
+/spike-multiselect
+/spike-ask-user
+/probe-first-prompt-hang
 /bin/
 
 # Test
