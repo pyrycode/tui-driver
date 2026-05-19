@@ -29,10 +29,10 @@ import (
 )
 
 const (
-	defaultCheckTimeout   = 60 * time.Second
-	probeCheckTimeout     = 30 * time.Second
-	snapshotDriftTimeout  = 180 * time.Second
-	defaultWallBudget     = 10 * time.Minute
+	defaultCheckTimeout  = 60 * time.Second
+	probeCheckTimeout    = 30 * time.Second
+	snapshotDriftTimeout = 180 * time.Second
+	defaultWallBudget    = 10 * time.Minute
 )
 
 // successSuccess matches the four "result" spikes' `SUCCESS: <text>` line.
@@ -54,8 +54,8 @@ var snapshotResultRe = regexp.MustCompile(`(?m)^SNAPSHOT (picker|mcp|agents) (ma
 // startup from the hardcoded check list; runCheck consumes them uniformly.
 type Check struct {
 	Name          string
-	Kind          string         // "spike" | "probe" | "snapshot" — informational only
-	Binary        string         // path within -bin-dir
+	Kind          string // "spike" | "probe" | "snapshot" | "version-lock" — informational only
+	Binary        string // path within -bin-dir
 	Args          []string
 	SuccessMarker *regexp.Regexp // nil = exit-code-only success
 	Timeout       time.Duration  // zero falls back to defaultCheckTimeout
@@ -64,6 +64,12 @@ type Check struct {
 	// Use for fields that must appear on pass entries (e.g. snapshot-drift's
 	// per-fixture result list).
 	OnComplete func(stdout, stderr string) map[string]any
+	// Run is an in-process check body. When non-nil, runCheck calls Run
+	// instead of spawning Binary, and returns a CheckResult directly.
+	// OnFailure / OnComplete are NOT invoked for in-process checks — Run
+	// returns its extra fields directly. Binary / Args / SuccessMarker are
+	// ignored when Run is set.
+	Run func(ctx context.Context) (status string, extra map[string]any)
 }
 
 // CheckResult is the per-check entry surfaced into the report. Extra is
@@ -114,8 +120,16 @@ func main() {
 	binDir := flag.String("bin-dir", "./bin", "directory containing built spike+probe binaries")
 	reportPath := flag.String("report", "./e2e-report.json", "output path for e2e-report.json")
 	wall := flag.Duration("wall", defaultWallBudget, "top-level wall budget for the whole run")
+	lockPath := flag.String("lock", "./claude-version.lock", "path to claude-version.lock")
 
-	checks := buildChecks()
+	// Captured below via captureClaudeVersion. The version-lock closure
+	// reads it lazily so the same variable feeds both Report.ClaudeVersion
+	// and the parsed installed_version field in the check's report entry.
+	var claudeVersion string
+	runVersionLock := func(ctx context.Context) (string, map[string]any) {
+		return runClaudeVersionLockCheck(ctx, claudeVersion, *lockPath)
+	}
+	checks := buildChecks(runVersionLock)
 	tos := &timeoutOverrides{known: map[string]bool{}}
 	for _, c := range checks {
 		tos.known[c.Name] = true
@@ -139,14 +153,16 @@ func main() {
 	defer cancel()
 
 	runStart := time.Now()
-	claudeVersion := captureClaudeVersion(parentCtx)
+	claudeVersion = captureClaudeVersion(parentCtx)
 	fmt.Fprintf(os.Stderr, "e2e-runner: claude_version=%q\n", claudeVersion)
 
 	results := make([]CheckResult, 0, len(checks))
 	allPassed := true
+	skipRest := false
 	for _, c := range checks {
-		if parentCtx.Err() != nil {
-			// Top-level wall budget exhausted — report remaining checks as
+		if parentCtx.Err() != nil || skipRest {
+			// Either top-level wall budget exhausted, or claude-version-lock
+			// failed and short-circuited the run. Report remaining checks as
 			// timeout with duration_ms=0 so the array length stays stable.
 			results = append(results, CheckResult{
 				Name:       c.Name,
@@ -161,6 +177,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "e2e-runner: %s -> %s (%dms)\n", r.Name, r.Status, r.DurationMs)
 		if r.Status != "pass" {
 			allPassed = false
+		}
+		if r.Name == "claude-version-lock" && r.Status != "pass" {
+			skipRest = true
 		}
 		results = append(results, r)
 	}
@@ -185,10 +204,17 @@ func main() {
 
 // buildChecks returns the hardcoded list of checks. Order matters: serial
 // execution iterates this slice in order, so cheap checks first means
-// quicker failure feedback in CI.
-func buildChecks() []Check {
+// quicker failure feedback in CI. The first entry, claude-version-lock,
+// is in-process; its Run closure is supplied by main (it needs the
+// already-captured claude --version output, which lives in main's scope).
+func buildChecks(runVersionLock func(ctx context.Context) (string, map[string]any)) []Check {
 	commonArgs := []string{"-trust-folder=accept"}
 	return []Check{
+		{
+			Name: "claude-version-lock",
+			Kind: "version-lock",
+			Run:  runVersionLock,
+		},
 		{
 			Name:          "spike-one-turn",
 			Kind:          "spike",
@@ -287,6 +313,131 @@ func captureClaudeVersion(ctx context.Context) string {
 	return strings.TrimSpace(string(out))
 }
 
+// parseClaudeVersion extracts the leading whitespace-separated token from
+// `claude --version` output (e.g. "2.1.144 (Claude Code)" -> "2.1.144").
+// Returns "" for empty / whitespace-only input.
+func parseClaudeVersion(raw string) string {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+// lockFile is the parsed contents of claude-version.lock.
+type lockFile struct {
+	Version string
+	Flags   []string
+}
+
+// parseLockFile reads and parses the claude-version.lock file at path. See
+// the format rules in docs/specs/architecture/36-claude-version-lock.md
+// (key=value, # comments, exactly one version= line, zero or more flag=
+// lines, empty values rejected).
+func parseLockFile(path string) (lockFile, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return lockFile{}, err
+	}
+	var lf lockFile
+	versionSeen := false
+	lines := strings.Split(string(b), "\n")
+	for i, raw := range lines {
+		lineNo := i + 1
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq < 0 {
+			return lockFile{}, fmt.Errorf("at line %d: expected key=value, got %q", lineNo, line)
+		}
+		key := strings.TrimSpace(line[:eq])
+		value := strings.TrimSpace(line[eq+1:])
+		switch key {
+		case "version":
+			if value == "" {
+				return lockFile{}, fmt.Errorf("at line %d: empty version value", lineNo)
+			}
+			if versionSeen {
+				return lockFile{}, fmt.Errorf("at line %d: duplicate version key", lineNo)
+			}
+			lf.Version = value
+			versionSeen = true
+		case "flag":
+			if value == "" {
+				return lockFile{}, fmt.Errorf("at line %d: empty flag value", lineNo)
+			}
+			lf.Flags = append(lf.Flags, value)
+		default:
+			return lockFile{}, fmt.Errorf("at line %d: unknown key %q", lineNo, key)
+		}
+	}
+	if !versionSeen {
+		return lockFile{}, fmt.Errorf("missing required version= line")
+	}
+	return lf, nil
+}
+
+// runClaudeVersionLockCheck is the Run callback for the claude-version-lock
+// check. It compares the captured `claude --version` output against the
+// lock file's version field and asserts that every flag the library
+// depends on still appears verbatim in `claude --help`. The extra map
+// always carries installed_version, expected_version, and missing_flags
+// so the report schema stays uniform across pass/fail.
+func runClaudeVersionLockCheck(ctx context.Context, capturedVersion, lockPath string) (string, map[string]any) {
+	extra := map[string]any{
+		"installed_version": "",
+		"expected_version":  "",
+		"missing_flags":     []string{},
+	}
+
+	lf, err := parseLockFile(lockPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "e2e-runner: %s not found; required for claude-version-lock check\n", lockPath)
+		} else {
+			fmt.Fprintf(os.Stderr, "e2e-runner: %s parse error %v\n", lockPath, err)
+		}
+		extra["installed_version"] = parseClaudeVersion(capturedVersion)
+		return "fail", extra
+	}
+	extra["expected_version"] = lf.Version
+
+	if capturedVersion == "unknown" {
+		fmt.Fprintln(os.Stderr, "e2e-runner: claude --version failed at startup; cannot enforce claude-version.lock")
+		return "fail", extra
+	}
+	installed := parseClaudeVersion(capturedVersion)
+	extra["installed_version"] = installed
+
+	status := "pass"
+	if installed != lf.Version {
+		fmt.Fprintf(os.Stderr, "e2e-runner: claude version %s does not match %s (%s); review and update\n", installed, lockPath, lf.Version)
+		status = "fail"
+	}
+
+	helpOut, err := exec.CommandContext(ctx, "claude", "--help").CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "e2e-runner: claude --help failed: %v\n", err)
+		return "fail", extra
+	}
+	help := string(helpOut)
+
+	missing := []string{}
+	for _, f := range lf.Flags {
+		if !strings.Contains(help, f) {
+			fmt.Fprintf(os.Stderr, "e2e-runner: claude --help no longer mentions %s; review %s\n", f, lockPath)
+			missing = append(missing, f)
+		}
+	}
+	extra["missing_flags"] = missing
+	if len(missing) > 0 {
+		status = "fail"
+	}
+	return status, extra
+}
+
 // runCheck runs one Check with its (possibly defaulted) timeout, classifies
 // the outcome, and assembles the CheckResult. Stderr is mirrored to the
 // host stderr so operators see progress; both stdout and stderr are also
@@ -298,6 +449,17 @@ func runCheck(parent context.Context, c Check, binDir string) CheckResult {
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
+
+	if c.Run != nil {
+		start := time.Now()
+		status, extra := c.Run(ctx)
+		return CheckResult{
+			Name:       c.Name,
+			Status:     status,
+			DurationMs: time.Since(start).Milliseconds(),
+			Extra:      extra,
+		}
+	}
 
 	binPath := filepath.Join(binDir, c.Binary)
 	cmd := exec.CommandContext(ctx, binPath, c.Args...)
