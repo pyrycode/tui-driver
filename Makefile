@@ -9,9 +9,10 @@ REPORT     := ./e2e-report.json
 
 SPIKES     := spike-one-turn spike-multi-turn spike-cancel spike-permission spike-multiselect spike-ask-user
 PROBES     := probe-first-prompt-hang
+CHECKERS   := e2e-snapshot-check
 RUNNER     := e2e-runner
 
-ALL_BINS   := $(SPIKES) $(PROBES) $(RUNNER)
+ALL_BINS   := $(SPIKES) $(PROBES) $(CHECKERS) $(RUNNER)
 BIN_PATHS  := $(addprefix $(BIN_DIR)/,$(ALL_BINS))
 
 .PHONY: e2e build-bin clean-bin clean-report
