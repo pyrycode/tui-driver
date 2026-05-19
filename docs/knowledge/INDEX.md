@@ -14,7 +14,7 @@ One-line summary per evergreen doc. Cross-reference target — keep it terse.
 
 ## Features
 
-- [e2e harness](features/e2e-harness.md) — `make e2e` runs every spike + probe serially against real `claude` and emits `e2e-report.json` (pass/fail/timeout per check, single CI artifact); headless-MCP plumbing rides the `EnsureClaudeEnv` seam via `TUIDRIVER_STRICT_MCP_CONFIG=1`
+- [e2e harness](features/e2e-harness.md) — `make e2e` runs every spike + probe + the `snapshot-drift` check serially against real `claude` and emits `e2e-report.json` (pass/fail/timeout per check, single CI artifact); headless-MCP plumbing rides the `EnsureClaudeEnv` seam via `TUIDRIVER_STRICT_MCP_CONFIG=1`; snapshot-drift byte-compares `pkg/tuidriver/testdata/{picker,mcp,agents}-snapshot.bin` against re-derived captures and is read-only by construction
 
 ## Per-ticket notes
 
