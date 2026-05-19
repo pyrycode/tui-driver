@@ -11,6 +11,7 @@ tui-driver
 /spike-multi-turn
 /spike-multiselect
 /spike-ask-user
+/spike-long-prompt
 /probe-first-prompt-hang
 /e2e-runner
 /bin/
