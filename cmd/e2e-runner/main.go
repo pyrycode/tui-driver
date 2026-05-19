@@ -335,12 +335,19 @@ func parseClaudeVersion(raw string) string {
 type lockFile struct {
 	Version string
 	Flags   []string
+	Values  []string
 }
 
 // parseLockFile reads and parses the claude-version.lock file at path. See
 // the format rules in docs/specs/architecture/36-claude-version-lock.md
 // (key=value, # comments, exactly one version= line, zero or more flag=
-// lines, empty values rejected).
+// and value= lines, empty values rejected).
+//
+// `flag=` and `value=` are independent substring assertions against
+// `claude --help`. Use `flag=` for flag names and `value=` for enumerated
+// values that appear in choice-lists — this fits claude --help's actual
+// format, where flag-and-value pairs are NOT rendered as a literal
+// "--flag value" example (the choices appear inline parenthesised).
 func parseLockFile(path string) (lockFile, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -376,6 +383,11 @@ func parseLockFile(path string) (lockFile, error) {
 				return lockFile{}, fmt.Errorf("at line %d: empty flag value", lineNo)
 			}
 			lf.Flags = append(lf.Flags, value)
+		case "value":
+			if value == "" {
+				return lockFile{}, fmt.Errorf("at line %d: empty value value", lineNo)
+			}
+			lf.Values = append(lf.Values, value)
 		default:
 			return lockFile{}, fmt.Errorf("at line %d: unknown key %q", lineNo, key)
 		}
@@ -388,15 +400,17 @@ func parseLockFile(path string) (lockFile, error) {
 
 // runClaudeVersionLockCheck is the Run callback for the claude-version-lock
 // check. It compares the captured `claude --version` output against the
-// lock file's version field and asserts that every flag the library
-// depends on still appears verbatim in `claude --help`. The extra map
-// always carries installed_version, expected_version, and missing_flags
-// so the report schema stays uniform across pass/fail.
+// lock file's version field and asserts that every flag AND every value
+// the library depends on still appears verbatim in `claude --help`. The
+// extra map always carries installed_version, expected_version,
+// missing_flags, and missing_values so the report schema stays uniform
+// across pass/fail.
 func runClaudeVersionLockCheck(ctx context.Context, capturedVersion, lockPath string) (string, map[string]any) {
 	extra := map[string]any{
 		"installed_version": "",
 		"expected_version":  "",
 		"missing_flags":     []string{},
+		"missing_values":    []string{},
 	}
 
 	lf, err := parseLockFile(lockPath)
@@ -434,12 +448,22 @@ func runClaudeVersionLockCheck(ctx context.Context, capturedVersion, lockPath st
 	missing := []string{}
 	for _, f := range lf.Flags {
 		if !strings.Contains(help, f) {
-			fmt.Fprintf(os.Stderr, "e2e-runner: claude --help no longer mentions %s; review %s\n", f, lockPath)
+			fmt.Fprintf(os.Stderr, "e2e-runner: claude --help no longer mentions flag %s; review %s\n", f, lockPath)
 			missing = append(missing, f)
 		}
 	}
 	extra["missing_flags"] = missing
-	if len(missing) > 0 {
+
+	missingValues := []string{}
+	for _, v := range lf.Values {
+		if !strings.Contains(help, v) {
+			fmt.Fprintf(os.Stderr, "e2e-runner: claude --help no longer mentions value %s; review %s\n", v, lockPath)
+			missingValues = append(missingValues, v)
+		}
+	}
+	extra["missing_values"] = missingValues
+
+	if len(missing) > 0 || len(missingValues) > 0 {
 		status = "fail"
 	}
 	return status, extra

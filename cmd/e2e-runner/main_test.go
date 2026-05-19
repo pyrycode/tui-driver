@@ -125,11 +125,28 @@ func TestParseLockFile(t *testing.T) {
 				"version=2.1.144\n" +
 				"\n" +
 				"flag=--session-id\n" +
-				"flag=--permission-mode bypassPermissions\n",
+				"flag=--permission-mode\n" +
+				"value=bypassPermissions\n",
 			want: lockFile{
 				Version: "2.1.144",
-				Flags:   []string{"--session-id", "--permission-mode bypassPermissions"},
+				Flags:   []string{"--session-id", "--permission-mode"},
+				Values:  []string{"bypassPermissions"},
 			},
+		},
+		{
+			name:    "value key parses alongside flag key",
+			content: "version=2.1.144\nflag=--session-id\nvalue=acceptEdits\n",
+			want: lockFile{
+				Version: "2.1.144",
+				Flags:   []string{"--session-id"},
+				Values:  []string{"acceptEdits"},
+			},
+		},
+		{
+			name:        "empty value value rejected",
+			content:     "version=2.1.144\nvalue=\n",
+			wantErr:     true,
+			errContains: "empty value value",
 		},
 		{
 			name: "comments and blank lines tolerated",
