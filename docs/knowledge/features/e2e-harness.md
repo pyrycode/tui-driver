@@ -1,6 +1,6 @@
 # e2e harness
 
-The single command (`make e2e`) that verifies the library's empirical end-to-end behaviour against a real installed `claude` binary. Runs the `claude-version-lock` check first, then every spike + probe + the snapshot-drift check serially, classifies each as pass / fail / timeout, and emits a single-file JSON report (`e2e-report.json`) suitable for CI artifact collection. Introduced by [#34](../codebase/34.md); extended by [#35](../codebase/35.md) (snapshot-drift) and [#36](../codebase/36.md) (claude-version-lock). Operator runbook lives here; per-ticket build notes live in `codebase/<N>.md`.
+The single command (`make e2e`) that verifies the library's empirical end-to-end behaviour against a real installed `claude` binary. Runs the `claude-version-lock` check first, then every spike + probe + the snapshot-drift check serially, classifies each as pass / fail / timeout, and emits a single-file JSON report (`e2e-report.json`) suitable for CI artifact collection. Introduced by [#34](../codebase/34.md); extended by [#35](../codebase/35.md) (snapshot-drift), [#36](../codebase/36.md) (claude-version-lock), and [#40](../codebase/40.md) (GitHub Actions push-to-main workflow). Operator runbook lives here; per-ticket build notes live in `codebase/<N>.md`.
 
 ## What it does
 
@@ -10,7 +10,7 @@ The single command (`make e2e`) that verifies the library's empirical end-to-end
 - Exits `0` iff every check passed; `1` otherwise.
 - **Short-circuits the slow checks on a `claude-version-lock` failure.** If claude has drifted out from under the library, every subsequent check is appended to the report with `status="timeout"` and `duration_ms=0` rather than burning ~5 minutes of wall time on spikes that are doomed anyway. See [§ How it handles failure](#how-it-handles-failure).
 
-Out of scope (today): GitHub Actions wiring — see [#34 § Follow-ups](../codebase/34.md#links).
+CI integration: a GitHub Actions workflow at `.github/workflows/e2e.yml` runs `make e2e` on every push to `main` and on manual dispatch. See [§ CI integration](#ci-integration) below for the trigger surface, cost-cap rationale, and artifact shape. Introduced by [#40](../codebase/40.md).
 
 ## How to run
 
@@ -44,6 +44,32 @@ Example: `./bin/e2e-runner -timeout spike-cancel=90s -timeout probe-first-prompt
 The runner sets `TUIDRIVER_STRICT_MCP_CONFIG=1` on every child spike+probe process. The spike+probe binaries all call `tuidriver.EnsureClaudeEnv` between constructing the `*exec.Cmd` and starting the PTY; when that env var is `"1"`, `EnsureClaudeEnv` transparently appends `--strict-mcp-config` to `cmd.Args` (idempotent — skipped if already present). The flag tells `claude` to skip configured MCP servers entirely, which is what CI / containers / reproducibility scenarios want. Zero spike-side changes required; the env-var contract is the seam.
 
 No TTY is required on stdin. No MCP servers need to be configured on the host.
+
+## CI integration
+
+`.github/workflows/e2e.yml` invokes `make e2e` on every push to `main` and on `workflow_dispatch` (manual UI trigger). Explicitly NOT `pull_request` — every run burns metered `ANTHROPIC_API_KEY` credits (CI runners cannot use a Max subscription), so per-PR runs would multiply spend. The push-to-main gate is the cheapest coverage that still catches regressions before downstream consumers hit them. PR-time coverage is a separate concern: the code-review agent runs the harness selectively elsewhere.
+
+**Cost controls.** Two complementary mechanisms:
+
+- Trigger surface narrow to `push` (branch `main` only) + `workflow_dispatch`. No `pull_request`, no `paths:` filters (drift must surface on every push to `main`), no `[skip ci]` opt-out paths.
+- Job-level `timeout-minutes: 20` is the hard ceiling. Operator's p99 wall-time target is `< 15min`; the 20-minute cap gives ~5min headroom so a slow-but-healthy run isn't spuriously killed, while firmly bounding cost if the harness hangs. If runs reliably exceed 15min, file a profiling follow-up rather than bumping the cap.
+
+**Cache shape.** `~/.npm-global` is cached with `key: claude-${{ runner.os }}-${{ hashFiles('claude-version.lock') }}`. Any edit to the lock file (version, flags, comments) flips the key; cache miss triggers a fresh `npm install -g "@anthropic-ai/claude-code@${version}"` where `${version}` is parsed from `claude-version.lock`. Lock-file drift is the bug we're catching — missing the cache on every drift event is correct.
+
+**Authentication.** `ANTHROPIC_API_KEY` flows through `${{ secrets.ANTHROPIC_API_KEY }}` at the job-`env` level only. The secret must exist in repo secrets before the workflow can succeed; the rotation procedure is tracked in #41 (out of scope for the workflow itself).
+
+**`--strict-mcp-config` is NOT set at the CI layer.** The runner already injects `TUIDRIVER_STRICT_MCP_CONFIG=1` onto every spike+probe child, which `EnsureClaudeEnv` translates into `--strict-mcp-config` on argv. CI passes nothing extra; the env-var seam from [§ Headless / CI plumbing](#headless--ci-plumbing) does the work. Future edits MUST NOT also set the env var at the workflow level — the runner-side injection is sufficient and the redundancy would mislead readers.
+
+**Artifacts.** Two uploads, both gated on `if: always()` so they fire even on harness failure or timeout-kill — which is exactly when they're needed:
+
+- `e2e-report` → `e2e-report.json` (`if-no-files-found: warn` — absence is itself an anomaly)
+- `probe-recordings` → `/tmp/probe-first-prompt-hang-*` (`if-no-files-found: ignore` — clean runs may have no captures)
+
+Both use 30-day retention (trimmed from the 90-day default; drift events get inspected within hours).
+
+**Exit code & branch protection.** The workflow exits non-zero on any harness failure (the runner's exit-code contract from #34). This is the wiring point for branch protection: add `e2e` as a required check via the GitHub UI to gate merges on the workflow's verdict. The branch-protection toggle itself is out of scope for the workflow file.
+
+**Concurrency.** `concurrency.group: e2e-${{ github.ref }}` with `cancel-in-progress: false` — back-to-back pushes serialise rather than racing or cancelling each other. The push-to-main backstop is meant to land a verdict per SHA, not race itself.
 
 ## Check kinds
 
@@ -203,10 +229,11 @@ The `TUIDRIVER_STRICT_MCP_CONFIG=1` env var matters: the e2e runner sets it on e
 - `pkg/tuidriver/pty.go` — `EnsureClaudeEnv` + the `StrictMcpConfigEnv` opt-in.
 - `pkg/tuidriver/testdata/{picker,mcp,agents}-snapshot.bin` — committed byte fixtures consumed by both the unit tests in `pkg/tuidriver/` and the snapshot-drift check.
 - `.gitignore` — `/e2e-report.json` and `/e2e-runner` (generated artifacts).
+- `.github/workflows/e2e.yml` — push-to-main + `workflow_dispatch` GitHub Actions workflow that invokes `make e2e`, caches the claude install on `claude-version.lock`, and uploads `e2e-report.json` + `/tmp/probe-first-prompt-hang-*` artifacts. Introduced by [#40](../codebase/40.md).
 
 ## Related
 
-- Per-ticket notes: [#34](../codebase/34.md), [#35](../codebase/35.md), [#36](../codebase/36.md)
-- Specs: [#34](../../specs/architecture/34-e2e-harness-foundation.md), [#35](../../specs/architecture/35-snapshot-drift.md), [#36](../../specs/architecture/36-claude-version-lock.md)
+- Per-ticket notes: [#34](../codebase/34.md), [#35](../codebase/35.md), [#36](../codebase/36.md), [#40](../codebase/40.md)
+- Specs: [#34](../../specs/architecture/34-e2e-harness-foundation.md), [#35](../../specs/architecture/35-snapshot-drift.md), [#36](../../specs/architecture/36-claude-version-lock.md), [#40](../../specs/architecture/40-ci-e2e-workflow.md)
 - ADRs: orthogonal to both [0001](../decisions/0001-hybrid-jsonl-tui.md) and [0002](../decisions/0002-pattern-matching-over-emulation.md) — the harness shells out (and now also runs an in-process structural check); neither extends the library's signal model.
 - System overview: [architecture/system-overview.md](../architecture/system-overview.md)

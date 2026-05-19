@@ -14,7 +14,7 @@ One-line summary per evergreen doc. Cross-reference target — keep it terse.
 
 ## Features
 
-- [e2e harness](features/e2e-harness.md) — `make e2e` runs the in-process `claude-version-lock` check (asserts `claude --version` matches `claude-version.lock` and pinned flags still appear in `claude --help`; short-circuits the rest of the run on drift) first, then every spike + probe + `snapshot-drift` serially against real `claude`, emitting `e2e-report.json` (pass/fail/timeout per check, single CI artifact); headless-MCP plumbing rides the `EnsureClaudeEnv` seam via `TUIDRIVER_STRICT_MCP_CONFIG=1`; snapshot-drift byte-compares `pkg/tuidriver/testdata/{picker,mcp,agents}-snapshot.bin` against re-derived captures and is read-only by construction
+- [e2e harness](features/e2e-harness.md) — `make e2e` runs the in-process `claude-version-lock` check (asserts `claude --version` matches `claude-version.lock` and pinned flags still appear in `claude --help`; short-circuits the rest of the run on drift) first, then every spike + probe + `snapshot-drift` serially against real `claude`, emitting `e2e-report.json` (pass/fail/timeout per check, single CI artifact); headless-MCP plumbing rides the `EnsureClaudeEnv` seam via `TUIDRIVER_STRICT_MCP_CONFIG=1`; snapshot-drift byte-compares `pkg/tuidriver/testdata/{picker,mcp,agents}-snapshot.bin` against re-derived captures and is read-only by construction; CI runs the harness on push-to-main + `workflow_dispatch` only (cost-capped, `timeout-minutes: 20`) via `.github/workflows/e2e.yml`, caching the claude install on `claude-version.lock` and uploading `e2e-report.json` + probe recordings on `if: always()`
 
 ## Per-ticket notes
 
