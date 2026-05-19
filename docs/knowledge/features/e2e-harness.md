@@ -45,6 +45,8 @@ The runner sets `TUIDRIVER_STRICT_MCP_CONFIG=1` on every child spike+probe proce
 
 No TTY is required on stdin. No MCP servers need to be configured on the host.
 
+The harness uses `--strict-mcp-config` for determinism: without it, `claude` waits on configured MCP servers to register before processing the first prompt. On the GitHub runner that has no MCP servers configured this is mostly a no-op, but on operator machines (where `make e2e` also runs) host-level MCP config produces flaky first-prompt timing. Setting `TUIDRIVER_STRICT_MCP_CONFIG=1` from the runner side makes the harness behave identically regardless of host MCP config. This is consistent with the May 18 walk-back, not a contradiction: that walk-back recommended against making `--strict-mcp-config` the library's user-facing default sidestep for pyry acp — a consumer where MCP is a user-facing feature and stripping it would harm users. The e2e/CI context has no user-facing MCP feature, so the harness using the flag for determinism is exactly the kind of scoped, internal use the walk-back left intact. See `.github/workflows/e2e.yml` for the workflow that drives the runner.
+
 ## CI integration
 
 `.github/workflows/e2e.yml` invokes `make e2e` on every push to `main` and on `workflow_dispatch` (manual UI trigger). Explicitly NOT `pull_request` — every run burns metered `ANTHROPIC_API_KEY` credits (CI runners cannot use a Max subscription), so per-PR runs would multiply spend. The push-to-main gate is the cheapest coverage that still catches regressions before downstream consumers hit them. PR-time coverage is a separate concern: the code-review agent runs the harness selectively elsewhere.
@@ -56,7 +58,22 @@ No TTY is required on stdin. No MCP servers need to be configured on the host.
 
 **Cache shape.** `~/.npm-global` is cached with `key: claude-${{ runner.os }}-${{ hashFiles('claude-version.lock') }}`. Any edit to the lock file (version, flags, comments) flips the key; cache miss triggers a fresh `npm install -g "@anthropic-ai/claude-code@${version}"` where `${version}` is parsed from `claude-version.lock`. Lock-file drift is the bug we're catching — missing the cache on every drift event is correct.
 
-**Authentication.** `ANTHROPIC_API_KEY` flows through `${{ secrets.ANTHROPIC_API_KEY }}` at the job-`env` level only. The secret must exist in repo secrets before the workflow can succeed; the rotation procedure is tracked in #41 (out of scope for the workflow itself).
+**Authentication.** `ANTHROPIC_API_KEY` flows through `${{ secrets.ANTHROPIC_API_KEY }}` at the job-`env` level only (see `.github/workflows/e2e.yml`). The secret must exist in repo secrets before the workflow can succeed. The credential is owned by <the maintainer's Anthropic Console account — Juhana to fill in before merge or in a follow-up doc PR>; rotation requires access to that account.
+
+*Routine rotation* (no compromise suspected):
+
+1. Log in to the owning Anthropic Console account and generate a new API key, labelling it so the GitHub origin is obvious (e.g. `tui-driver-ci-2026-MM-DD`).
+2. Update the `ANTHROPIC_API_KEY` secret at `https://github.com/pyrycode/tui-driver/settings/secrets/actions` with the new value.
+3. Trigger an `e2e` run — wait for the next push to `main` or dispatch manually via the Actions UI — and confirm it goes green.
+4. Revoke the old key in Anthropic Console *only after* that run succeeds. Keeping the old key valid until the new one is validated avoids stranding an in-flight run on a half-rotated secret.
+
+*If a key is leaked while a workflow run is in flight* (stop the bleeding first):
+
+1. Revoke the compromised key in Anthropic Console immediately — do this before anything else, even if a workflow run is mid-execution.
+2. Cancel any in-flight `e2e` workflow run via the Actions UI. (`concurrency.cancel-in-progress: false` serialises subsequent pushes but does NOT prevent manual cancellation.)
+3. Generate a new API key (label as in routine rotation).
+4. Update the `ANTHROPIC_API_KEY` secret at `https://github.com/pyrycode/tui-driver/settings/secrets/actions`.
+5. Re-dispatch via `workflow_dispatch` to confirm the new key works without waiting for the next push to `main`.
 
 **`--strict-mcp-config` is NOT set at the CI layer.** The runner already injects `TUIDRIVER_STRICT_MCP_CONFIG=1` onto every spike+probe child, which `EnsureClaudeEnv` translates into `--strict-mcp-config` on argv. CI passes nothing extra; the env-var seam from [§ Headless / CI plumbing](#headless--ci-plumbing) does the work. Future edits MUST NOT also set the env var at the workflow level — the runner-side injection is sufficient and the redundancy would mislead readers.
 
