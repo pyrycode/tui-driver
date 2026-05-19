@@ -5,4 +5,5 @@
 version=2.1.144
 
 flag=--session-id
-flag=--permission-mode bypassPermissions
+flag=--permission-mode
+value=bypassPermissions
