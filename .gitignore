@@ -12,7 +12,9 @@ tui-driver
 /spike-multiselect
 /spike-ask-user
 /probe-first-prompt-hang
+/e2e-runner
 /bin/
+/e2e-report.json
 
 # Test
 *.test

@@ -21,21 +21,54 @@ const (
 // detection (no spinner glyphs, no box-drawing, no color codes).
 const ClaudeTermEnv = "TERM=xterm-256color"
 
-// EnsureClaudeEnv ensures cmd.Env contains TERM=xterm-256color. If cmd.Env
-// is nil it is seeded from os.Environ first. If TERM is already set to
-// xterm-256color the call is a no-op; if set to something else, it is
-// replaced. Returns cmd for chaining.
+// StrictMcpConfigEnv is the env var the e2e harness sets to ask
+// EnsureClaudeEnv to additionally append --strict-mcp-config to cmd.Args.
+// Set to "1" to enable. Empty / unset / any other value: no-op. Lets the
+// harness signal "headless / reproducible MCP" through the seam every
+// spike+probe already uses, without touching individual spike binaries.
+const StrictMcpConfigEnv = "TUIDRIVER_STRICT_MCP_CONFIG"
+
+// strictMcpConfigFlag is the claude CLI flag that skips configured MCP
+// servers entirely (see package doc). EnsureClaudeEnv appends it to
+// cmd.Args when StrictMcpConfigEnv is "1" and the flag is not already
+// present.
+const strictMcpConfigFlag = "--strict-mcp-config"
+
+// EnsureClaudeEnv prepares cmd for driving claude. It ensures cmd.Env
+// contains TERM=xterm-256color (seeding from os.Environ when nil; replacing
+// any pre-existing TERM=...; idempotent on repeat calls). When the
+// StrictMcpConfigEnv env var is set to "1", it additionally appends
+// --strict-mcp-config to cmd.Args unless that flag is already present;
+// other values (including empty/unset) are a no-op for the args side.
+// Returns cmd for chaining.
 func EnsureClaudeEnv(cmd *exec.Cmd) *exec.Cmd {
 	if cmd.Env == nil {
 		cmd.Env = os.Environ()
 	}
+	termSet := false
 	for i, kv := range cmd.Env {
 		if strings.HasPrefix(kv, "TERM=") {
 			cmd.Env[i] = ClaudeTermEnv
-			return cmd
+			termSet = true
+			break
 		}
 	}
-	cmd.Env = append(cmd.Env, ClaudeTermEnv)
+	if !termSet {
+		cmd.Env = append(cmd.Env, ClaudeTermEnv)
+	}
+
+	if os.Getenv(StrictMcpConfigEnv) == "1" {
+		alreadyPresent := false
+		for _, a := range cmd.Args {
+			if a == strictMcpConfigFlag {
+				alreadyPresent = true
+				break
+			}
+		}
+		if !alreadyPresent {
+			cmd.Args = append(cmd.Args, strictMcpConfigFlag)
+		}
+	}
 	return cmd
 }
 
