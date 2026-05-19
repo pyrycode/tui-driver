@@ -70,3 +70,79 @@ func TestIsThinkingNegative(t *testing.T) {
 		t.Errorf("IsThinking(no spinner) = true, want false")
 	}
 }
+
+func TestParseSpinnerTokensClassC(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+		want int
+	}{
+		{
+			"single-digit",
+			[]byte("\xe2\x9c\xbb Actualizing… (2s · ↓1 tokens)"),
+			1,
+		},
+		{
+			"multi-digit",
+			[]byte("\xe2\x9c\xbb Embellishing… (3s · ↓247 tokens)"),
+			247,
+		},
+		{
+			"singular token (1 token, not tokens)",
+			[]byte("\xe2\x9c\xbb Generating… (1s · ↓1 token)"),
+			1,
+		},
+		{
+			"CSI-wrapped (live spinner rendering)",
+			[]byte("\x1b[38;5;174m\xe2\x9c\xbb\x1b[39m Cooked… (4s · ↓512 tokens)"),
+			512,
+		},
+		{
+			"multiple matches in buffer — return last",
+			[]byte("✻ … (1s · ↓50 tokens)... later ✻ … (3s · ↓200 tokens)"),
+			200,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ParseSpinnerTokens(tc.in)
+			if !ok {
+				t.Fatalf("ParseSpinnerTokens(%q) returned ok=false", tc.in)
+			}
+			if got != tc.want {
+				t.Errorf("ParseSpinnerTokens(%q) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseSpinnerTokensClassAB(t *testing.T) {
+	// Classes A (`✻ Baked for 2s`) and B (`✻ Channeling…`) don't include
+	// token counts. Parser should return ok=false.
+	cases := [][]byte{
+		[]byte("\xe2\x9c\xbb Baked for 2s"),
+		[]byte("\xe2\x9c\xbb Channeling…"),
+		[]byte("\xe2\x9c\xbb Sautéed for 5s"),
+	}
+	for _, in := range cases {
+		if n, ok := ParseSpinnerTokens(in); ok {
+			t.Errorf("ParseSpinnerTokens(%q) = (%d, true), want (0, false)", in, n)
+		}
+	}
+}
+
+func TestParseSpinnerTokensNegative(t *testing.T) {
+	if _, ok := ParseSpinnerTokens(nil); ok {
+		t.Errorf("ParseSpinnerTokens(nil) returned ok=true")
+	}
+	if _, ok := ParseSpinnerTokens([]byte("idle ❯ no spinner")); ok {
+		t.Errorf("ParseSpinnerTokens(idle) returned ok=true")
+	}
+}
+
+func TestParseSpinnerTokensIgnoresUnrelatedTokensText(t *testing.T) {
+	// Text mentioning "tokens" without the ↓ arrow should NOT match.
+	if _, ok := ParseSpinnerTokens([]byte("CLAUDE.md: 9 tokens")); ok {
+		t.Errorf("matched unrelated 'tokens' text")
+	}
+}
