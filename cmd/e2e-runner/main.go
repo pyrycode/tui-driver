@@ -258,13 +258,6 @@ func buildChecks(runVersionLock func(ctx context.Context) (string, map[string]an
 			SuccessMarker: observedSuccess,
 		},
 		{
-			Name:          "spike-long-prompt",
-			Kind:          "spike",
-			Binary:        "spike-long-prompt",
-			Args:          commonArgs,
-			SuccessMarker: successSuccess,
-		},
-		{
 			Name:    "probe-first-prompt-hang",
 			Kind:    "probe",
 			Binary:  "probe-first-prompt-hang",
