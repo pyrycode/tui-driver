@@ -211,7 +211,7 @@ flag=--permission-mode bypassPermissions
 2. Run `claude --help` and confirm every existing `flag=` entry still appears verbatim.
 3. Edit `claude-version.lock` — change the `version=` line; add/remove `flag=` lines for any new dependencies.
 4. Re-run `make e2e`. The `claude-version-lock` check should pass; if it doesn't, the lock file edit was incomplete.
-5. Commit the lock file edit in the same commit as any library changes that depend on the new claude. The full maintainer runbook lives in docs ticket #37 (not yet landed).
+5. Commit the lock file edit in the same commit as any library changes that depend on the new claude.
 
 The format is intentionally NOT JSON / TOML / YAML — hand-edit-friendliness and grep-friendliness matter more than data-model expressiveness for a 6-line contract file edited once per claude upgrade.
 
