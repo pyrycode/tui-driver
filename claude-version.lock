@@ -2,7 +2,7 @@
 # Update deliberately when bumping the installed claude; the docs ticket
 # (#37) covers the workflow.
 
-version=2.1.144
+version=2.1.145
 
 flag=--session-id
 flag=--permission-mode
