@@ -180,20 +180,25 @@ table.
 
 | Run | spawn → idle | idle → prompt-loaded | prompt-loaded → jsonl-opened | jsonl-opened → end-turn | total | outcome |
 |-----|--------------|----------------------|------------------------------|--------------------------|-------|---------|
+|  1  | 354 ms       | 0.041 ms             | 266 ms                       | 2.606 s                  | 3.23 s | **SUCCESS** — `SUCCESS: ALPHA_42-GAMMA_88-OMEGA_13` against installed `claude 2.1.145`; fast path (`thinking-detected` never logged — spinner appeared briefly as `✻ Brewed for 2s` but rendered via interleaved per-character glyph updates so the regex didn't match, same shape as `spike-one-turn` finding #8). Prompt body 3454 bytes. |
 
-*(no runs yet)*
+The single recorded run sits well under the watchdog deadlines (60 s state inactivity / 30 s spinner freeze) so no widening is justified at this point.
 
 ## Observed thinking verbs
 
 | Verb (captured) | Run(s) | Notes |
 |-----------------|--------|-------|
+| (none captured) | 1      | `✻ Brewed for 2s` rendered in the raw PTY bytes but the spinner regex never matched — the glyph and verb are emitted via interleaved CSI cursor-positioning + per-character writes (same shape as `spike-one-turn` finding #8). The fast path triggered because the JSONL `end_turn` event arrived ~2.6 s after `session-jsonl-opened`, and the state machine accepts that even when no spinner has been recognised. |
 
-*(no runs yet — record each new verb claude renders for the fixture prompt;
-known-good set from sibling spikes: "Baked", "Brewing", "Skedaddling", "Whipped up", "Cooking")*
+Known-good verbs from sibling spikes: `Baked`, `Brewing`, `Brewed`, `Skedaddling`, `Whipped up`, `Cooking`.
 
 ## Surprises / findings
 
-*(no runs yet — record anything that breaks the assumed shape here)*
+### Run 1 (2026-05-20, claude 2.1.145)
+
+- **Total wall-clock 3.23 s** with a 3454-byte fixture. The architect's open question ("If it consistently exceeds 30 s, surface as a finding") is answered: well under. No watchdog widening warranted.
+- **Fast path taken** — same shape as `spike-one-turn` Run 5. The spinner regex never matched even though `✻ Brewed for 2s` appeared in the PTY bytes; the JSONL `end_turn` event arrived first. Confirms that the substring-on-final-`end_turn`-text assertion is sufficient for the fixture shape (no intermediate `assistant` events with `tool_use`).
+- **Encoded-cwd quirk worth noting for operators** — `tuidriver.EncodeCwd` honours the case of `$PWD` rather than canonicalising via the filesystem. If a worktree is entered under one casing (`/Users/.../WorkSpace/...`) but the on-disk `~/.claude/projects/` directory was created under another (`-Users-...-Workspace-...`), the deterministic JSONL path resolves to a directory that does not exist and the 10 s stat-poll trips. Re-entering the worktree under the canonical casing (e.g. `cd "$(pwd -P)"`) resolves it. Not a defect in this spike — same shape would affect every `--session-id`-pinning spike — but worth knowing when triaging "JSONL did not appear" failures.
 
 ## Claude version dependency
 
