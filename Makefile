@@ -15,10 +15,18 @@ RUNNER     := e2e-runner
 ALL_BINS   := $(SPIKES) $(PROBES) $(CHECKERS) $(RUNNER)
 BIN_PATHS  := $(addprefix $(BIN_DIR)/,$(ALL_BINS))
 
+# Optional model / effort overrides. Unset → spike+probe inherit the
+# operator's interactive Claude config (Max-subscription path). Set →
+# the runner exports TUIDRIVER_CLAUDE_{MODEL,EFFORT}, EnsureClaudeEnv
+# appends --model/--effort onto every spike+probe child. CI uses
+# MODEL=haiku EFFORT=low to cap metered-API spend.
+MODEL      ?=
+EFFORT     ?=
+
 .PHONY: e2e build-bin clean-bin clean-report
 
 e2e: build-bin
-	$(BIN_DIR)/$(RUNNER) -bin-dir $(BIN_DIR) -report $(REPORT)
+	$(if $(MODEL),TUIDRIVER_CLAUDE_MODEL=$(MODEL)) $(if $(EFFORT),TUIDRIVER_CLAUDE_EFFORT=$(EFFORT)) $(BIN_DIR)/$(RUNNER) -bin-dir $(BIN_DIR) -report $(REPORT)
 
 build-bin: $(BIN_PATHS)
 

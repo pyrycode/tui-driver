@@ -34,13 +34,31 @@ const StrictMcpConfigEnv = "TUIDRIVER_STRICT_MCP_CONFIG"
 // present.
 const strictMcpConfigFlag = "--strict-mcp-config"
 
+// ClaudeModelEnv is the env var the e2e harness sets to ask
+// EnsureClaudeEnv to additionally append --model <value> to cmd.Args.
+// Non-empty: appended verbatim. Empty / unset: no-op (preserves the
+// operator's interactive Claude default — required for Max-subscription
+// local development). Idempotent: if --model is already in cmd.Args,
+// no second occurrence is added.
+const ClaudeModelEnv = "TUIDRIVER_CLAUDE_MODEL"
+
+// ClaudeEffortEnv — same contract as ClaudeModelEnv for --effort <level>.
+// Accepts whatever string claude accepts (today: low/medium/high/xhigh/max
+// — see `claude --help`). Validation is delegated to claude itself.
+const ClaudeEffortEnv = "TUIDRIVER_CLAUDE_EFFORT"
+
+const claudeModelFlag = "--model"
+const claudeEffortFlag = "--effort"
+
 // EnsureClaudeEnv prepares cmd for driving claude. It ensures cmd.Env
 // contains TERM=xterm-256color (seeding from os.Environ when nil; replacing
 // any pre-existing TERM=...; idempotent on repeat calls). When the
 // StrictMcpConfigEnv env var is set to "1", it additionally appends
 // --strict-mcp-config to cmd.Args unless that flag is already present;
 // other values (including empty/unset) are a no-op for the args side.
-// Returns cmd for chaining.
+// When ClaudeModelEnv / ClaudeEffortEnv are set to a non-empty value, it
+// appends --model <value> / --effort <value> to cmd.Args unless the
+// respective flag is already present. Returns cmd for chaining.
 func EnsureClaudeEnv(cmd *exec.Cmd) *exec.Cmd {
 	if cmd.Env == nil {
 		cmd.Env = os.Environ()
@@ -67,6 +85,32 @@ func EnsureClaudeEnv(cmd *exec.Cmd) *exec.Cmd {
 		}
 		if !alreadyPresent {
 			cmd.Args = append(cmd.Args, strictMcpConfigFlag)
+		}
+	}
+
+	if v := os.Getenv(ClaudeModelEnv); v != "" {
+		alreadyPresent := false
+		for _, a := range cmd.Args {
+			if a == claudeModelFlag {
+				alreadyPresent = true
+				break
+			}
+		}
+		if !alreadyPresent {
+			cmd.Args = append(cmd.Args, claudeModelFlag, v)
+		}
+	}
+
+	if v := os.Getenv(ClaudeEffortEnv); v != "" {
+		alreadyPresent := false
+		for _, a := range cmd.Args {
+			if a == claudeEffortFlag {
+				alreadyPresent = true
+				break
+			}
+		}
+		if !alreadyPresent {
+			cmd.Args = append(cmd.Args, claudeEffortFlag, v)
 		}
 	}
 	return cmd

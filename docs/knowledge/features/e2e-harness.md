@@ -15,10 +15,11 @@ CI integration: a GitHub Actions workflow at `.github/workflows/e2e.yml` runs `m
 ## How to run
 
 ```sh
-make e2e             # build everything to ./bin and run the runner
-make build-bin       # build only (no run)
-make clean-bin       # rm -rf ./bin
-make clean-report    # rm -f ./e2e-report.json
+make e2e                              # build everything to ./bin and run the runner (inherits operator's Claude config)
+make e2e MODEL=haiku EFFORT=low       # CI default: pin --model haiku --effort low (caps metered-API spend)
+make build-bin                        # build only (no run)
+make clean-bin                        # rm -rf ./bin
+make clean-report                     # rm -f ./e2e-report.json
 ```
 
 The runner can also be invoked directly after `make build-bin`:
@@ -47,6 +48,8 @@ No TTY is required on stdin. No MCP servers need to be configured on the host.
 
 The harness uses `--strict-mcp-config` for determinism: without it, `claude` waits on configured MCP servers to register before processing the first prompt. On the GitHub runner that has no MCP servers configured this is mostly a no-op, but on operator machines (where `make e2e` also runs) host-level MCP config produces flaky first-prompt timing. Setting `TUIDRIVER_STRICT_MCP_CONFIG=1` from the runner side makes the harness behave identically regardless of host MCP config. This is consistent with the May 18 walk-back, not a contradiction: that walk-back recommended against making `--strict-mcp-config` the library's user-facing default sidestep for pyry acp — a consumer where MCP is a user-facing feature and stripping it would harm users. The e2e/CI context has no user-facing MCP feature, so the harness using the flag for determinism is exactly the kind of scoped, internal use the walk-back left intact. See `.github/workflows/e2e.yml` for the workflow that drives the runner.
 
+The same env-var seam carries `TUIDRIVER_CLAUDE_MODEL` and `TUIDRIVER_CLAUDE_EFFORT`. When either is set to a non-empty value, `EnsureClaudeEnv` appends `--model <value>` and/or `--effort <value>` to each spike+probe's `cmd.Args` (idempotent — skipped if already present). The Makefile surfaces them as `make e2e MODEL=haiku EFFORT=low`, inlined per-recipe so the vars only ride the runner invocation (never `build-bin`'s `go build`). The runner itself is unchanged: `cmd.Env = append(os.Environ(), …)` already inherits whatever Make exports, so model/effort flow shell → Make → runner → spike child without per-binary plumbing. **Unset is the load-bearing default**: it preserves the operator's interactive Claude config (currently Opus 4.7 + high), which is required for Max-subscription local development. CI sets `MODEL=haiku EFFORT=low` to pin a cheap model — see [§ CI integration](#ci-integration).
+
 ## CI integration
 
 `.github/workflows/e2e.yml` invokes `make e2e` on every push to `main` and on `workflow_dispatch` (manual UI trigger). Explicitly NOT `pull_request` — every run burns metered `ANTHROPIC_API_KEY` credits (CI runners cannot use a Max subscription), so per-PR runs would multiply spend. The push-to-main gate is the cheapest coverage that still catches regressions before downstream consumers hit them. PR-time coverage is a separate concern: the code-review agent runs the harness selectively elsewhere.
@@ -55,6 +58,7 @@ The harness uses `--strict-mcp-config` for determinism: without it, `claude` wai
 
 - Trigger surface narrow to `push` (branch `main` only) + `workflow_dispatch`. No `pull_request`, no `paths:` filters (drift must surface on every push to `main`), no `[skip ci]` opt-out paths.
 - Job-level `timeout-minutes: 20` is the hard ceiling. Operator's p99 wall-time target is `< 15min`; the 20-minute cap gives ~5min headroom so a slow-but-healthy run isn't spuriously killed, while firmly bounding cost if the harness hangs. If runs reliably exceed 15min, file a profiling follow-up rather than bumping the cap.
+- **Model / effort pinned to the cheap path.** CI invokes `make e2e MODEL=haiku EFFORT=low` (per #48). The default Opus + high pairing the operator's Claude config uses would cost ~$0.50–$2 per spike × 7 spikes + probe ≈ $3–$15 per CI run; Haiku low runs ~$0.20–$0.70 per run — roughly 18–90× cheaper at parity coverage (spikes test PTY/JSONL/modal behaviour, not reasoning quality). The seam is the `TUIDRIVER_CLAUDE_MODEL` / `TUIDRIVER_CLAUDE_EFFORT` env vars; see [§ Headless / CI plumbing](#headless--ci-plumbing) for the propagation chain. Local `make e2e` with no overrides keeps inheriting the operator's interactive config (Max-subscription path).
 
 **Cache shape.** `~/.npm-global` is cached with `key: claude-${{ runner.os }}-${{ hashFiles('claude-version.lock') }}`. Any edit to the lock file (version, flags, comments) flips the key; cache miss triggers a fresh `npm install -g "@anthropic-ai/claude-code@${version}"` where `${version}` is parsed from `claude-version.lock`. Lock-file drift is the bug we're catching — missing the cache on every drift event is correct.
 
@@ -242,8 +246,8 @@ The `TUIDRIVER_STRICT_MCP_CONFIG=1` env var matters: the e2e runner sets it on e
 - `cmd/e2e-snapshot-check/main.go` — snapshot-drift orchestrator; serial spike-multiselect invocations + byte-compare.
 - `cmd/e2e-runner/main_test.go` — `parseSnapshotResults`, `parseClaudeVersion`, `parseLockFile` table tests.
 - `claude-version.lock` — pinned claude-version + flag contract; hand-edited per upgrade.
-- `Makefile` — `e2e`, `build-bin`, `clean-bin`, `clean-report` targets; `CHECKERS` variable for non-spike/non-probe check binaries.
-- `pkg/tuidriver/pty.go` — `EnsureClaudeEnv` + the `StrictMcpConfigEnv` opt-in.
+- `Makefile` — `e2e`, `build-bin`, `clean-bin`, `clean-report` targets; `CHECKERS` variable for non-spike/non-probe check binaries; `MODEL` / `EFFORT` overrides inlined per-recipe on `e2e`.
+- `pkg/tuidriver/pty.go` — `EnsureClaudeEnv` + the `StrictMcpConfigEnv` opt-in + the `ClaudeModelEnv` / `ClaudeEffortEnv` `--model`/`--effort` passthrough seam.
 - `pkg/tuidriver/testdata/{picker,mcp,agents}-snapshot.bin` — committed byte fixtures consumed by both the unit tests in `pkg/tuidriver/` and the snapshot-drift check.
 - `.gitignore` — `/e2e-report.json` and `/e2e-runner` (generated artifacts).
 - `.github/workflows/e2e.yml` — push-to-main + `workflow_dispatch` GitHub Actions workflow that invokes `make e2e`, caches the claude install on `claude-version.lock`, and uploads `e2e-report.json` + `/tmp/probe-first-prompt-hang-*` artifacts. Introduced by [#40](../codebase/40.md).

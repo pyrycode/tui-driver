@@ -7,3 +7,5 @@ version=2.1.144
 flag=--session-id
 flag=--permission-mode
 value=bypassPermissions
+flag=--model
+flag=--effort
