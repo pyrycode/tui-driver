@@ -11,10 +11,14 @@ tui-driver
 /spike-multi-turn
 /spike-multiselect
 /spike-ask-user
+/spike-long-prompt
 /probe-first-prompt-hang
 /e2e-runner
 /bin/
 /e2e-report.json
+
+# Capture logs (e.g. code-review's `make e2e` capture); never commit
+*.log
 
 # Test
 *.test

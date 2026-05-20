@@ -1,0 +1,47 @@
+Respond with all three tokens, separated by hyphens, on a single line. Nothing else.
+
+[TOKEN_START: ALPHA_42]
+
+This is a regression-rig fixture used by `cmd/spike-long-prompt` to exercise `Session.WritePrompt` against real claude. The prompt body deliberately mixes prose, lists, fenced code, indented blocks, tab-indented lines, and one very long unbroken run so that bracketed-paste handling is stressed across a variety of content shapes that real-world consumers (most prominently `pyry agent-run` via ptyrunner — see pyrycode/pyrycode#468) are likely to feed in.
+
+Why a substring assertion: the regression target is "claude received all three tokens", not "claude obeyed the formatting instruction perfectly". Exact-equality would produce noisy false-negatives whenever claude prepends "OK:", adds a trailing newline, or wraps the answer in backticks. The assertion is therefore that the joined token string appears somewhere in the trimmed assistant text.
+
+Section A — bullet list (deliberately short items, with one trailing sentence each so paste handling sees varied line lengths):
+
+- Item one — a brief item with one trailing sentence so paste handling sees a normal short line.
+- Item two — another brief item, this one carrying a slightly longer trailing sentence to keep things uneven.
+- Item three — a third short item, again with its own trailing sentence to maintain the varied-length shape.
+- Item four — and finally one more short item with a trailing sentence to round out the list.
+
+Section B — fenced code-block-shaped region (the renderer in claude's TUI may try to syntax-highlight this; the spike is interested in whether the raw bytes round-trip cleanly, not in how they render):
+
+```
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("hello, paste world")
+}
+```
+
+[TOKEN_MIDDLE: GAMMA_88]
+
+Section C — indented block (four-space lead-in; common shape in pasted log excerpts):
+
+    2026-05-19 11:34:21.123  INFO  loaded fixture bytes=3456
+    2026-05-19 11:34:21.124  INFO  bracketed-paste open
+    2026-05-19 11:34:21.789  INFO  bracketed-paste close + commit
+
+Section D — single tab-indented line follows on the next line (the leading whitespace is a tab character, not spaces):
+	tabbed-line: this row begins with a single horizontal tab and is followed by ordinary text content so the paste body contains at least one tab character.
+
+Section E — one very long single line (>200 chars, no spaces past the first 100). This row exercises bracketed-paste handling for long unbroken runs that some terminals chunk awkwardly:
+
+prefix-with-spaces-up-to-here-but-then-everything-becomes-a-single-dashed-run-with-no-spaces-anywhere-after-this-point-and-continues-for-quite-a-while-so-that-the-total-length-of-this-uninterrupted-tail-exceeds-the-two-hundred-character-threshold-comfortably-and-then-some-more.
+
+Section F — prose paragraph that intentionally wraps past 80 columns when displayed in a typical terminal, to confirm that wrapping at the claude side does not silently mangle the underlying bytes. This is the sort of paragraph that real users paste into chat-style assistants when they are quoting a section from a design document, a code review note, or a postmortem. The exact contents are not important — what matters is that the bytes survive the bracketed-paste round-trip intact.
+
+[TOKEN_END: OMEGA_13]
+
+End of input. Token reminder: respond ONLY with the three tokens joined by hyphens.
