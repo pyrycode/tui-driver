@@ -17,6 +17,9 @@ tui-driver
 /bin/
 /e2e-report.json
 
+# Capture logs (e.g. code-review's `make e2e` capture); never commit
+*.log
+
 # Test
 *.test
 *.out
