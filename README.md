@@ -16,6 +16,15 @@ Consumer pairs `tui-driver` output (live state) with the target binary's session
 
 Pending: `ParseAskUserQuestion` (blocked by first-prompt-blocks-on-tool-readiness bug); pyry-acp consumer integration.
 
+## Running the e2e harness
+
+```sh
+make e2e                            # local: inherit operator's Claude config (Max-subscription path)
+make e2e MODEL=haiku EFFORT=low     # CI: pin --model haiku --effort low to cap metered-API spend
+```
+
+Cost differential: Opus high (the default operator config) costs ~$0.50–$2 per spike × 7 spikes + probe ≈ **$3–$15 per CI run**. Haiku low runs ~$0.20–$0.70 per run — roughly **18–90× cheaper** at parity coverage. The spikes test PTY / JSONL / modal behaviour, not reasoning quality, so Haiku low is fine. The `MODEL=` / `EFFORT=` Make variables ride the `TUIDRIVER_CLAUDE_MODEL` / `TUIDRIVER_CLAUDE_EFFORT` env vars through `EnsureClaudeEnv`; unset = inherited operator config. See `docs/knowledge/features/e2e-harness.md` for the full doc.
+
 ## Public API
 
 ### Process lifecycle
