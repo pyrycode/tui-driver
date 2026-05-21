@@ -48,6 +48,7 @@ func TestEncodeCwd(t *testing.T) {
 // byteTransform applies the post-canonicalisation byte-by-byte hyphen
 // mapping used by EncodeCwd. Tests use it to compute expected outputs
 // from a canonicalised path without re-implementing the rule.
+// Keep in sync with EncodeCwd's loop in cwd.go.
 func byteTransform(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
