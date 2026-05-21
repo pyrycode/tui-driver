@@ -132,7 +132,7 @@ Of these, only `user` and `assistant` carry a `message` object; everything else 
 
 ## Caveats
 
-- **`os.Getwd()` casing on macOS** (HFS+/APFS case-insensitive): the same directory can be reached as `WorkSpace` or `Workspace` depending on how you got there. If `os.Getwd()`'s casing disagrees with the path `claude` saw, the computed `<encoded-cwd>` won't match the directory `claude` writes to. The spike documents this; the eventual library may need to resolve the path canonically.
+- **Path casing on case-insensitive filesystems (default macOS APFS, default Windows).** The same directory can be reached as `WorkSpace` or `Workspace` depending on how you got there, and the on-disk canonical casing is what `claude` writes into `~/.claude/projects/`. Consumers that route through `tuidriver.EncodeCwd` get this for free — since [#57](../codebase/57.md), `EncodeCwd` resolves to the on-disk canonical form (symlinks resolved, case canonicalised) before encoding, so the output matches the directory `claude` writes to. Consumers that build the encoded-cwd themselves must canonicalise the input first (open the path and `fcntl(F_GETPATH)` on darwin, or `filepath.EvalSymlinks` on case-sensitive Linux defaults where a differently-cased lookup naturally returns `ENOENT`).
 - The shape above is the snapshot from one `claude` version (2.1.x). Future versions may rename fields or add new envelope types. Per [ADR-0001](../decisions/0001-hybrid-jsonl-tui.md), JSONL parsing is the **consumer's** responsibility, not tui-driver's — this file exists to inform consumers and to anchor the state-detection side that does need to know when a turn is done.
 
 ## Related

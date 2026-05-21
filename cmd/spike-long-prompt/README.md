@@ -198,7 +198,6 @@ Known-good verbs from sibling spikes: `Baked`, `Brewing`, `Brewed`, `Skedaddling
 
 - **Total wall-clock 3.23 s** with a 3454-byte fixture. The architect's open question ("If it consistently exceeds 30 s, surface as a finding") is answered: well under. No watchdog widening warranted.
 - **Fast path taken** — same shape as `spike-one-turn` Run 5. The spinner regex never matched even though `✻ Brewed for 2s` appeared in the PTY bytes; the JSONL `end_turn` event arrived first. Confirms that the substring-on-final-`end_turn`-text assertion is sufficient for the fixture shape (no intermediate `assistant` events with `tool_use`).
-- **Encoded-cwd quirk worth noting for operators** — `tuidriver.EncodeCwd` honours the case of `$PWD` rather than canonicalising via the filesystem. If a worktree is entered under one casing (`/Users/.../WorkSpace/...`) but the on-disk `~/.claude/projects/` directory was created under another (`-Users-...-Workspace-...`), the deterministic JSONL path resolves to a directory that does not exist and the 10 s stat-poll trips. Re-entering the worktree under the canonical casing (e.g. `cd "$(pwd -P)"`) resolves it. Not a defect in this spike — same shape would affect every `--session-id`-pinning spike — but worth knowing when triaging "JSONL did not appear" failures.
 
 ## Claude version dependency
 
