@@ -12,6 +12,12 @@ import "path/filepath"
 // Returns ("", false) on any resolution failure; callers fall back to
 // encoding the input as-passed.
 func canonicalisePath(p string) (string, bool) {
+	// filepath.EvalSymlinks("") succeeds with "." (filepath.Clean("") == ".")
+	// rather than erroring — mirror darwin's os.Open("") rejection so the
+	// fallback contract is uniform across platforms.
+	if p == "" {
+		return "", false
+	}
 	resolved, err := filepath.EvalSymlinks(p)
 	if err != nil {
 		return "", false
