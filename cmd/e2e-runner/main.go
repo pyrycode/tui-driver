@@ -399,9 +399,11 @@ func parseLockFile(path string) (lockFile, error) {
 }
 
 // runClaudeVersionLockCheck is the Run callback for the claude-version-lock
-// check. It compares the captured `claude --version` output against the
-// lock file's version field and asserts that every flag AND every value
-// the library depends on still appears verbatim in `claude --help`. The
+// check. It asserts that every flag AND every value the library depends on
+// still appears verbatim in `claude --help`. The `version=` field of the
+// lock file is informational — patch (or any) drift between the installed
+// claude and the lock's version is intentionally tolerated; bumping the
+// lock is coupled to a deliberate fixture re-record sweep (#47, #57). The
 // extra map always carries installed_version, expected_version,
 // missing_flags, and missing_values so the report schema stays uniform
 // across pass/fail.
@@ -430,40 +432,57 @@ func runClaudeVersionLockCheck(ctx context.Context, capturedVersion, lockPath st
 		return "fail", extra
 	}
 	installed := parseClaudeVersion(capturedVersion)
-	extra["installed_version"] = installed
-
-	status := "pass"
-	if installed != lf.Version {
-		fmt.Fprintf(os.Stderr, "e2e-runner: claude version %s does not match %s (%s); review and update\n", installed, lockPath, lf.Version)
-		status = "fail"
-	}
 
 	helpOut, err := exec.CommandContext(ctx, "claude", "--help").CombinedOutput()
 	if err != nil {
+		extra["installed_version"] = installed
 		fmt.Fprintf(os.Stderr, "e2e-runner: claude --help failed: %v\n", err)
 		return "fail", extra
 	}
-	help := string(helpOut)
 
-	missing := []string{}
+	status, extra := evaluateClaudeVersionLock(lf, installed, string(helpOut))
+	for _, f := range extra["missing_flags"].([]string) {
+		fmt.Fprintf(os.Stderr, "e2e-runner: claude --help no longer mentions flag %s; review %s\n", f, lockPath)
+	}
+	for _, v := range extra["missing_values"].([]string) {
+		fmt.Fprintf(os.Stderr, "e2e-runner: claude --help no longer mentions value %s; review %s\n", v, lockPath)
+	}
+	return status, extra
+}
+
+// evaluateClaudeVersionLock applies the lock policy to a parsed lockFile,
+// the parsed installed-version token, and a captured `claude --help`
+// output. Returns the check's status ("pass" or "fail") and the extra
+// map populated with installed_version, expected_version, missing_flags,
+// missing_values (always present; empty []string slices on pass).
+//
+// Side-effecting concerns (reading the lock file, exec'ing claude --help,
+// emitting stderr lines for the operator) live in the runClaudeVersionLockCheck
+// wrapper. The version field of the lock is *not* compared against the
+// installed version: per spec 64, patch drift in either direction is
+// informational only — the flag/value substring contract is the
+// substantive assertion.
+func evaluateClaudeVersionLock(lf lockFile, installedVersion, helpOut string) (string, map[string]any) {
+	missingFlags := []string{}
 	for _, f := range lf.Flags {
-		if !strings.Contains(help, f) {
-			fmt.Fprintf(os.Stderr, "e2e-runner: claude --help no longer mentions flag %s; review %s\n", f, lockPath)
-			missing = append(missing, f)
+		if !strings.Contains(helpOut, f) {
+			missingFlags = append(missingFlags, f)
 		}
 	}
-	extra["missing_flags"] = missing
-
 	missingValues := []string{}
 	for _, v := range lf.Values {
-		if !strings.Contains(help, v) {
-			fmt.Fprintf(os.Stderr, "e2e-runner: claude --help no longer mentions value %s; review %s\n", v, lockPath)
+		if !strings.Contains(helpOut, v) {
 			missingValues = append(missingValues, v)
 		}
 	}
-	extra["missing_values"] = missingValues
-
-	if len(missing) > 0 || len(missingValues) > 0 {
+	extra := map[string]any{
+		"installed_version": installedVersion,
+		"expected_version":  lf.Version,
+		"missing_flags":     missingFlags,
+		"missing_values":    missingValues,
+	}
+	status := "pass"
+	if len(missingFlags) > 0 || len(missingValues) > 0 {
 		status = "fail"
 	}
 	return status, extra

@@ -242,3 +242,143 @@ func TestParseLockFile_MissingFile(t *testing.T) {
 		t.Errorf("expected os.IsNotExist error, got %v", err)
 	}
 }
+
+func TestEvaluateClaudeVersionLock(t *testing.T) {
+	canonicalLF := lockFile{
+		Version: "2.1.144",
+		Flags:   []string{"--session-id", "--permission-mode", "--model", "--effort"},
+		Values:  []string{"bypassPermissions"},
+	}
+	const allFlagsHelp = "  --session-id\n  --permission-mode\n  --model\n  --effort\n  bypassPermissions\n"
+	helpMissingSessionID := "  --permission-mode\n  --model\n  --effort\n  bypassPermissions\n"
+	helpMissingBypass := "  --session-id\n  --permission-mode\n  --model\n  --effort\n"
+	helpMissingBoth := "  --permission-mode\n  --model\n  --effort\n"
+
+	tests := []struct {
+		name             string
+		lf               lockFile
+		installed        string
+		helpOut          string
+		wantStatus       string
+		wantMissingFlags []string
+		wantMissingVals  []string
+	}{
+		{
+			name:       "canonical match",
+			lf:         canonicalLF,
+			installed:  "2.1.144",
+			helpOut:    allFlagsHelp,
+			wantStatus: "pass",
+		},
+		{
+			name:       "patch drift above lock",
+			lf:         canonicalLF,
+			installed:  "2.1.145",
+			helpOut:    allFlagsHelp,
+			wantStatus: "pass",
+		},
+		{
+			name:       "patch drift below lock",
+			lf:         canonicalLF,
+			installed:  "2.1.143",
+			helpOut:    allFlagsHelp,
+			wantStatus: "pass",
+		},
+		{
+			name:       "minor drift above lock",
+			lf:         canonicalLF,
+			installed:  "2.2.0",
+			helpOut:    allFlagsHelp,
+			wantStatus: "pass",
+		},
+		{
+			name:             "missing flag",
+			lf:               canonicalLF,
+			installed:        "2.1.144",
+			helpOut:          helpMissingSessionID,
+			wantStatus:       "fail",
+			wantMissingFlags: []string{"--session-id"},
+		},
+		{
+			name:            "missing value",
+			lf:              canonicalLF,
+			installed:       "2.1.144",
+			helpOut:         helpMissingBypass,
+			wantStatus:      "fail",
+			wantMissingVals: []string{"bypassPermissions"},
+		},
+		{
+			name:             "both missing",
+			lf:               canonicalLF,
+			installed:        "2.1.144",
+			helpOut:          helpMissingBoth,
+			wantStatus:       "fail",
+			wantMissingFlags: []string{"--session-id"},
+			wantMissingVals:  []string{"bypassPermissions"},
+		},
+		{
+			name:       "empty flags and values",
+			lf:         lockFile{Version: "2.1.144"},
+			installed:  "2.1.144",
+			helpOut:    "irrelevant content",
+			wantStatus: "pass",
+		},
+		{
+			name:             "drift above lock plus missing flag",
+			lf:               canonicalLF,
+			installed:        "2.1.145",
+			helpOut:          helpMissingSessionID,
+			wantStatus:       "fail",
+			wantMissingFlags: []string{"--session-id"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			status, extra := evaluateClaudeVersionLock(tc.lf, tc.installed, tc.helpOut)
+			if status != tc.wantStatus {
+				t.Errorf("status = %q, want %q", status, tc.wantStatus)
+			}
+
+			gotInstalled, ok := extra["installed_version"].(string)
+			if !ok {
+				t.Fatalf("installed_version type = %T, want string", extra["installed_version"])
+			}
+			if gotInstalled != tc.installed {
+				t.Errorf("installed_version = %q, want %q", gotInstalled, tc.installed)
+			}
+
+			gotExpected, ok := extra["expected_version"].(string)
+			if !ok {
+				t.Fatalf("expected_version type = %T, want string", extra["expected_version"])
+			}
+			if gotExpected != tc.lf.Version {
+				t.Errorf("expected_version = %q, want %q", gotExpected, tc.lf.Version)
+			}
+
+			wantMF := tc.wantMissingFlags
+			if wantMF == nil {
+				wantMF = []string{}
+			}
+			gotMF, ok := extra["missing_flags"].([]string)
+			if !ok {
+				t.Fatalf("missing_flags type = %T, want []string", extra["missing_flags"])
+			}
+			if !reflect.DeepEqual(gotMF, wantMF) {
+				t.Errorf("missing_flags = %#v, want %#v", gotMF, wantMF)
+			}
+
+			wantMV := tc.wantMissingVals
+			if wantMV == nil {
+				wantMV = []string{}
+			}
+			gotMV, ok := extra["missing_values"].([]string)
+			if !ok {
+				t.Fatalf("missing_values type = %T, want []string", extra["missing_values"])
+			}
+			if !reflect.DeepEqual(gotMV, wantMV) {
+				t.Errorf("missing_values = %#v, want %#v", gotMV, wantMV)
+			}
+		})
+	}
+}
