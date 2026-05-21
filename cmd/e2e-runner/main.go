@@ -408,11 +408,16 @@ func parseLockFile(path string) (lockFile, error) {
 // missing_flags, and missing_values so the report schema stays uniform
 // across pass/fail.
 func runClaudeVersionLockCheck(ctx context.Context, capturedVersion, lockPath string) (string, map[string]any) {
-	extra := map[string]any{
-		"installed_version": "",
-		"expected_version":  "",
-		"missing_flags":     []string{},
-		"missing_values":    []string{},
+	// failExtra builds the report's extra map for early-return failure paths
+	// that don't reach evaluateClaudeVersionLock. On the success path the
+	// helper produces its own extra; building one here would be overwritten.
+	failExtra := func(installed, expected string) map[string]any {
+		return map[string]any{
+			"installed_version": installed,
+			"expected_version":  expected,
+			"missing_flags":     []string{},
+			"missing_values":    []string{},
+		}
 	}
 
 	lf, err := parseLockFile(lockPath)
@@ -422,22 +427,19 @@ func runClaudeVersionLockCheck(ctx context.Context, capturedVersion, lockPath st
 		} else {
 			fmt.Fprintf(os.Stderr, "e2e-runner: %s parse error %v\n", lockPath, err)
 		}
-		extra["installed_version"] = parseClaudeVersion(capturedVersion)
-		return "fail", extra
+		return "fail", failExtra(parseClaudeVersion(capturedVersion), "")
 	}
-	extra["expected_version"] = lf.Version
 
 	if capturedVersion == "unknown" {
 		fmt.Fprintln(os.Stderr, "e2e-runner: claude --version failed at startup; cannot enforce claude-version.lock")
-		return "fail", extra
+		return "fail", failExtra("", lf.Version)
 	}
 	installed := parseClaudeVersion(capturedVersion)
 
 	helpOut, err := exec.CommandContext(ctx, "claude", "--help").CombinedOutput()
 	if err != nil {
-		extra["installed_version"] = installed
 		fmt.Fprintf(os.Stderr, "e2e-runner: claude --help failed: %v\n", err)
-		return "fail", extra
+		return "fail", failExtra(installed, lf.Version)
 	}
 
 	status, extra := evaluateClaudeVersionLock(lf, installed, string(helpOut))
