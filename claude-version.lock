@@ -1,6 +1,12 @@
-# claude-version.lock — pinned claude binary contract for the e2e harness.
-# Update deliberately when bumping the installed claude; the docs ticket
-# (#37) covers the workflow.
+# claude-version.lock — pinned API surface for the e2e harness.
+#
+# `version=` is informational: the claude version this lock was last
+# reviewed against. It is NOT enforced at runtime — claude patch drift
+# above this version is intentionally tolerated. Bump deliberately when
+# re-recording snapshot fixtures (see #47, #57).
+#
+# `flag=` and `value=` lines ARE enforced — each MUST appear as a
+# substring of `claude --help` for the e2e gate to pass.
 
 version=2.1.144
 

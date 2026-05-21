@@ -1,10 +1,10 @@
 # e2e harness
 
-The single command (`make e2e`) that verifies the library's empirical end-to-end behaviour against a real installed `claude` binary. Runs the `claude-version-lock` check first, then every spike + probe + the snapshot-drift check serially, classifies each as pass / fail / timeout, and emits a single-file JSON report (`e2e-report.json`) suitable for CI artifact collection. Introduced by [#34](../codebase/34.md); extended by [#35](../codebase/35.md) (snapshot-drift), [#36](../codebase/36.md) (claude-version-lock), and [#40](../codebase/40.md) (GitHub Actions push-to-main workflow). Operator runbook lives here; per-ticket build notes live in `codebase/<N>.md`.
+The single command (`make e2e`) that verifies the library's empirical end-to-end behaviour against a real installed `claude` binary. Runs the `claude-version-lock` check first, then every spike + probe + the snapshot-drift check serially, classifies each as pass / fail / timeout, and emits a single-file JSON report (`e2e-report.json`) suitable for CI artifact collection. Introduced by [#34](../codebase/34.md); extended by [#35](../codebase/35.md) (snapshot-drift), [#36](../codebase/36.md) (claude-version-lock), [#40](../codebase/40.md) (GitHub Actions push-to-main workflow), and [#64](../codebase/64.md) (`claude-version-lock` policy narrowed — version equality dropped, flag/value presence kept). Operator runbook lives here; per-ticket build notes live in `codebase/<N>.md`.
 
 ## What it does
 
-- Runs the in-process `claude-version-lock` check first (asserts `claude --version` matches `claude-version.lock` and that every flag pinned in the lock file still appears in `claude --help`), then the 7 spike binaries (`spike-one-turn`, `spike-multi-turn`, `spike-cancel`, `spike-permission`, `spike-multiselect`, `spike-ask-user`, `spike-long-prompt`), then `probe-first-prompt-hang`, then the `snapshot-drift` check — all serially against a real `claude` install. `spike-long-prompt` is the `Session.WritePrompt` regression rig — bracketed-paste path, 3.45 KB embedded fixture, three token markers, substring assertion (see [#47](../codebase/47.md)).
+- Runs the in-process `claude-version-lock` check first (asserts every `flag=` and `value=` pinned in `claude-version.lock` still appears in `claude --help` — claude patch drift between the installed binary and the lock's informational `version=` field is intentionally tolerated, see [#64](../codebase/64.md)), then the 7 spike binaries (`spike-one-turn`, `spike-multi-turn`, `spike-cancel`, `spike-permission`, `spike-multiselect`, `spike-ask-user`, `spike-long-prompt`), then `probe-first-prompt-hang`, then the `snapshot-drift` check — all serially against a real `claude` install. `spike-long-prompt` is the `Session.WritePrompt` regression rig — bracketed-paste path, 3.45 KB embedded fixture, three token markers, substring assertion (see [#47](../codebase/47.md)).
 - Captures pass/fail/timeout + wall duration per check.
 - Emits `e2e-report.json` at the repo root (always — even on partial failure, so CI gets a uniform artifact).
 - Exits `0` iff every check passed; `1` otherwise.
@@ -96,7 +96,7 @@ Both use 30-day retention (trimmed from the 90-day default; drift events get ins
 
 Four kinds today (`Kind` is informational — every check goes through the same `runCheck` body):
 
-- **`version-lock`** — in-process check that runs first. Parses `claude-version.lock`, parses the leading token out of the captured `claude --version` output, asserts strict string equality against the lock's `version=` value, then runs `claude --help` once and `strings.Contains`-checks every `flag=` entry against the help output. Default 60s timeout (override via `-timeout claude-version-lock=DUR`). Failure short-circuits every subsequent check. Emits `installed_version`, `expected_version`, and `missing_flags` (always present — empty slice on pass) on the report entry. The only in-process check kind: the `Run` field on `Check` is set, `Binary`/`Args`/`SuccessMarker` are ignored. Introduced by [#36](../codebase/36.md).
+- **`version-lock`** — in-process check that runs first. Parses `claude-version.lock`, parses the leading token out of the captured `claude --version` output (informational only — populates `installed_version` for the report; the lock's `version=` populates `expected_version`), then runs `claude --help` once and `strings.Contains`-checks every `flag=` and `value=` entry against the help output. The substantive contract is the flag/value presence — claude patch drift between the lock's `version=` and the installed binary is intentionally tolerated (see [#64](../codebase/64.md) for the rationale: the version-equality assertion produced spurious FAILs every time the reviewer-side claude auto-updated, while adding no signal the flag/value check didn't already provide). Default 60s timeout (override via `-timeout claude-version-lock=DUR`). Failure short-circuits every subsequent check. Emits `installed_version`, `expected_version`, `missing_flags`, and `missing_values` (always present — empty slices on pass) on the report entry. The only in-process check kind: the `Run` field on `Check` is set, `Binary`/`Args`/`SuccessMarker` are ignored. Introduced by [#36](../codebase/36.md); policy narrowed by [#64](../codebase/64.md).
 - **`spike`** — runs a single spike binary with `-trust-folder=accept`. Passes iff the subprocess exits 0 AND its stdout matches the check's `SuccessMarker` regex.
   - Result spikes (`one-turn`, `multi-turn`, `cancel`, `permission`, `long-prompt`) use `^SUCCESS` as their marker (they print `SUCCESS: <text>` on green).
   - Observation spikes (`multiselect`, `ask-user`) use `^OBSERVED` as their marker (they print `OBSERVED: <text>` — their contract is "exit 0 + observation logged").
@@ -126,9 +126,10 @@ Both callbacks return `map[string]any` that gets flattened into the report entry
   "total_duration_ms": 312456,
   "checks": [
     { "name": "claude-version-lock",     "status": "pass",    "duration_ms":    38,
-      "installed_version": "2.1.144",
+      "installed_version": "2.1.146",
       "expected_version":  "2.1.144",
-      "missing_flags": [] },
+      "missing_flags": [],
+      "missing_values": [] },
     { "name": "spike-one-turn",          "status": "pass",    "duration_ms":  9123 },
     { "name": "spike-multi-turn",        "status": "pass",    "duration_ms": 18247 },
     { "name": "spike-cancel",            "status": "pass",    "duration_ms": 13002 },
@@ -147,9 +148,9 @@ Both callbacks return `map[string]any` that gets flattened into the report entry
 }
 ```
 
-`claude_version` is the raw `claude --version` output (whitespace-trimmed); the bare version token (e.g. `2.1.144`) is parsed inside the `claude-version-lock` check and surfaced separately as `installed_version`. If `claude --version` itself fails, `claude_version` is the string `"unknown"` and `claude-version-lock` short-circuits the run.
+`claude_version` is the raw `claude --version` output (whitespace-trimmed); the bare version token (e.g. `2.1.146`) is parsed inside the `claude-version-lock` check and surfaced separately as `installed_version`. If `claude --version` itself fails, `claude_version` is the string `"unknown"` and `claude-version-lock` short-circuits the run.
 
-`installed_version`, `expected_version`, and `missing_flags` always ride on the `claude-version-lock` entry — even on pass, the empty slice is emitted so a CI consumer can rely on the schema. On a drift short-circuit, every check below the `claude-version-lock` `fail` entry appears with `status="timeout"` and `duration_ms=0` (the same shape wall-budget exhaustion produces); the surrounding `claude-version-lock` `fail` entry disambiguates the two.
+`installed_version`, `expected_version`, `missing_flags`, and `missing_values` always ride on the `claude-version-lock` entry — even on pass, the empty slices are emitted so a CI consumer can rely on the schema. `installed_version` ≠ `expected_version` is **not** a gate condition (per [#64](../codebase/64.md), patch drift is informational only); the fields exist so the operator can see drift in the JSON report and so re-record sweeps have a single grep target for "what claude was this lock last reviewed against." Consumers that want a soft drift indicator can compare the two fields themselves; the harness no longer fails on the inequality. On a drift short-circuit (lock-file missing, parse error, captured-version `"unknown"`, `claude --help` exec failure, or any `missing_flags` / `missing_values` entries), every check below the `claude-version-lock` `fail` entry appears with `status="timeout"` and `duration_ms=0` (the same shape wall-budget exhaustion produces); the surrounding `claude-version-lock` `fail` entry disambiguates the two.
 
 `snapshots[]` appears on both `pass` and `fail` so a CI consumer can always pinpoint which fixture(s) drifted. It's omitted only when the check binary crashed before emitting any `SNAPSHOT` line (extremely rare — the binary is engineered to always exit cleanly with a real exit code and partial output). `file` is always a repo-relative path; the `/tmp/spike-multiselect-bytes-<ns>.bin` dump path is operator-facing diagnostic output (visible in mirrored stderr) and never enters the report.
 
@@ -169,8 +170,9 @@ Both callbacks return `map[string]any` that gets flattened into the report entry
 | `claude` binary missing | `claude --version` fails → `claude_version="unknown"`; `claude-version-lock` emits a `claude --version failed at startup; cannot enforce claude-version.lock` stderr line and returns `fail`; remaining checks short-circuit with `status="timeout"` and `duration_ms=0`. Report still emits; exit 1. |
 | `claude-version.lock` missing | `claude-version-lock` emits `claude-version.lock not found; required for claude-version-lock check` on stderr, returns `fail`, short-circuits the run. Report still emits with `installed_version` parsed from the captured raw version and `expected_version: ""`. |
 | `claude-version.lock` parse error | Stderr: `claude-version.lock parse error at line N: <reason>`. Same shape as the missing-file path — `fail`, short-circuit, `expected_version: ""`. |
-| `claude` version drifted from lock | Stderr: `claude version 2.1.X does not match claude-version.lock (2.1.144); review and update`. The check continues to the `--help` flag check (so both findings appear in `missing_flags` for the operator), then returns `fail` and short-circuits the rest of the run. |
-| `claude --help` missing a pinned flag | One stderr line per missing flag: `claude --help no longer mentions <flag>; review claude-version.lock`. Missing flags collected into `missing_flags`. `fail` + short-circuit. |
+| `claude` version drifted from lock | Tolerated by design (since [#64](../codebase/64.md)). `installed_version` ≠ `expected_version` shows up in the report but does not produce a stderr line and does not gate the check. The substantive contract is the flag/value presence check below. |
+| `claude --help` missing a pinned flag | One stderr line per missing flag: `claude --help no longer mentions flag <flag>; review claude-version.lock`. Missing flags collected into `missing_flags`. `fail` + short-circuit. |
+| `claude --help` missing a pinned value | One stderr line per missing value: `claude --help no longer mentions value <value>; review claude-version.lock`. Missing values collected into `missing_values`. `fail` + short-circuit. |
 | Spike binary missing in `-bin-dir` | The check's `cmd.Run()` returns an error; treated as `status="fail"`. Runner continues with the next check. |
 | Per-check timeout | `status="timeout"`. Runner continues. |
 | Top-level wall budget hit | In-flight check ends with `status="timeout"`. Remaining checks appended with `status="timeout"` and `duration_ms=0` (un-run). |
@@ -188,36 +190,54 @@ Single goroutine. The runner drives checks serially. `exec.CommandContext` handl
 
 ## `claude-version.lock`
 
-The pinned-claude contract at the repo root, consumed by the `claude-version-lock` check.
+The pinned API surface at the repo root, consumed by the `claude-version-lock` check. As of [#64](../codebase/64.md): `version=` is informational metadata; `flag=` and `value=` lines are the enforced contract.
 
 ```
-# claude-version.lock — pinned claude binary contract for the e2e harness.
-# Update deliberately when bumping the installed claude; the docs ticket
-# (#37) covers the workflow.
+# claude-version.lock — pinned API surface for the e2e harness.
+#
+# `version=` is informational: the claude version this lock was last
+# reviewed against. It is NOT enforced at runtime — claude patch drift
+# above this version is intentionally tolerated. Bump deliberately when
+# re-recording snapshot fixtures (see #47, #57).
+#
+# `flag=` and `value=` lines ARE enforced — each MUST appear as a
+# substring of `claude --help` for the e2e gate to pass.
 
 version=2.1.144
 
 flag=--session-id
-flag=--permission-mode bypassPermissions
+flag=--permission-mode
+value=bypassPermissions
+flag=--model
+flag=--effort
 ```
 
 **Format rules** (enforced by `parseLockFile` in `cmd/e2e-runner/main.go`):
 
 - Lines beginning with `#` (after optional leading whitespace) are comments. Blank/whitespace-only lines are ignored.
-- Non-comment lines must be `key=value` with `key ∈ {"version", "flag"}`. Anything else is a parse error with the line number.
-- Exactly one `version=` line is required. Zero or two-or-more → parse error.
+- Non-comment lines must be `key=value` with `key ∈ {"version", "flag", "value"}`. Anything else is a parse error with the line number.
+- Exactly one `version=` line is required. Zero or two-or-more → parse error. The field is required at parse time even though it is no longer enforced at runtime — keeping it required preserves a single grep target for "what claude version was this lock last reviewed against?", which matters for the snapshot-drift re-record discipline (see [#47](../codebase/47.md), [#57](../codebase/57.md)).
 - Zero or more `flag=` lines. Empty value (`flag=`) is a parse error.
-- Key and value are trimmed of surrounding whitespace; the value portion preserves internal whitespace verbatim (so `flag=--permission-mode bypassPermissions` stores the literal substring that will be searched for in `claude --help` output).
+- Zero or more `value=` lines. Empty value (`value=`) is a parse error. Conventionally used for argv values that appear as standalone tokens in `claude --help` output (e.g. `bypassPermissions` for `--permission-mode bypassPermissions`) — splitting flag and value into separate lines lets the substring check survive cosmetic re-flowing of the `--help` text.
+- Key and value are trimmed of surrounding whitespace; the value portion preserves internal whitespace verbatim.
 
 **Updating the lock file** (manual; tooling deliberately not shipped):
 
-1. Bump claude on the maintainer's box. Run `claude --version`; copy the leading token (e.g. `2.1.145`).
-2. Run `claude --help` and confirm every existing `flag=` entry still appears verbatim.
-3. Edit `claude-version.lock` — change the `version=` line; add/remove `flag=` lines for any new dependencies.
-4. Re-run `make e2e`. The `claude-version-lock` check should pass; if it doesn't, the lock file edit was incomplete.
-5. Commit the lock file edit in the same commit as any library changes that depend on the new claude.
+The semantics of an edit shifted with [#64](../codebase/64.md). Two distinct triggers, with different urgency:
 
-The format is intentionally NOT JSON / TOML / YAML — hand-edit-friendliness and grep-friendliness matter more than data-model expressiveness for a 6-line contract file edited once per claude upgrade.
+- **Legitimate / scheduled — re-recording fixtures.** When `snapshot-drift` or one of the byte-stream-sensitive spikes (`spike-multi-turn`, `spike-cancel`, `spike-permission`, `spike-ask-user`) starts failing because claude's TUI output has genuinely changed, the fixture re-record sweep AND the lock bump travel together. Bumping `version=` is the maintainer's annotation that "the fixtures committed alongside this edit were captured against this claude." See [#47](../codebase/47.md) and [#57](../codebase/57.md) on why these two changes must coincide.
+- **No-op / informational — patch drift.** When the operator's claude has auto-updated past `version=` but every pinned flag and value still appears in `claude --help`, the harness no longer cares. The operator MAY bump `version=` to reflect the latest reviewed-against value, but the bump has no functional effect on the gate. Bumping mid-feature-ticket purely to silence the gate is what [#64](../codebase/64.md) exists to make unnecessary; the anti-pattern (`#47` and `#57` lessons) still applies if a bump cascades into sibling-fixture failures.
+
+Workflow when re-recording fixtures (the legitimate path):
+
+1. Bump claude on the maintainer's box. Run `claude --version`; note the leading token (e.g. `2.1.146`).
+2. Run `claude --help` and confirm every existing `flag=` and `value=` entry still appears verbatim. Add new lines for any new dependencies; remove lines for retired ones.
+3. Re-record snapshot fixtures per § [Re-recording snapshot fixtures](#re-recording-snapshot-fixtures) below and any other byte-stream-coupled fixtures the cascade names.
+4. Edit `claude-version.lock` — change the `version=` line to match what you re-recorded against; update `flag=` / `value=` lines if step 2 surfaced changes.
+5. Re-run `make e2e`. The `claude-version-lock` check should pass under the new claude (it would have passed before the bump too — that's the [#64](../codebase/64.md) change); the byte-stream-coupled checks should also pass once their fixtures have been refreshed.
+6. Commit the lock-file edit and the fixture refresh in the same commit, alongside any library changes that depend on the new claude.
+
+The format is intentionally NOT JSON / TOML / YAML — hand-edit-friendliness and grep-friendliness matter more than data-model expressiveness for a small contract file edited once per re-record sweep.
 
 ## Re-recording snapshot fixtures
 
@@ -254,7 +274,7 @@ The `TUIDRIVER_STRICT_MCP_CONFIG=1` env var matters: the e2e runner sets it on e
 
 ## Related
 
-- Per-ticket notes: [#34](../codebase/34.md), [#35](../codebase/35.md), [#36](../codebase/36.md), [#40](../codebase/40.md)
-- Specs: [#34](../../specs/architecture/34-e2e-harness-foundation.md), [#35](../../specs/architecture/35-snapshot-drift.md), [#36](../../specs/architecture/36-claude-version-lock.md), [#40](../../specs/architecture/40-ci-e2e-workflow.md)
+- Per-ticket notes: [#34](../codebase/34.md), [#35](../codebase/35.md), [#36](../codebase/36.md), [#40](../codebase/40.md), [#64](../codebase/64.md)
+- Specs: [#34](../../specs/architecture/34-e2e-harness-foundation.md), [#35](../../specs/architecture/35-snapshot-drift.md), [#36](../../specs/architecture/36-claude-version-lock.md), [#40](../../specs/architecture/40-ci-e2e-workflow.md), [#64](../../specs/architecture/64-claude-version-lock-policy.md)
 - ADRs: orthogonal to both [0001](../decisions/0001-hybrid-jsonl-tui.md) and [0002](../decisions/0002-pattern-matching-over-emulation.md) — the harness shells out (and now also runs an in-process structural check); neither extends the library's signal model.
 - System overview: [architecture/system-overview.md](../architecture/system-overview.md)
