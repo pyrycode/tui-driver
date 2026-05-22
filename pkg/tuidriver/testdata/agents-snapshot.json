@@ -1,0 +1,9 @@
+{
+  "tabs": [
+    "Running",
+    "Library"
+  ],
+  "current_tab": "Running",
+  "items": null,
+  "empty_text": "No subagents are currently running."
+}

@@ -311,7 +311,7 @@ func parseSnapshotResults(stdout, _ string) map[string]any {
 	snapshots := make([]map[string]any, 0, len(matches))
 	for _, m := range matches {
 		snapshots = append(snapshots, map[string]any{
-			"file":   "pkg/tuidriver/testdata/" + m[1] + "-snapshot.bin",
+			"file":   "pkg/tuidriver/testdata/" + m[1] + "-snapshot.json",
 			"result": m[2],
 		})
 	}

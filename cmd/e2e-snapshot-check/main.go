@@ -1,25 +1,37 @@
 // e2e-snapshot-check re-derives each committed fixture under
 // pkg/tuidriver/testdata/ by running spike-multiselect with the appropriate
-// -trigger and -settle flags, then byte-compares the resulting /tmp dump to
-// the committed file. Exits 0 iff every fixture matched.
+// -trigger and -settle flags, then compares the resulting parsed-shape JSON
+// dump against the committed fixture. Exits 0 iff every fixture matched.
 //
-// Read-only invariant (per ticket #35): this binary never writes to
-// pkg/tuidriver/testdata/* — re-recording is a maintainer step run
-// separately via spike-multiselect.
+// Spec 81 (supersedes spec 35): comparison is parsed-shape JSON (via the
+// .parsed.json file spike-multiselect writes alongside its raw .bin dump),
+// not raw PTY bytes. Equality is reflect.DeepEqual over the json.Unmarshal'd
+// trees to survive incidental whitespace / key-order differences. The
+// renderer-byte volatility (Try-line rotation, bimodal whitespace-clear
+// passes — see #72) is absorbed by the parsers, so the parsed shape is
+// stable where the byte stream is not.
+//
+// The check binary unconditionally sets TUIDRIVER_STRICT_MCP_CONFIG=1 in the
+// env passed to every spike-multiselect child so re-recorded fixtures don't
+// leak operator MCP-config paths into the mcp fixture (idempotent when
+// `make e2e` already set it; load-bearing for `bin/e2e-snapshot-check`
+// direct invocation).
 //
 // Stdout protocol (one line per fixture, in fixture-table order):
 //
-//	SNAPSHOT picker match|diff
-//	SNAPSHOT mcp match|diff
-//	SNAPSHOT agents match|diff
+//	SNAPSHOT picker match|diff|recorded
+//	SNAPSHOT mcp match|diff|recorded
+//	SNAPSHOT agents match|diff|recorded
 //
 // Stderr carries operator-facing diagnostics (mirrored spike-multiselect
-// output, per-fixture "drift in <path>" lines on diff).
+// output, per-fixture "drift in <path>" lines on diff, plus a
+// "captured at <parsed.json>" forensic anchor for `diff`).
 package main
 
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,7 +39,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -43,8 +57,9 @@ type fixture struct {
 
 func main() {
 	binDir := flag.String("bin-dir", "./bin", "directory containing the built spike-multiselect binary")
-	testdataDir := flag.String("testdata-dir", "./pkg/tuidriver/testdata", "directory containing committed *-snapshot.bin fixtures")
+	testdataDir := flag.String("testdata-dir", "./pkg/tuidriver/testdata", "directory containing committed *-snapshot.json fixtures")
 	spikeTimeout := flag.Duration("spike-timeout", 60*time.Second, "per-fixture spike-multiselect wall budget")
+	record := flag.Bool("record", false, "overwrite committed fixtures with freshly-captured parsed JSON instead of comparing")
 	flag.Parse()
 
 	fixtures := []fixture{
@@ -55,7 +70,7 @@ func main() {
 
 	allOK := true
 	for _, f := range fixtures {
-		ok := runFixture(*binDir, *testdataDir, *spikeTimeout, f)
+		ok := runFixture(*binDir, *testdataDir, *spikeTimeout, *record, f)
 		if !ok {
 			allOK = false
 		}
@@ -65,8 +80,8 @@ func main() {
 	}
 }
 
-func runFixture(binDir, testdataDir string, spikeTimeout time.Duration, f fixture) bool {
-	fixturePath := filepath.Join(testdataDir, f.name+"-snapshot.bin")
+func runFixture(binDir, testdataDir string, spikeTimeout time.Duration, record bool, f fixture) bool {
+	fixturePath := filepath.Join(testdataDir, f.name+"-snapshot.json")
 
 	ctx, cancel := context.WithTimeout(context.Background(), spikeTimeout)
 	defer cancel()
@@ -78,6 +93,10 @@ func runFixture(binDir, testdataDir string, spikeTimeout time.Duration, f fixtur
 	binPath := filepath.Join(binDir, "spike-multiselect")
 
 	cmd := exec.CommandContext(ctx, binPath, args...)
+	// Force strict-mcp on every child so re-recorded fixtures are
+	// reproducible across hosts. Idempotent when the parent env already
+	// has it set (the e2e-runner does); load-bearing for direct invocation.
+	cmd.Env = append(os.Environ(), "TUIDRIVER_STRICT_MCP_CONFIG=1")
 	var stderrBuf bytes.Buffer
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.MultiWriter(&stderrBuf, os.Stderr)
@@ -95,20 +114,45 @@ func runFixture(binDir, testdataDir string, spikeTimeout time.Duration, f fixtur
 		return false
 	}
 	dumpPath := string(m[1])
+	parsedPath := strings.TrimSuffix(dumpPath, ".bin") + ".parsed.json"
 
-	captured, err := os.ReadFile(dumpPath)
+	capturedJSON, err := os.ReadFile(parsedPath)
 	if err != nil {
-		emitDiff(f, fixturePath, fmt.Errorf("read dump %s: %w", dumpPath, err))
+		emitDiff(f, fixturePath, fmt.Errorf("read parsed-json %s: %w", parsedPath, err))
 		return false
 	}
-	committed, err := os.ReadFile(fixturePath)
+
+	if record {
+		if err := os.WriteFile(fixturePath, capturedJSON, 0o644); err != nil {
+			emitDiff(f, fixturePath, fmt.Errorf("write fixture %s: %w", fixturePath, err))
+			return false
+		}
+		fmt.Printf("SNAPSHOT %s recorded\n", f.name)
+		return true
+	}
+
+	committedJSON, err := os.ReadFile(fixturePath)
 	if err != nil {
 		emitDiff(f, fixturePath, fmt.Errorf("read fixture %s: %w", fixturePath, err))
+		fmt.Fprintf(os.Stderr, "  captured at %s\n", parsedPath)
 		return false
 	}
 
-	if !bytes.Equal(captured, committed) {
+	var capturedTree, committedTree any
+	if err := json.Unmarshal(capturedJSON, &capturedTree); err != nil {
+		emitDiff(f, fixturePath, fmt.Errorf("parse captured json: %w", err))
+		fmt.Fprintf(os.Stderr, "  captured at %s\n", parsedPath)
+		return false
+	}
+	if err := json.Unmarshal(committedJSON, &committedTree); err != nil {
+		emitDiff(f, fixturePath, fmt.Errorf("parse fixture json: %w", err))
+		fmt.Fprintf(os.Stderr, "  captured at %s\n", parsedPath)
+		return false
+	}
+
+	if !reflect.DeepEqual(capturedTree, committedTree) {
 		emitDiff(f, fixturePath, nil)
+		fmt.Fprintf(os.Stderr, "  captured at %s\n", parsedPath)
 		return false
 	}
 	fmt.Printf("SNAPSHOT %s match\n", f.name)
@@ -117,7 +161,7 @@ func runFixture(binDir, testdataDir string, spikeTimeout time.Duration, f fixtur
 
 // emitDiff prints the diff verdict to stdout and the operator-facing
 // "drift in <path>[: <err>]" line to stderr. err==nil means a clean
-// byte-mismatch; non-nil means a capture/read failure degraded to diff.
+// parsed-shape mismatch; non-nil means a capture/read failure degraded to diff.
 func emitDiff(f fixture, fixturePath string, err error) {
 	fmt.Printf("SNAPSHOT %s diff\n", f.name)
 	if err == nil {

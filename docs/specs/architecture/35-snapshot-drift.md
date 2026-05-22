@@ -1,7 +1,14 @@
 # Spec 35 — e2e: snapshot-drift check vs pkg/tuidriver/testdata/*-snapshot.bin
 
+> **Superseded by [Spec 81](81-snapshot-drift-parsed-shape.md)** (#81, 2026-05-22). The
+> byte-compare model designed below was retired after #72's evidence that every
+> byte-level mitigation surfaces the next layer of renderer volatility. Spec 81
+> replaces the byte-compare with a parsed-shape (`ParsePicker` / `ParseMcpStatus` /
+> `ParseAgentList`) JSON comparison. Read spec 81 for the canonical design; this
+> spec is retained for historical context only.
+
 Ticket: https://github.com/pyrycode/tui-driver/issues/35
-Status: ready for developer
+Status: superseded by spec 81
 
 ## Files to read first
 
