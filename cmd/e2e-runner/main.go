@@ -235,6 +235,14 @@ func buildChecks(runVersionLock func(ctx context.Context) (string, map[string]an
 			Binary:        "spike-cancel",
 			Args:          commonArgs,
 			SuccessMarker: successSuccess,
+			// Per-check timeout override: the 5-probe shape (3 cancel probes +
+			// Probe 4 re-running the 1000-word monad essay as a full recovery
+			// turn + Probe 5 follow-up) takes ~60-70s wall time on claude
+			// 2.1.148 — Probe 4's essay generation alone is ~30-40s of real
+			// model time. The default 60s cut runs short of completion. The
+			// spec for #69 estimated 18-25s but undercounted Probe 4's full
+			// essay generation. Ticket #69.
+			Timeout: 120 * time.Second,
 		},
 		{
 			Name:          "spike-permission",

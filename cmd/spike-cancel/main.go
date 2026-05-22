@@ -60,7 +60,6 @@ const (
 	shutdownGrace      = 3 * time.Second
 
 	disappearedWindow = 500 * time.Millisecond
-	idleStableWindow  = 250 * time.Millisecond
 
 	// cancelRecoveryLimit: post-cancel watchdog window per AC. Cancellation
 	// should be near-instant; if ❯-reappeared doesn't fire within this
@@ -514,15 +513,32 @@ func waitForKickoff(
 // cancel keystroke. Drains assistant events arriving in this window into
 // `probe=N jsonl-cancel-event` log lines.
 //
-// Predicate: ❯ idle glyph present AND the PTY has been quiet for at least
-// ptyQuietWindow. The spec's first-cut predicate ("hasSpinnerGlyph
-// becomes false AND isIdle true") would have been tighter, but post-cancel
-// claude doesn't emit enough bytes to roll the spinner glyph out of the
-// 4096-byte rolling buffer — the glyph stays painted indefinitely even
-// though no new spinner paint has happened. The quiescence predicate
-// detects "claude has finished settling" directly, which is what we
-// actually care about. See spec open question #4 and this binary's
-// README § *Surprises / findings*.
+// Predicate: ❯ idle glyph present (direct bytes.Contains check, NOT via
+// tuidriver.IsIdle) AND the PTY has been quiet for at least ptyQuietWindow.
+//
+// We deliberately do NOT use tuidriver.IsIdle here. IsIdle's spinner-absent
+// half is exactly what wedges this function against claude 2.1.148: the
+// pre-cancel `✻ Forming…` glyph paint stays painted in the 4 KB rolling
+// buffer (pkg/tuidriver/buffer.go:8-13) because post-cancel claude emits
+// only ~1.4 KB of redraw — well under the buffer cap — so the glyph never
+// rolls out. IsIdle then returns false forever, the predicate wedges, and
+// the 30 s cancelRecoveryLimit watchdog trips on every run. Ticket #69 has
+// the byte-count math (1577 bytes of churn since the last `✻` paint at
+// watchdog-trip time vs. the 4096-byte buffer cap). PTY-quiescence subsumes
+// the safety the spinner-absent clause was meant to provide: when claude
+// has emitted zero bytes for 1.5 s, it has by definition stopped redrawing.
+// The new predicate is weaker on the spinner-glyph axis but strictly
+// stronger on the rendering-activity axis (1500 ms of zero PTY bytes vs.
+// 250 ms of glyph-absence — quiescence cannot be faked by a transient
+// buffer state).
+//
+// Same predicate shape as cmd/spike-multi-turn/main.go:391-400 (PR #74 /
+// ticket #73), which validated PTY-quiescence empirically against the same
+// stuck-glyph-in-rolling-buffer failure mode. Three consumers now share
+// this shape: waitReappeared and runRecovery in this file (both ticket
+// #69), and runTurn in spike-multi-turn (ticket #73). See this binary's
+// README § *Surprises / findings* (findings 1 and 8) for the empirical
+// derivation.
 //
 // preCancelHadSpinner is recorded for the README but no longer drives the
 // predicate.
@@ -543,7 +559,8 @@ func waitReappeared(
 	defer ticker.Stop()
 
 	stable := func() bool {
-		if !tuidriver.IsIdle(rb.Snapshot()) {
+		stripped := tuidriver.StripANSI(rb.Snapshot())
+		if !bytes.Contains(stripped, tuidriver.IdleGlyph) {
 			return false
 		}
 		return rb.QuietFor() >= ptyQuietWindow
@@ -592,8 +609,26 @@ func logCancelEvent(logger *log.Logger, probeN int, ev map[string]any) {
 
 // runRecovery drives Probe 3: same shape as spike-multi-turn's runTurn
 // from prompt-written onward. Detects turn-complete on the conjunction
-// `gotEndTurn ∧ tuidriver.IsIdle(rb)` stable for idleStableWindow, then extracts
+// `gotEndTurn ∧ ❯ idle glyph present (direct bytes.Contains check, NOT
+// via tuidriver.IsIdle) ∧ rb.QuietFor() ≥ ptyQuietWindow`, then extracts
 // the assistant text by msg_id grouping.
+//
+// Pre-#69 this used `gotEndTurn ∧ tuidriver.IsIdle(rb) stable for
+// idleStableWindow = 250ms` — the verbatim pre-#74 spike-multi-turn
+// predicate that PR #74 already proved wedges. IsIdle's spinner-absent
+// half is exactly the wedging clause on claude 2.1.148: after a fast
+// assistant response the `✻ Brewed for Ns` glyph is painted in the 4 KB
+// rolling buffer and post-`end_turn` claude emits well under 4 KB, so the
+// glyph never rolls out and IsIdle stays false. PTY-quiescence subsumes
+// the safety property the spinner-absent clause was meant to provide: when
+// claude has emitted zero bytes for 1.5 s, it has by definition stopped
+// redrawing.
+//
+// Same predicate shape as cmd/spike-multi-turn/main.go:391-400 (PR #74 /
+// ticket #73) and cmd/spike-cancel/main.go:waitReappeared (ticket #69,
+// the same file). Three consumers share the PTY-quiescence pattern; if
+// the duplication becomes a maintenance burden the library extraction at
+// #58-#62 is the right home.
 func runRecovery(
 	ctx context.Context,
 	logger *log.Logger,
@@ -634,20 +669,15 @@ func runRecovery(
 	ticker := time.NewTicker(statePollInterval)
 	defer ticker.Stop()
 
-	var idleSince time.Time
 	check := func() bool {
 		if !gotEndTurn {
 			return false
 		}
-		if !tuidriver.IsIdle(rb.Snapshot()) {
-			idleSince = time.Time{}
+		stripped := tuidriver.StripANSI(rb.Snapshot())
+		if !bytes.Contains(stripped, tuidriver.IdleGlyph) {
 			return false
 		}
-		if idleSince.IsZero() {
-			idleSince = time.Now()
-			return false
-		}
-		return time.Since(idleSince) >= idleStableWindow
+		return rb.QuietFor() >= ptyQuietWindow
 	}
 
 	for !check() {

@@ -36,7 +36,7 @@ The runner can also be invoked directly after `make build-bin`:
 | `-report PATH` | `./e2e-report.json` | Output path for the report. |
 | `-lock PATH` | `./claude-version.lock` | Path to the claude-version lock file consumed by the `claude-version-lock` check. |
 | `-wall DUR` | `10m` | Top-level wall budget for the entire run. |
-| `-timeout NAME=DUR` | per-check default (60s; 30s for the probe; 180s for snapshot-drift) | Per-check timeout override. Repeatable. Unknown `NAME` is a hard parse error so typos surface immediately. |
+| `-timeout NAME=DUR` | per-check default (60s; 30s for the probe; 120s for spike-cancel; 180s for snapshot-drift) | Per-check timeout override. Repeatable. Unknown `NAME` is a hard parse error so typos surface immediately. `spike-cancel`'s 120s built-in is structural — Probe 4 re-runs the 1000-word monad essay as a real recovery turn (~30–40s of model time); see [#69](../codebase/69.md). |
 
 Example: `./bin/e2e-runner -timeout spike-cancel=90s -timeout probe-first-prompt-hang=45s -timeout claude-version-lock=10s`.
 

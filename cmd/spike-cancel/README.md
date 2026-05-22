@@ -564,6 +564,72 @@ but-not-sufficient half (without `❯` visible, the input box isn't
 ready for the next prompt; quiescence is what tells us claude has
 stopped settling).
 
+### 8. `claude 2.1.148` post-cancel byte volume shrank below the buffer-rotation threshold — `IsIdle` wedge surfaced in `waitReappeared` (ticket #69)
+
+**Symptom.** Against `claude 2.1.148` (`claude-version.lock` pins
+`2.1.144`, advisory only after #64), Probe 1 (`kindThinking`, the
+1000-word monad essay) wedges in `waitReappeared` with
+`watchdog: stuck after cancel for 30s`. Total wall time ~32.9 s
+(Probe 1 setup + 30 s `cancelRecoveryLimit`). Reproduced in two
+deterministic runs during ticket #69's Step 1 diagnosis.
+
+**Mechanism — same family as finding 1, different consumer.** Finding
+1 above documents the original predicate failure: post-cancel claude
+emits ~1.4 KB of redraw, well under the 4 KB rolling-buffer cap, so
+any spinner glyph painted before the cancel stays painted afterwards.
+The original fix added the PTY-quiescence half of the predicate but
+kept the `tuidriver.IsIdle` wrapper (`❯` present AND `✻` absent) — the
+spinner-absent half was assumed to flip once the cancel completed and
+no more spinner paints arrived. Across five `spike-cancel` runs in
+issue #11's README that assumption held empirically on `claude
+2.1.144`. On `claude 2.1.148` it doesn't — the empirical byte budget
+shrank just enough (1577 bytes of churn since the last `✻` paint at
+watchdog-trip time, well under 4096) that the pre-cancel `✻` paint
+isn't rolled out. `IsIdle`'s spinner-absent half stays false forever,
+the predicate wedges, the 30 s `cancelRecoveryLimit` trips.
+
+The same wedge mechanism applies to `runRecovery` (Probes 3, 4, 5),
+which carries the verbatim pre-#74 `spike-multi-turn` predicate
+(`gotEndTurn ∧ tuidriver.IsIdle(rb) stable for idleStableWindow =
+250ms`). Probes 3/4/5 didn't reach in Step 1's runs — Probe 1's 30 s
+fire is earlier in the linear flow — but the predicate shape is the
+same one PR #74 (ticket #73) already proved wedges, and the byte-count
+substrate (post-`end_turn` claude emits well under 4 KB) is the same
+as `waitReappeared`'s. Bundled in the same fix to avoid the
+unmasking-on-next-`make e2e` trap.
+
+**Fix.** Both predicates drop the `tuidriver.IsIdle` wrapper and use a
+direct `bytes.Contains(tuidriver.StripANSI(snap), tuidriver.IdleGlyph)`
+check for the `❯` half. The `rb.QuietFor() >= ptyQuietWindow` half
+is unchanged in `waitReappeared` (it already had it) and is adopted
+in `runRecovery` in place of `idleStableWindow` (which is removed —
+no other consumers). The new predicate is weaker on the spinner-glyph
+axis (the glyph is no longer required to be absent — that's exactly
+the wedging clause being dropped) but strictly stronger on the
+rendering-activity axis (1500 ms of zero PTY bytes vs. 250 ms of
+glyph-absence — quiescence cannot be faked by a transient buffer
+state).
+
+Three consumers now share the PTY-quiescence pattern: `runTurn` in
+`spike-multi-turn` (ticket #73 / PR #74), and `waitReappeared` +
+`runRecovery` in this binary (ticket #69 / PR for #69). If the
+duplication becomes a maintenance burden the library extraction at
+#58–#62 is the right home.
+
+**Why not bigger buffer / `spinnerGone` heuristic / no-op keystroke**:
+spelled out in `docs/specs/architecture/73-spike-multi-turn-pty-quiescence.md`
+§ *Why fix shapes 1, 2, 4 are not chosen*. Briefly: bigger buffer
+changes the substrate for every consumer; the `spinnerGone` heuristic
+regresses safety in multi-turn / recovery contexts by predicate-shape
+luck; "send a no-op keystroke" couples the consumer contract to
+claude's renderer internals.
+
+**Post-fix verification (2026-05-22, `claude 2.1.148`, dispatcher
+host).** `bin/spike-cancel -trust-folder=accept` exits 0 with three
+`SUCCESS:` lines (Probes 3, 4, 5 are `kindRecovery`); total wall
+time ~63 s, dominated by Probe 4's 1000-word monad essay re-run
+(actual model time, not a wedge). No probe hits its watchdog.
+
 ## Why no automated tests
 
 Per the spec § *Testing strategy*: verification is by execution
