@@ -4,7 +4,7 @@ One-line summary per evergreen doc. Cross-reference target — keep it terse.
 
 ## Architecture
 
-- [System overview](architecture/system-overview.md) — modules, data flows, concurrency model (single-turn + multi-turn + cancellation + permission-modal spike shapes); key signals including cancel keystroke (ESC), PTY-quiescence post-cancel predicate, input-box state across cancels, modal-detection literal-text predicate, modal-text extraction anchor, and `1\r` approve keystroke
+- [System overview](architecture/system-overview.md) — modules, data flows, concurrency model (single-turn + multi-turn + cancellation + permission-modal spike shapes); key signals including cancel keystroke (ESC), PTY-quiescence predicate (now two-consumer: post-cancel readiness and multi-turn turn-complete since #73), input-box state across cancels, modal-detection literal-text predicate, modal-text extraction anchor, and `1\r` approve keystroke
 - [JSONL layout](architecture/jsonl-layout.md) — where claude writes session logs, deterministic-path discovery via `--session-id`, the turn-terminator shape, msg_id grouping for multi-block messages, the `user(text "[Request interrupted by user]")` cancellation marker, and the zero-JSONL-footprint of permission-prompt modals
 
 ## Decisions (ADRs)
