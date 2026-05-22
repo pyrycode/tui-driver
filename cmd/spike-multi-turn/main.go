@@ -56,13 +56,19 @@ const (
 
 	disappearedWindow = 500 * time.Millisecond
 
-	// idleStableWindow: how long isIdle must be CONTINUOUSLY true after
-	// end_turn arrived before we declare turn-complete. Guards against a
-	// transient idle observation while the TUI is still mid-redraw. The
-	// primary protection against the inter-turn race is the per-byte
-	// typePrompt delay (see typePrompt) — this stability window is a
-	// secondary belt-and-suspenders gate at minimal overhead.
-	idleStableWindow = 250 * time.Millisecond
+	// ptyQuietWindow: post-end_turn, the predicate "❯ idle glyph visible
+	// AND the rolling buffer has been quiet for this long" stands in for
+	// "TUI ready to accept input." Empirical value reused from
+	// spike-cancel (see cmd/spike-cancel/main.go:82-91): claude emits
+	// ~1.4 KB of redraw + title-bar updates after end_turn, then falls
+	// silent; 1500 ms covers that tail comfortably. The first-cut
+	// predicate (`gotEndTurn ∧ IsIdle for 250ms`) wedges against claude
+	// 2.1.148 because a `✻ Brewed for Ns` glyph stays painted in the
+	// 4096-byte rolling buffer (pkg/tuidriver/buffer.go:8-13) — claude
+	// doesn't emit enough bytes post-end_turn to roll it out, so IsIdle
+	// stays false forever. PTY-quiescence sidesteps the glyph-residue
+	// problem entirely by observing silence directly.
+	ptyQuietWindow = 1500 * time.Millisecond
 )
 
 // copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
@@ -346,11 +352,33 @@ drain:
 
 	// Accumulate assistant events and detect turn-complete.
 	//
-	// Predicate: at least one assistant line with stop_reason=end_turn has
-	// been seen for this turn AND tuidriver.IsIdle(rb) is true. The conjunction is
-	// load-bearing — JSONL end_turn means "model done speaking"; isIdle
-	// (❯ visible, spinner gone) means "TUI ready to accept input." Both
-	// must hold to safely write the next prompt.
+	// Predicate: (a) at least one assistant line with stop_reason=end_turn
+	// has been seen for this turn, AND (b) the ❯ idle glyph is present in
+	// the stripped rolling buffer, AND (c) the PTY has been quiet for at
+	// least ptyQuietWindow. All three clauses are load-bearing — JSONL
+	// end_turn means "model done speaking"; ❯-present means "input prompt
+	// is on screen"; PTY-quiescence means "claude has stopped redrawing."
+	// The next prompt is safe to write only when all three hold.
+	//
+	// We deliberately do NOT use tuidriver.IsIdle here. IsIdle's
+	// spinner-absent half is exactly what wedges this spike against
+	// claude 2.1.148: a stuck `✻ Brewed for Ns` glyph stays painted in
+	// the 4 KB rolling buffer (pkg/tuidriver/buffer.go:8-13) and never
+	// rolls out, keeping IsIdle false forever even though the assistant
+	// turn is over. PTY-quiescence subsumes the safety property the
+	// spinner-absent clause was meant to provide: when claude has emitted
+	// zero bytes for 1.5 s, it has by definition stopped redrawing the
+	// spinner (or anything else), so further input is safe. The new
+	// predicate is therefore weaker than the old one on the spinner-glyph
+	// axis but strictly stronger on the rendering-activity axis (1500 ms
+	// of zero bytes vs. 250 ms of glyph-absence — quiescence cannot be
+	// faked by a transient buffer state).
+	//
+	// Same predicate shape as cmd/spike-cancel/main.go:513-568, which
+	// validated PTY-quiescence empirically against the same
+	// stuck-glyph-in-rolling-buffer failure mode (see
+	// cmd/spike-cancel/main.go:82-91 for the empirical derivation of the
+	// 1500 ms window). Ticket #73.
 	var (
 		events             []map[string]any
 		latestEndTurnMsgID string
@@ -360,25 +388,15 @@ drain:
 	ticker := time.NewTicker(statePollInterval)
 	defer ticker.Stop()
 
-	// idleSince tracks the time at which isIdle first became true after
-	// gotEndTurn. Reset to zero whenever isIdle is observed false. The
-	// predicate fires only once idleSince is non-zero AND the gap to now
-	// exceeds idleStableWindow.
-	var idleSince time.Time
-
 	check := func() bool {
 		if !gotEndTurn {
 			return false
 		}
-		if !tuidriver.IsIdle(rb.Snapshot()) {
-			idleSince = time.Time{}
+		stripped := tuidriver.StripANSI(rb.Snapshot())
+		if !bytes.Contains(stripped, tuidriver.IdleGlyph) {
 			return false
 		}
-		if idleSince.IsZero() {
-			idleSince = time.Now()
-			return false
-		}
-		return time.Since(idleSince) >= idleStableWindow
+		return rb.QuietFor() >= ptyQuietWindow
 	}
 
 	for !check() {
