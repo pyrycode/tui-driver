@@ -31,6 +31,8 @@ The robust mechanism is to **dictate the session ID up-front** via `claude --ses
 
 Polling is sufficient — do NOT pull in `fsnotify` for this. Implemented in `cmd/spike-one-turn/main.go` (`resolveSession`, `openSessionJSONL`, `tailJSONL`).
 
+> **Canonical library API (post-[#58](../codebase/58.md)).** Steps 1 and 3 above are now `tuidriver.SessionJSONLPath(home, cwd, sessionID)` (pure path composition, wraps `EncodeCwd` so no consumer can re-implement the byte transform) and `tuidriver.WaitForSessionJSONL(ctx, path)` (`os.Stat` poll at `DefaultPollInterval`, returns `nil` on appearance, wraps `context.Cause(ctx)` with the path in the message on cancellation/deadline). The 7 in-tree spike binaries and pyrycode's `agentrun.EncodeProjectDir` still inline these shapes; migration to the library functions is tracked separately ([pyrycode/pyrycode#501](https://github.com/pyrycode/pyrycode/issues/501) for the cross-repo consumer). New consumers should use the library functions; do not hand-roll the path composition.
+
 ### Why the deterministic path
 
 "Newest `*.jsonl` by mtime" is fragile in two distinct ways:
@@ -139,6 +141,7 @@ Of these, only `user` and `assistant` carry a `message` object; everything else 
 
 - [ADR-0001 — Hybrid JSONL + TUI](../decisions/0001-hybrid-jsonl-tui.md)
 - [System overview](system-overview.md)
+- Code: `pkg/tuidriver/jsonl.go` — `SessionJSONLPath` (canonical path composition; wraps `EncodeCwd`) + `WaitForSessionJSONL` (canonical `os.Stat`-poll appearance waiter). Use these from new consumers — the spike helpers below are pre-extraction inlines that have not yet been migrated. See [#58](../codebase/58.md).
 - Code: `cmd/spike-one-turn/main.go` — `projectsDir`, `encodeCwd`, `resolveSession`, `openSessionJSONL`, `tailJSONL`, `isEndTurn`, `extractAssistantText` (single-record content extractor; superseded by msg_id grouping)
 - Code: `cmd/spike-multi-turn/main.go` — `extractByMsgID` (the msg_id-grouped content extractor described above)
 - Code: `cmd/spike-cancel/main.go` — `logCancelEvent` (handles `<nil>` / `<missing>` / string `stop_reason` representations), `runCancel` (the cancel-probe driver; the assistant-only filter still drops the `user(text)` cancel marker, so detection is PTY-side via `❯-reappeared`)
