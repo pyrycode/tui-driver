@@ -266,7 +266,7 @@ The `TUIDRIVER_STRICT_MCP_CONFIG=1` env var matters: the e2e runner sets it on e
 - `cmd/e2e-snapshot-check/main.go` — snapshot-drift orchestrator; serial spike-multiselect invocations + byte-compare.
 - `cmd/e2e-runner/main_test.go` — `parseSnapshotResults`, `parseClaudeVersion`, `parseLockFile` table tests.
 - `claude-version.lock` — pinned claude-version + flag contract; hand-edited per upgrade.
-- `Makefile` — `e2e`, `build-bin`, `clean-bin`, `clean-report` targets; `CHECKERS` variable for non-spike/non-probe check binaries; `MODEL` / `EFFORT` overrides inlined per-recipe on `e2e`.
+- `Makefile` — `e2e`, `build-bin`, `clean-bin`, `clean-report` targets; `CHECKERS` variable for non-spike/non-probe check binaries; `MODEL` / `EFFORT` overrides inlined per-recipe on `e2e`. The per-binary pattern rule (`$(BIN_DIR)/%: FORCE`) lists a recipe-less `FORCE:` target as a prereq so `go build` runs every invocation and its cache handles incremental rebuilds across `cmd/` and `pkg/` — without this, stale binaries from a previous build would silently shadow source edits (see [#79](../codebase/79.md)). Steady-state no-op `make build-bin` ≈ 480 ms across all 10 binaries.
 - `pkg/tuidriver/pty.go` — `EnsureClaudeEnv` + the `StrictMcpConfigEnv` opt-in + the `ClaudeModelEnv` / `ClaudeEffortEnv` `--model`/`--effort` passthrough seam.
 - `pkg/tuidriver/testdata/{picker,mcp,agents}-snapshot.bin` — committed byte fixtures consumed by both the unit tests in `pkg/tuidriver/` and the snapshot-drift check.
 - `.gitignore` — `/e2e-report.json` and `/e2e-runner` (generated artifacts).
