@@ -107,7 +107,7 @@ func runFixture(binDir, testdataDir string, spikeTimeout time.Duration, f fixtur
 		return false
 	}
 
-	if !bytes.Equal(captured, committed) {
+	if !bytes.Equal(normalize(captured), normalize(committed)) {
 		emitDiff(f, fixturePath, nil)
 		return false
 	}
