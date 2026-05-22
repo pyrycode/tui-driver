@@ -96,7 +96,23 @@ const (
 	shutdownGrace      = 3 * time.Second
 
 	disappearedWindow = 500 * time.Millisecond
-	idleStableWindow  = 250 * time.Millisecond
+
+	// ptyQuietWindow: post-approve readiness predicate window. The
+	// readiness predicate in runAutoRespond — `gotEndTurn ∧ ❯-present ∧
+	// rb.QuietFor() ≥ ptyQuietWindow` — fires once claude has stopped
+	// emitting bytes for this long. PTY-quiescence is used in place of
+	// `tuidriver.IsIdle`'s spinner-absent clause because a `✻ … for Ns`
+	// spinner glyph painted during tool execution sits in the 4 KB
+	// rolling buffer (pkg/tuidriver/buffer.go:8-13) and the small
+	// post-end_turn redraw doesn't push it out, wedging IsIdle forever.
+	// Quiescence detects "claude has finished" directly.
+	//
+	// 1500 ms is the empirically-calibrated window. Derivation:
+	// cmd/spike-cancel/main.go:82-91 (the original PTY-quiescence
+	// consumer in waitReappeared). Same window adopted by the proven
+	// sibling at cmd/spike-multi-turn/main.go:353-400 (PR #74) against
+	// the same stuck-glyph failure mode. Ticket #70.
+	ptyQuietWindow = 1500 * time.Millisecond
 
 	// clearLineSettle: brief pause after Ctrl-U so the input handler can
 	// process the line-kill before the next byte arrives.
@@ -637,9 +653,36 @@ func runAutoRespond(
 	//     bug: modal text persists in the 4096-byte rolling buffer when
 	//     streaming responses don't push it out fast enough).
 	//
-	//   end-turn-detected: JSONL stop_reason=end_turn AND PTY idle (❯
-	//     visible). Per spike #2 finding the gap is ~100µs; passive
-	//     verification suffices.
+	//   end-turn-detected: post-approve readiness predicate. Three
+	//     load-bearing clauses, all required:
+	//       (a) gotEndTurn — JSONL has reported stop_reason=end_turn for
+	//           this turn (model done speaking).
+	//       (b) ❯ glyph present in StripANSI(rb.Snapshot()) — input
+	//           prompt is back on screen.
+	//       (c) rb.QuietFor() ≥ ptyQuietWindow (1500 ms) — claude has
+	//           stopped emitting bytes; not still redrawing.
+	//
+	//     The OLD predicate (gotEndTurn ∧ tuidriver.IsIdle ∧ stable
+	//     idleStableWindow) wedged on claude 2.1.148: a `✻ Verb for Ns`
+	//     spinner glyph painted during tool execution stays in the 4 KB
+	//     rolling buffer (pkg/tuidriver/buffer.go:8-13) post-end_turn,
+	//     and the small final assistant message + title-bar redraws
+	//     don't emit enough bytes to roll it out. IsIdle's spinner-absent
+	//     half therefore stays false forever and the watchdog fires
+	//     ~30 s later. Ticket #70.
+	//
+	//     PTY-quiescence subsumes the safety property the spinner-absent
+	//     clause was meant to provide: 1500 ms of zero bytes means claude
+	//     has by definition stopped redrawing (spinner or anything else),
+	//     so further interaction is safe. Strictly stronger than the OLD
+	//     predicate on the rendering-activity axis (quiescence cannot be
+	//     faked by a transient buffer state); weaker on the spinner-glyph
+	//     axis — which is exactly the wedge being removed.
+	//
+	//     Same predicate shape as cmd/spike-multi-turn/main.go:353-400
+	//     (post-#74) and cmd/spike-cancel/main.go:513-568 (the original
+	//     PTY-quiescence consumer, waitReappeared). Empirical derivation
+	//     of the 1500 ms window: cmd/spike-cancel/main.go:82-91.
 	//
 	// No per-phase wall-clock deadlines here. Liveness is enforced by
 	// the session-level PTY-heartbeat watchdog (tracker.checkWatchdog) —
@@ -655,20 +698,15 @@ func runAutoRespond(
 	ticker := time.NewTicker(statePollInterval)
 	defer ticker.Stop()
 
-	var idleSince time.Time
 	check := func() bool {
 		if !gotEndTurn {
 			return false
 		}
-		if !tuidriver.IsIdle(rb.Snapshot()) {
-			idleSince = time.Time{}
+		stripped := tuidriver.StripANSI(rb.Snapshot())
+		if !bytes.Contains(stripped, tuidriver.IdleGlyph) {
 			return false
 		}
-		if idleSince.IsZero() {
-			idleSince = time.Now()
-			return false
-		}
-		return time.Since(idleSince) >= idleStableWindow
+		return rb.QuietFor() >= ptyQuietWindow
 	}
 
 	for !check() {
@@ -1242,5 +1280,4 @@ var (
 	_ = hasSpinnerGlyph
 	_ = isToolUse
 	_ = disappearedWindow
-	_ = idleStableWindow
 )
