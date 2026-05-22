@@ -3,12 +3,13 @@
 // TUI-style CLI drivers).
 //
 // Scope: PTY allocation, rolling byte buffer with quiet-time tracking,
-// projects-dir name encoding, session JSONL path resolution + appearance
-// polling, ANSI/OSC stripping, vt10x-backed grid rendering, modal-class
-// detection, modal parsers (picker / mcp / agents), trust-folder +
-// MCP-failure banner detectors. Out of scope (consumer's job): JSONL
-// parsing, ACP protocol, agent-stage logic, dispatcher coordination, cost
-// telemetry.
+// projects-dir name encoding, session JSONL path resolution, appearance
+// polling, and tail-with-parsed-entries, ANSI/OSC stripping, vt10x-backed
+// grid rendering, modal-class detection, modal parsers (picker / mcp /
+// agents), trust-folder + MCP-failure banner detectors. Out of scope
+// (consumer's job): JSONL semantic interpretation (end-of-turn detection,
+// msg_id grouping, content extraction), ACP protocol, agent-stage logic,
+// dispatcher coordination, cost telemetry.
 //
 // Extracted from the 6 spike binaries under cmd/ after loops 1-6 validated
 // the architecture across 19 experiments. See the project's Findings.md in
