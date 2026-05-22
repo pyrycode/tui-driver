@@ -30,9 +30,11 @@ e2e: build-bin
 
 build-bin: $(BIN_PATHS)
 
-$(BIN_DIR)/%:
+$(BIN_DIR)/%: FORCE
 	@mkdir -p $(BIN_DIR)
 	go build -o $@ ./cmd/$*
+
+FORCE:
 
 clean-bin:
 	rm -rf $(BIN_DIR)
