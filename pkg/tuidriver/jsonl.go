@@ -1,12 +1,23 @@
 package tuidriver
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
 )
+
+// defaultJSONLTailBuffer is the buffered-channel capacity returned by
+// TailJSONL. Matches the spike-side observed-stable size (every
+// spike-* binary uses chan map[string]any with cap 32). Not exposed
+// as a knob until a real consumer surfaces a real backpressure
+// problem.
+const defaultJSONLTailBuffer = 32
 
 // SessionJSONLPath returns the path that claude writes its per-session
 // JSONL log to for a session pinned via `claude --session-id <sessionID>`
@@ -63,4 +74,182 @@ func WaitForSessionJSONL(ctx context.Context, path string) error {
 			}
 		}
 	}
+}
+
+// JSONLEntry is one parsed line from a claude session JSONL log.
+//
+// Type is the envelope kind (assistant, user, attachment,
+// permission-mode, file-history-snapshot, ai-title, system,
+// last-prompt — see docs/knowledge/architecture/jsonl-layout.md §
+// "Observed top-level type values"). Message is non-nil iff the
+// envelope carried a "message" object (i.e. only on assistant and
+// user). Raw holds the full parsed JSON for fields outside the typed
+// shape — envelope-specific fields like "attachment", "sessionId",
+// future additions, and the message object itself.
+//
+// Fields are populated best-effort. Missing or type-mismatched JSON
+// yields zero values (Type == "", Message == nil, Content == nil);
+// the entry is still emitted. Consumers requiring presence-vs-absence
+// semantics check `_, ok := e.Raw["message"]` directly.
+type JSONLEntry struct {
+	Type    string
+	Message *EntryMessage
+	Raw     map[string]any
+}
+
+// EntryMessage is the nested `message` object on assistant and user
+// envelopes. The library populates ID, StopReason, and Content
+// best-effort from the JSON; consumers reach through Raw (the full
+// message map) for fields outside this typed view (model, role, usage,
+// stop_sequence, …).
+type EntryMessage struct {
+	ID         string
+	StopReason string
+	Content    []ContentBlock
+	Raw        map[string]any
+}
+
+// ContentBlock is one element of `message.content[]`. Type is the
+// block's kind (text, thinking, tool_use, tool_result, …); Raw holds
+// the full block JSON so consumers can extract type-specific fields
+// (text, input, name, tool_use_id, …) without the library committing
+// to a type-tagged union over claude's content-block schema.
+type ContentBlock struct {
+	Type string
+	Raw  map[string]any
+}
+
+// TailJSONL opens path, seeks to startOffset, and spawns a goroutine
+// that reads lines, parses each as JSON into a JSONLEntry, and emits
+// them on the returned channel. Use 0 for startOffset to start at the
+// beginning; use a previously recorded offset (e.g. f.Tell()-ish) to
+// resume mid-file.
+//
+// Returns an error synchronously if the file cannot be opened or the
+// seek fails — both indicate a programmer error or permission issue
+// that polling will not resolve. Use WaitForSessionJSONL first to
+// guarantee the file exists.
+//
+// The channel is closed when ctx is cancelled or when an
+// unrecoverable read error occurs (rare on an append-only file). The
+// goroutine returns within one poll tick (DefaultPollInterval, 50 ms)
+// after ctx is cancelled.
+//
+// Malformed JSON lines are silently dropped — the goroutine continues
+// reading. Partial lines split across reads are reassembled before
+// parsing, so each completed JSON line is delivered as exactly one
+// channel value, never two. EOF on a still-active log is treated as
+// "wait for more bytes" (sleep one poll tick, retry).
+//
+// The channel is buffered (capacity 32 — matches the spike-side
+// observed-stable size). Consumers should drain promptly; if the
+// buffer fills, the tail goroutine blocks on the next send until
+// either a receiver makes space or ctx is cancelled.
+//
+// Compose with SessionJSONLPath and WaitForSessionJSONL:
+//
+//	path := tuidriver.SessionJSONLPath(home, cwd, sessionID)
+//	if err := tuidriver.WaitForSessionJSONL(ctx, path); err != nil { /* … */ }
+//	entries, err := tuidriver.TailJSONL(ctx, path, 0)
+//	if err != nil { /* … */ }
+//	for ev := range entries { /* … */ }
+func TailJSONL(ctx context.Context, path string, startOffset int64) (<-chan JSONLEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open session jsonl %s: %w", path, err)
+	}
+	if _, serr := f.Seek(startOffset, io.SeekStart); serr != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("seek session jsonl %s to %d: %w", path, startOffset, serr)
+	}
+	ch := make(chan JSONLEntry, defaultJSONLTailBuffer)
+	go tailJSONLLoop(ctx, f, ch)
+	return ch, nil
+}
+
+// tailJSONLLoop owns f and ch from entry. It closes both on every
+// exit path. Runs on its own goroutine spawned by TailJSONL.
+func tailJSONLLoop(ctx context.Context, f *os.File, ch chan<- JSONLEntry) {
+	defer close(ch)
+	defer f.Close()
+	reader := bufio.NewReader(f)
+	var partial []byte
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		chunk, rerr := reader.ReadBytes('\n')
+		if len(chunk) > 0 {
+			partial = append(partial, chunk...)
+		}
+		switch {
+		case rerr == nil:
+			line := bytes.TrimRight(partial, "\r\n")
+			partial = partial[:0]
+			if len(line) == 0 {
+				continue
+			}
+			entry, ok := parseEntry(line)
+			if !ok {
+				continue
+			}
+			select {
+			case ch <- entry:
+			case <-ctx.Done():
+				return
+			}
+		case rerr == io.EOF:
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(DefaultPollInterval):
+			}
+		default:
+			return
+		}
+	}
+}
+
+// parseEntry parses one already-trimmed JSONL line into a JSONLEntry.
+// Returns (zero-value, false) if the bytes are not valid JSON or do
+// not decode into a top-level object. Caller is responsible for
+// filtering out empty/whitespace-only lines.
+func parseEntry(line []byte) (JSONLEntry, bool) {
+	var raw map[string]any
+	if err := json.Unmarshal(line, &raw); err != nil {
+		return JSONLEntry{}, false
+	}
+	if raw == nil {
+		return JSONLEntry{}, false
+	}
+	entry := JSONLEntry{Raw: raw}
+	entry.Type, _ = raw["type"].(string)
+	if m, ok := raw["message"].(map[string]any); ok {
+		msg := parseMessage(m)
+		entry.Message = &msg
+	}
+	return entry, true
+}
+
+func parseMessage(m map[string]any) EntryMessage {
+	msg := EntryMessage{Raw: m}
+	msg.ID, _ = m["id"].(string)
+	msg.StopReason, _ = m["stop_reason"].(string)
+	if blocks, ok := m["content"].([]any); ok {
+		msg.Content = make([]ContentBlock, 0, len(blocks))
+		for _, b := range blocks {
+			bm, ok := b.(map[string]any)
+			if !ok {
+				continue
+			}
+			msg.Content = append(msg.Content, parseContentBlock(bm))
+		}
+	}
+	return msg
+}
+
+func parseContentBlock(b map[string]any) ContentBlock {
+	cb := ContentBlock{Raw: b}
+	cb.Type, _ = b["type"].(string)
+	return cb
 }
