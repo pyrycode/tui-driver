@@ -1,6 +1,7 @@
 package tuidriver
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -37,52 +38,107 @@ func TestParsePickerReturnsNilOnNonPicker(t *testing.T) {
 }
 
 func TestParsePickerRealFixture(t *testing.T) {
-	snap, err := os.ReadFile(filepath.Join("testdata", "picker-snapshot.bin"))
-	if err != nil {
-		t.Fatalf("read fixture: %v", err)
+	// Both fixtures are from default unfiltered "/" probes captured at
+	// different points in claude's renderer history. Same structural
+	// assertions for both — the parser is renderer-encoding-agnostic.
+	// First-command differs per capture because claude's plugin set
+	// (and therefore the alphabetically-first skill) changes; the
+	// parser must report whichever row claude paints first.
+	cases := []struct {
+		fixture     string
+		firstCmd    string
+		minSGRShape string // expected raw-byte substring proving the SGR shape
+	}{
+		{
+			fixture:     "picker-snapshot.bin",
+			firstCmd:    "/figma-use",
+			minSGRShape: "\x1b[38;5;",
+		},
+		{
+			fixture:     "picker-truecolor-snapshot.bin",
+			firstCmd:    "/code-review",
+			minSGRShape: "\x1b[38;2;",
+		},
 	}
+	for _, tc := range cases {
+		t.Run(tc.fixture, func(t *testing.T) {
+			snap, err := os.ReadFile(filepath.Join("testdata", tc.fixture))
+			if err != nil {
+				t.Fatalf("read fixture: %v", err)
+			}
+			// Sanity: confirm the fixture really does carry the SGR shape
+			// we claim it does (guards against future re-records
+			// silently swapping encodings).
+			if !bytes.Contains(snap, []byte(tc.minSGRShape)) {
+				t.Fatalf("fixture %s missing expected SGR shape %q", tc.fixture, tc.minSGRShape)
+			}
+
+			items := ParsePicker(snap)
+			if len(items) == 0 {
+				t.Fatalf("ParsePicker(%s) returned 0 items", tc.fixture)
+			}
+
+			first := items[0]
+			if first.Command != tc.firstCmd {
+				t.Errorf("first item Command = %q, want %q", first.Command, tc.firstCmd)
+			}
+			if !first.Highlighted {
+				t.Errorf("first item Highlighted = false, want true")
+			}
+
+			sawFigmaCategory := false
+			for _, it := range items {
+				if it.Category == "figma" {
+					sawFigmaCategory = true
+				}
+				if !startsWithSlash(it.Command) {
+					t.Errorf("item %q does not start with /", it.Command)
+				}
+			}
+			if !sawFigmaCategory {
+				t.Errorf("no item had category=figma in fixture; items=%+v", items)
+			}
+
+			highlightedCount := 0
+			for _, it := range items {
+				if it.Highlighted {
+					highlightedCount++
+				}
+			}
+			if highlightedCount != 1 {
+				t.Errorf("highlighted count = %d, want 1 (unfiltered mode)", highlightedCount)
+			}
+		})
+	}
+}
+
+// TestParsePickerHypotheticalThirdEncoding is the AC #5 seam proof. A
+// made-up SGR shape (\x1b[38;6;…) that parseForegroundSGR doesn't
+// recognise must still produce parsed rows — the row anchor is
+// renderer-encoding-agnostic. The rows just come back unhighlighted
+// (the highlight predicate can't classify a color it can't read).
+//
+// To support a third encoding for real, add one case to
+// parseForegroundSGR. No edits to the anchor or classifier are needed.
+func TestParsePickerHypotheticalThirdEncoding(t *testing.T) {
+	snap := []byte("\x1b[38;6;1;2;3m/foo description one\n\x1b[38;6;9;9;9m/bar description two\n")
 	items := ParsePicker(snap)
-	if len(items) == 0 {
-		t.Fatal("ParsePicker(picker-snapshot.bin) returned 0 items")
+	if len(items) != 2 {
+		t.Fatalf("ParsePicker returned %d items, want 2 (anchor must not depend on color encoding); items=%+v", len(items), items)
 	}
-
-	// The fixture is from a default unfiltered "/" probe. Spot-check
-	// known structural facts:
-	//   - First item should be /figma-use (highlighted by default — at
-	//     time of capture the figma plugin owned the alphabetically-
-	//     first skill).
-	//   - At least one item should have category=="figma".
-	//   - All items must start with "/".
-	first := items[0]
-	if first.Command != "/figma-use" {
-		t.Errorf("first item Command = %q, want /figma-use", first.Command)
+	if items[0].Command != "/foo" {
+		t.Errorf("items[0].Command = %q, want /foo", items[0].Command)
 	}
-	if !first.Highlighted {
-		t.Errorf("first item Highlighted = false, want true")
+	if items[1].Command != "/bar" {
+		t.Errorf("items[1].Command = %q, want /bar", items[1].Command)
 	}
-
-	sawFigmaCategory := false
-	for _, it := range items {
-		if it.Category == "figma" {
-			sawFigmaCategory = true
-		}
-		if !startsWithSlash(it.Command) {
-			t.Errorf("item %q does not start with /", it.Command)
-		}
+	// No row's open color is in pickerHighlightedRGBs (encoding is
+	// unknown), so the classifier falls back to "first row highlighted".
+	if !items[0].Highlighted {
+		t.Errorf("items[0].Highlighted = false; want true (fallback when no row matches known highlight set)")
 	}
-	if !sawFigmaCategory {
-		t.Errorf("no item had category=figma in fixture; items=%+v", items)
-	}
-
-	// Exactly one item should be highlighted in unfiltered mode.
-	highlightedCount := 0
-	for _, it := range items {
-		if it.Highlighted {
-			highlightedCount++
-		}
-	}
-	if highlightedCount != 1 {
-		t.Errorf("highlighted count = %d, want 1 (unfiltered mode)", highlightedCount)
+	if items[1].Highlighted {
+		t.Errorf("items[1].Highlighted = true; want false")
 	}
 }
 

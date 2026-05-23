@@ -10,6 +10,7 @@
 // Stdout protocol (one line per fixture, in fixture-table order):
 //
 //	SNAPSHOT picker match|diff
+//	SNAPSHOT picker-truecolor match|diff
 //	SNAPSHOT mcp match|diff
 //	SNAPSHOT agents match|diff
 //
@@ -36,7 +37,7 @@ import (
 var dumpPathRe = regexp.MustCompile(`picker-snapshot path=(\S+)`)
 
 type fixture struct {
-	name    string // "picker" | "mcp" | "agents"
+	name    string // "picker" | "picker-truecolor" | "mcp" | "agents"
 	trigger string // raw bytes for -trigger flag
 	settle  time.Duration
 }
@@ -48,7 +49,13 @@ func main() {
 	flag.Parse()
 
 	fixtures := []fixture{
+		// Both picker fixtures share the same '/' trigger — they are
+		// historical records of how claude rendered the picker at
+		// different points (indexed-color vs truecolor). Whichever one
+		// matches the bytes claude emits today passes; the other surfaces
+		// as drift, which is the maintainer's signal to re-record.
 		{name: "picker", trigger: "/", settle: 0},
+		{name: "picker-truecolor", trigger: "/", settle: 0},
 		{name: "mcp", trigger: "/mcp\r", settle: 5 * time.Second},
 		{name: "agents", trigger: "/agents\r", settle: 0},
 	}
