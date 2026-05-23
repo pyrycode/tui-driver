@@ -55,16 +55,20 @@ Empirical record of the original validation:
    stderr so a human watching the spike sees claude's UI live.
 5. Waits for the idle prompt (`❯` glyph present and no `✻` spinner).
 6. Loads the embedded fixture `testdata/long-prompt.txt` (compiled into the
-   binary via `//go:embed`), strips a single optional trailing `\n`, and
-   logs `prompt-loaded bytes=<n>`.
+   binary via `//go:embed`) and strips a single optional trailing `\n`.
 7. Sends the body via `session.WritePrompt(promptBody)`. **Not** `session.Write`
    / `ptmx.Write` — the whole point is to exercise the bracketed-paste path.
-8. Polls `os.Stat(jsonlPath)` every 100 ms with a 10 s timeout; under
-   `--session-id` claude defers JSONL creation until first input arrives.
-9. Tails the JSONL from offset 0 (file is brand new), filtering for
-   `type=="assistant"` events with `message.stop_reason=="end_turn"`.
-10. Concatenates every `content[].text` on that record; calls the result
-    `assistantText`.
+8. Calls `tuidriver.WaitForSessionJSONL(ctx, jsonlPath)` under a 10 s
+   `context.WithTimeout` deadline (the library polls at `DefaultPollInterval`,
+   50 ms); under `--session-id` claude defers JSONL creation until first input
+   arrives.
+9. Calls `session.Events(ctx, jsonlPath, 0)` and ranges the unified PTY+JSONL
+   channel; the library's per-entry end-of-turn discriminator (`IsEndTurn`:
+   `end_turn` + non-empty text) emits `EventKindJsonlEndOfTurn` carrying the
+   matching `JSONLEntry`. PTY `EventKindPtyThinking` / `EventKindPtyIdle` events
+   drive the opportunistic `thinking-detected` / `spinner-gone` log pair on the
+   slow path.
+10. Reads the assistant text via `tuidriver.AssistantText(ev.Entry)`.
 11. Asserts that `strings.TrimSpace(assistantText)` **contains** the substring
     `ALPHA_42-GAMMA_88-OMEGA_13`. On match: prints `SUCCESS: <trimmed>` to
     stdout, exits 0. On mismatch: returns an error of shape
@@ -149,11 +153,10 @@ Stderr contains the raw claude UI bytes interleaved with the state log lines.
 ```
 session-id-resolved id=<uuid> jsonl=<path>   # fires before pty.Start
 idle-detected
-prompt-loaded bytes=<n>                       # NEW vs spike-one-turn
 prompt-written
-session-jsonl-opened path=<path> offset=0
-thinking-detected verb="<captured>"           # slow path only
-spinner-gone                                  # slow path only
+session-jsonl-opened path=<path> offset=0    # fires after WaitForSessionJSONL returns
+thinking-detected verb="<captured>"          # slow path only
+spinner-gone                                 # slow path only
 end-turn-detected
 assistant-text-extracted len=<n>
 shutdown-signalled
