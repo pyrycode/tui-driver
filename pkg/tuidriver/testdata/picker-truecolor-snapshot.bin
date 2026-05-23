@@ -1,0 +1,29 @@
+moniemi.fi's[27GOrganization[54G[2m[38;2;215;119;87m│[56G[22m[38;2;153;153;153m[3m/release-notes[71Gfor[75Gmore[120G[23m[38;2;215;119;87m│[39m
+[38;2;215;119;87m│[22G[38;2;153;153;153m/private/tmp[54G[2m[38;2;215;119;87m│[120G[22m│[39m
+[38;2;215;119;87m╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯[39m
+
+[38;2;136;136;136m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+❯ [7mT[27m[2mry[7G"write[14Ga[16Gtest[21Gfor[25G<filepath>"[22m
+[38;2;136;136;136m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+[3G[38;2;153;153;153m?[5Gfor[9Gshortcuts[19G·[21G←[23Gfor[27Gagents[103G●[105Ghigh[110G·[112G/effort[39m
+[2C[3A[2D[3B[2C[3A/[7m [27m[K[2B[38;2;177;185;249m/code-review                               Review the current diff for correctness bugs at the given effort level[39m[K
+[44G[38;2;177;185;249m(low/medium:[57Gfewer,[64Ghigh-confidence[80Gfindings;[90Ghigh→max:[100Gbroader[108Gcoverage…[39m
+[38;2;153;153;153m/figma-use[44G(figma)[52G**MANDATORY[64Gprerequisite**[79G—[81Gyou[85GMUST[90Ginvoke[97Gthis[102Gskill[108GBEFORE[39m
+[44G[38;2;153;153;153mevery[50G`use_figma`[62Gtool[67Gcall.[73GNEVER[79Gcall[84G`use_figma`[96Gdirectly[105Gwithout[113Gloa…[39m
+[38;2;153;153;153m/walkthrough[44GGenerates[54Ga[56Gself-contained[71GHTML[76Gfile[81Gwith[86Gan[89Ginteractive,[102Gclickable[39m
+[44G[38;2;153;153;153mMermaid[52Gdiagram[60G(flowchart[71Gor[74GER[77Gdiagram)[86Gthat[91Gexplains[100Ghow[104Ga[106Gcodebase[115Gf…[39m
+[38;2;153;153;153m/dependency-graph[44GGenerate[53Gsystem[60Gdependency[71Ggraphs[78Gshowing[86Gupstream/downstream[39m
+[44G[38;2;153;153;153mrelationships[58Gwith[63Gcolour-coded[76Gcriticality[88G(user)[39m
+[38;2;153;153;153m/logo-creator[44GCreate[51Glogos[57Gusing[63GAI[66Gimage[72Ggeneration.[84GDiscuss[92Gstyle/ratio,[105Ggenerate[39m
+[44G[38;2;153;153;153mvariations,[56Giterate[64Gwith[69Guser[74Gfeedback,[84Gcrop,[90Gremove[97Gbackground,[109Gand[113Gexp…[39m
+[38;2;153;153;153m/add-dir[44GAdd[48Ga[50Gnew[54Gworking[62Gdirectory[39m
+[38;2;153;153;153m/advisor[44GConfigure[54Gthe[58GAdvisor[66GTool[71Gto[74Gconsult[82Ga[84Gstronger[93Gmodel[99Gfor[103Gguidance[112Gat[39m
+[44G[38;2;153;153;153mkey[48Gmoments[56Gduring[63Ga[65Gtask[39m
+[38;2;153;153;153m/agents[44GManage[51Gagent[57Gconfigurations[39m
+[38;2;153;153;153m/autofix-pr[44GMonitor[52Gand[56Gautofix[64Gany[68Gissues[75Gwith[80Gthe[84Gcurrent[92GPR[39m
+[38;2;153;153;153m/background[44GSend[49Gthis[54Gsession[62Gto[65Gthe[69Gbackground[80Gand[84Gfree[89Gthe[93Gterminal[39m
+[38;2;153;153;153m/branch[44GCreate[51Ga[53Gbranch[60Gof[63Gthe[67Gcurrent[75Gconversation[88Gat[91Gthis[96Gpoint[39m
+[38;2;153;153;153m/btw[44GAsk[48Ga[50Gquick[56Gside[61Gquestion[70Gwithout[78Ginterrupting[91Gthe[95Gmain[100Gconversation[39m
+[38;2;153;153;153m/chrome[44GClaude[51Gin[54GChrome[61G(beta)[68Gsettings[39m
+
+[3C[22A

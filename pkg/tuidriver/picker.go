@@ -1,7 +1,6 @@
 package tuidriver
 
 import (
-	"bytes"
 	"regexp"
 	"strings"
 )
@@ -17,53 +16,150 @@ type PickerItem struct {
 	Highlighted bool   `json:"highlighted"`
 }
 
-// pickerItemStartRe matches the start of a picker row: a color-code
-// followed by `/` followed by a name character.
+// Picker row structure as claude paints it:
 //
-// Claude renders the `/` picker in two structurally different modes:
+// UNFILTERED (user typed `/` only) — each row is a single color block:
 //
-// UNFILTERED (user typed `/` only): each row is a single color block.
-//
-//	\x1b[38;5;<color>m/<cmd><CSI-fwd>[(<cat>) ]<desc>\x1b[39m
-//	- color=153 (light blue) marks the HIGHLIGHTED row (Enter default).
-//	- color=246 (gray) marks every other row.
+//	\x1b[38;…m/<cmd><CSI-fwd>[(<cat>) ]<desc>\x1b[39m
+//	- highlighted row's open color sits in pickerHighlightedRGBs.
+//	- all other rows open in a normal gray (RGB ~153 or ~148).
 //	- CSI cursor-forward (\x1b[<N>C) substitutes for spaces between words.
 //
-// FILTERED (user typed e.g. `/fi`): each row has MULTIPLE color
-// switches within it. Claude wraps each occurrence of the typed filter
-// substring in 153 to highlight matching characters; the rest stays 246.
-// So `/figma-use` filtered by `fi` renders as:
+// FILTERED (user typed e.g. `/fi`) — each row has MULTIPLE color switches
+// within it. Claude wraps each occurrence of the typed filter substring in
+// the highlight color; the rest stays in the normal color. So `/figma-use`
+// filtered by `fi` renders with the `fi` substring highlighted mid-row:
 //
-//	\x1b[38;5;246m/\x1b[38;5;153mfi\x1b[38;5;246mgma-use\x1b[39m
+//	\x1b[38;…246m/\x1b[38;…153mfi\x1b[38;…246mgma-use\x1b[39m
 //
 // The whole-row highlight semantic is lost in filtered mode; claude
-// instead surfaces the SELECTED row's full description in a separate
-// right-column 153 block. Default selection in filtered mode is always
-// the first match (claude convention).
-//
-// The trailing `(?:\x1b\[38;5;\d+m)?[a-zA-Z]` clause matches both shapes
-// without false-positiving on description-embedded slashes (those never
-// have the SGR-foreground prefix).
-var pickerItemStartRe = regexp.MustCompile(
-	`\x1b\[38;5;(246|153)m/(?:\x1b\[38;5;\d+m)?[a-zA-Z]`,
-)
+// instead surfaces the SELECTED row's description in a separate right-
+// column block, and the default selection is always the first match
+// (claude convention). Row finding works in both modes because every row
+// — filtered or not — begins with `/<letter>` on its line after ANSI
+// stripping.
 
-// pickerColorCodeRe matches the foreground-color SGR codes we strip
-// during command-name + description reconstruction. CSI cursor-forward
-// (\x1b[NC) is handled separately because it's positional, not stylistic.
-var pickerColorCodeRe = regexp.MustCompile(`\x1b\[(?:38;5;\d+|39)m`)
+// pickerColorCodeRe matches foreground-color SGR codes we strip during
+// description reconstruction. Indexed + truecolor + reset shapes all
+// covered. CSI cursor-forward (\x1b[NC) is handled separately because
+// it's positional, not stylistic.
+var pickerColorCodeRe = regexp.MustCompile(`\x1b\[(?:38;5;\d+|38;2;\d+;\d+;\d+|39)m`)
 
-// pickerCsiCursorFwdRe matches CSI cursor-forward N (\x1b[<N>C).
-var pickerCsiCursorFwdRe = regexp.MustCompile(`\x1b\[(\d+)C`)
+// pickerCsiCursorFwdRe matches CSI sequences that claude uses for
+// inter-word spacing: cursor-forward-N (`\x1b[<N>C`, used in the
+// indexed-color era) and cursor-horizontal-absolute-N (`\x1b[<N>G`,
+// observed in claude 2.1.150's truecolor renderer). Both collapse to a
+// single space during description reconstruction.
+var pickerCsiCursorFwdRe = regexp.MustCompile(`\x1b\[(\d+)[CG]`)
 
 // pickerCategoryRe matches the optional "(category)" prefix on a row's
 // description: e.g. `/figma-use (figma) MANDATORY prerequisite — …`.
 var pickerCategoryRe = regexp.MustCompile(`^\(([^)]+)\)\s*(.*)`)
 
+// pickerRow is the internal projection of one picker line: the raw byte
+// slice covering line-start..newline plus the foreground color that was
+// active when the leading `/` was painted. openColor.known distinguishes
+// "color set explicitly" from "default/unknown" (the walker's zero value)
+// so unrecognised SGR encodings produce unhighlighted rows rather than
+// matching some sentinel constant.
+type pickerRow struct {
+	raw       []byte
+	openColor rgb
+	colorSet  bool
+}
+
+// pickerRowStartRe locates the start of a picker row's content within a
+// stripped line: optional leading whitespace (including `\r` left over
+// from `\r\r\n` line separators getting split on `\n`), then `/`, then
+// a name character. The anchor is intentionally renderer-agnostic — it
+// does not know about colors at all. Whatever shape claude paints
+// (indexed, truecolor, hypothetical-third-encoding, none), the
+// underlying text is `/<letter>…`.
+var pickerRowStartRe = regexp.MustCompile(`^[ \t\r]*/[a-zA-Z]`)
+
+// findPickerRows scans snap for picker rows. Returns one entry per line
+// whose stripped content begins with `/<letter>`. Highlight color is
+// captured by walking the line's raw bytes through a foreground-SGR
+// state machine — the rows themselves are located structurally, with no
+// reference to SGR encoding.
+//
+// Line segmentation treats BOTH `\n` and `\r` as separators. claude
+// emits `\r\r\n` between rows in some renders and uses bare `\r` to
+// overwrite the cursor's column (e.g. `\r/ \r/code-review` — the
+// prompt's `/ ` is overprinted by the picker row). Splitting on `\r`
+// puts the post-carriage-return content on its own logical line so the
+// row anchor matches.
+func findPickerRows(snap []byte) []pickerRow {
+	if len(snap) == 0 {
+		return nil
+	}
+	cleaned := StripOSC(snap)
+	var rows []pickerRow
+	start := 0
+	for i := 0; i <= len(cleaned); i++ {
+		isSep := i == len(cleaned) || cleaned[i] == '\n' || cleaned[i] == '\r'
+		if !isSep {
+			continue
+		}
+		line := cleaned[start:i]
+		start = i + 1
+		if len(line) == 0 {
+			continue
+		}
+		stripped := StripANSI(line)
+		if !pickerRowStartRe.Match(stripped) {
+			continue
+		}
+		color, ok := pickerRowOpenColor(line)
+		rows = append(rows, pickerRow{
+			raw:       line,
+			openColor: color,
+			colorSet:  ok,
+		})
+	}
+	return rows
+}
+
+// pickerRowOpenColor walks raw byte-by-byte tracking the active
+// foreground color. When the walker reaches the first `/` followed by a
+// letter, it returns the color in effect at that point. ok=false means
+// no explicit foreground color was set when the `/` was painted (treat
+// as unhighlighted by default).
+func pickerRowOpenColor(raw []byte) (rgb, bool) {
+	var (
+		cur    rgb
+		curSet bool
+	)
+	i := 0
+	for i < len(raw) {
+		if raw[i] == 0x1b && i+1 < len(raw) && raw[i+1] == '[' {
+			c, consumed, isFg, isReset := parseForegroundSGR(raw[i:])
+			if consumed > 0 {
+				if isFg {
+					cur, curSet = c, true
+				} else if isReset {
+					cur, curSet = rgb{}, false
+				}
+				i += consumed
+				continue
+			}
+		}
+		if raw[i] == '/' && i+1 < len(raw) && isASCIILetter(raw[i+1]) {
+			return cur, curSet
+		}
+		i++
+	}
+	return rgb{}, false
+}
+
+func isASCIILetter(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
 // ParsePicker extracts structured items from a raw PTY snapshot of
 // claude's `/` slash-command picker. Returns items in render order
-// (top-to-bottom). Handles both unfiltered and filtered modes (see
-// pickerItemStartRe doc for the structural difference).
+// (top-to-bottom). Handles both unfiltered and filtered modes (see the
+// row-structure doc comment above for the difference).
 //
 // Items past the visible-window cutoff in the rolling buffer won't appear;
 // picker scrolling requires a follow-up snapshot after arrow-down keys —
@@ -72,48 +168,28 @@ var pickerCategoryRe = regexp.MustCompile(`^\(([^)]+)\)\s*(.*)`)
 // Returns nil if no picker rows are detected (snap is not the picker UI,
 // or the buffer has only fragments).
 func ParsePicker(snap []byte) []PickerItem {
-	cleaned := StripOSC(snap)
-
-	starts := pickerItemStartRe.FindAllSubmatchIndex(cleaned, -1)
-	if len(starts) == 0 {
+	rows := findPickerRows(snap)
+	if len(rows) == 0 {
 		return nil
 	}
 
-	// Mode detection: unfiltered has 0 or 1 item-starts with color=153
-	// (the highlighted row). Filtered has every item-start at 246
-	// (substring highlights live MID-row, not at the start). So we can
-	// detect highlighting by counting color=153 openings.
-	highlightedCount153 := 0
-	for _, m := range starts {
-		color := string(cleaned[m[2]:m[3]])
-		if color == "153" {
-			highlightedCount153++
+	// Count rows opening in a known-highlighted color. Unfiltered mode
+	// has ≥1; filtered mode has 0 (substring highlights live mid-row).
+	highlightedCount := 0
+	for _, r := range rows {
+		if r.colorSet && rgbIsHighlighted(r.openColor) {
+			highlightedCount++
 		}
 	}
 
 	var items []PickerItem
-	for i, m := range starts {
-		itemStart := m[0]
-		var itemEnd int
-		if i+1 < len(starts) {
-			itemEnd = starts[i+1][0]
-		} else {
-			itemEnd = len(cleaned)
-		}
-		// Cap at first newline — left-column items are single-line; the
-		// trailing right-pane description must not leak into the last item.
-		if nl := bytes.IndexAny(cleaned[itemStart:itemEnd], "\r\n"); nl >= 0 {
-			itemEnd = itemStart + nl
-		}
-		raw := cleaned[itemStart:itemEnd]
-		openColor := string(cleaned[m[2]:m[3]])
-
+	for i, r := range rows {
 		// Reconstruct command + description text:
 		//  1. Strip SGR foreground colors (preserve adjacency).
 		//  2. Convert cursor-forward to single space.
 		//  3. Strip any remaining CSI noise.
 		//  4. Collapse multi-spaces; trim.
-		text := pickerColorCodeRe.ReplaceAllString(string(raw), "")
+		text := pickerColorCodeRe.ReplaceAllString(string(r.raw), "")
 		text = pickerCsiCursorFwdRe.ReplaceAllString(text, " ")
 		text = StripANSIString(text)
 		for strings.Contains(text, "  ") {
@@ -141,11 +217,11 @@ func ParsePicker(snap []byte) []PickerItem {
 		}
 
 		// Highlight detection:
-		//  - UNFILTERED: exactly one row opens with 153.
-		//  - FILTERED: every row opens with 246; default is the first row.
+		//  - UNFILTERED: ≥1 row opens in a highlighted color → match by RGB.
+		//  - FILTERED: every row opens in normal color → default is first.
 		var highlighted bool
-		if highlightedCount153 >= 1 {
-			highlighted = openColor == "153"
+		if highlightedCount >= 1 {
+			highlighted = r.colorSet && rgbIsHighlighted(r.openColor)
 		} else {
 			highlighted = i == 0
 		}

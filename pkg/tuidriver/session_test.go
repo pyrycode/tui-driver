@@ -147,6 +147,172 @@ func TestSessionWritePromptSendsBracketedPaste(t *testing.T) {
 	t.Errorf("Buffer never received bracketed-paste sequence; snap=%q", s.Buffer.Snapshot())
 }
 
+func TestSessionClearInputLineSendsCtrlU(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PTY tests skipped on Windows")
+	}
+	// 0x15 is the VKILL character for the PTY line discipline in cooked
+	// mode — it is consumed by the kernel before reaching the child's
+	// stdin. Switch the slave to raw mode (no line discipline) so the
+	// echo round-trip preserves the byte. A "READY" sentinel after stty
+	// proves the mode switch has taken effect before we call into the
+	// API under test.
+	cmd := exec.Command("sh", "-c", "stty raw -echo 2>/dev/null; printf READY; exec cat")
+	s, err := Spawn(cmd, SpawnOpts{})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer s.Close()
+
+	readyDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(readyDeadline) {
+		if bytes.Contains(s.Buffer.Snapshot(), []byte("READY")) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !bytes.Contains(s.Buffer.Snapshot(), []byte("READY")) {
+		t.Fatalf("stty/cat never reached READY; snap=%q", s.Buffer.Snapshot())
+	}
+
+	if err := s.ClearInputLine(); err != nil {
+		t.Fatalf("ClearInputLine: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		// Trim the READY sentinel and look for 0x15 in the remainder.
+		snap := s.Buffer.Snapshot()
+		idx := bytes.Index(snap, []byte("READY"))
+		if idx >= 0 && bytes.Contains(snap[idx+len("READY"):], []byte{0x15}) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("Buffer never received Ctrl-U after READY; snap=%q", s.Buffer.Snapshot())
+}
+
+func TestSessionTypePromptSendsBytesThenCommit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PTY tests skipped on Windows")
+	}
+	cmd := exec.Command("cat")
+	s, err := Spawn(cmd, SpawnOpts{})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.TypePrompt("ping"); err != nil {
+		t.Fatalf("TypePrompt: %v", err)
+	}
+	// cat in cooked-PTY mode may translate \r to \n on echo; assert that
+	// the body landed and that either CR or LF followed.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snap := s.Buffer.Snapshot()
+		if bytes.Contains(snap, []byte("ping\r")) || bytes.Contains(snap, []byte("ping\n")) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("Buffer never received typed prompt + commit; snap=%q", s.Buffer.Snapshot())
+}
+
+func TestSessionTypePromptInterByteTiming(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PTY tests skipped on Windows")
+	}
+	var sleeps []time.Duration
+	oldSleep := sleepFn
+	sleepFn = func(d time.Duration) { sleeps = append(sleeps, d) }
+	t.Cleanup(func() { sleepFn = oldSleep })
+
+	cmd := exec.Command("cat")
+	s, err := Spawn(cmd, SpawnOpts{})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.TypePrompt("abc"); err != nil {
+		t.Fatalf("TypePrompt: %v", err)
+	}
+
+	want := []time.Duration{
+		PromptInterByteDelay,
+		PromptInterByteDelay,
+		PromptInterByteDelay,
+		PromptCommitSettle,
+	}
+	if len(sleeps) != len(want) {
+		t.Fatalf("sleepFn called %d times, want %d (got %v)", len(sleeps), len(want), sleeps)
+	}
+	for i, d := range want {
+		if sleeps[i] != d {
+			t.Errorf("sleep[%d] = %v, want %v", i, sleeps[i], d)
+		}
+	}
+}
+
+func TestSessionTypePromptEmptyString(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PTY tests skipped on Windows")
+	}
+	var sleeps []time.Duration
+	oldSleep := sleepFn
+	sleepFn = func(d time.Duration) { sleeps = append(sleeps, d) }
+	t.Cleanup(func() { sleepFn = oldSleep })
+
+	cmd := exec.Command("cat")
+	s, err := Spawn(cmd, SpawnOpts{})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.TypePrompt(""); err != nil {
+		t.Fatalf("TypePrompt: %v", err)
+	}
+
+	// Empty body: no inter-byte sleeps, just the commit settle before \r.
+	want := []time.Duration{PromptCommitSettle}
+	if len(sleeps) != len(want) {
+		t.Fatalf("sleepFn called %d times, want %d (got %v)", len(sleeps), len(want), sleeps)
+	}
+	if sleeps[0] != want[0] {
+		t.Errorf("sleep[0] = %v, want %v", sleeps[0], want[0])
+	}
+}
+
+func TestSessionClearInputLineTiming(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PTY tests skipped on Windows")
+	}
+	var sleeps []time.Duration
+	oldSleep := sleepFn
+	sleepFn = func(d time.Duration) { sleeps = append(sleeps, d) }
+	t.Cleanup(func() { sleepFn = oldSleep })
+
+	cmd := exec.Command("cat")
+	s, err := Spawn(cmd, SpawnOpts{})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.ClearInputLine(); err != nil {
+		t.Fatalf("ClearInputLine: %v", err)
+	}
+
+	want := []time.Duration{ClearLineSettle}
+	if len(sleeps) != len(want) {
+		t.Fatalf("sleepFn called %d times, want %d (got %v)", len(sleeps), len(want), sleeps)
+	}
+	if sleeps[0] != want[0] {
+		t.Errorf("sleep[0] = %v, want %v", sleeps[0], want[0])
+	}
+}
+
 func TestSessionCloseIsIdempotent(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY tests skipped on Windows")

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -252,4 +253,69 @@ func parseContentBlock(b map[string]any) ContentBlock {
 	cb := ContentBlock{Raw: b}
 	cb.Type, _ = b["type"].(string)
 	return cb
+}
+
+// IsEndTurn reports whether e marks turn-end under the Phase-A
+// discriminator: the entry is an assistant envelope, its
+// message.stop_reason == "end_turn", AND its combined "text" content
+// (concatenation of content[] blocks whose type == "text") has
+// non-zero length.
+//
+// The text-non-empty half disambiguates a per-block delta line that
+// carries only thinking or tool_use blocks from the line that carries
+// the user-visible reply. Both can land with stop_reason=end_turn (a
+// single assistant message is serialised as one JSONL line per
+// content block, and every delta line carries stop_reason); the text
+// content is what distinguishes them. See
+// docs/knowledge/architecture/jsonl-layout.md § "Turn lifecycle".
+//
+// Returns false for non-assistant entries, entries with a nil
+// Message, entries with stop_reason != "end_turn", and zero-value
+// entries. Safe to call on a JSONLEntry{} — never panics.
+//
+// Per-entry semantics: this function returns true for the single
+// JSONL line that carries the (non-empty) text block of a turn. A
+// turn whose text is split across multiple lines (one block per line,
+// all sharing message.id) needs msg_id grouping on top — out of scope
+// for the library; consumers compose if needed.
+func IsEndTurn(e JSONLEntry) bool {
+	if e.Type != "assistant" || e.Message == nil {
+		return false
+	}
+	if e.Message.StopReason != "end_turn" {
+		return false
+	}
+	return AssistantText(e) != ""
+}
+
+// AssistantText returns the concatenation of e.Message.Content[]
+// blocks whose Type == "text", reading each block's "text" field from
+// its Raw map. Returns "" if e is not an assistant entry, has a nil
+// Message, or carries no non-empty text blocks. Safe to call on a
+// JSONLEntry{} — never panics.
+//
+// Blocks are joined in JSONL arrival order (the order content[] was
+// parsed in). Non-string or missing "text" fields contribute nothing
+// (zero-value-on-mismatch type assertion); type="thinking",
+// "tool_use", "tool_result", etc. are skipped.
+//
+// This is the per-entry primitive. Consumers needing the full turn's
+// text (split across lines under one message.id) build msg_id
+// grouping on top — out of scope for the library.
+func AssistantText(e JSONLEntry) string {
+	if e.Type != "assistant" || e.Message == nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, c := range e.Message.Content {
+		if c.Type != "text" {
+			continue
+		}
+		text, _ := c.Raw["text"].(string)
+		if text == "" {
+			continue
+		}
+		b.WriteString(text)
+	}
+	return b.String()
 }
