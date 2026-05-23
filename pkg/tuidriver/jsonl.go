@@ -92,10 +92,24 @@ func WaitForSessionJSONL(ctx context.Context, path string) error {
 // yields zero values (Type == "", Message == nil, Content == nil);
 // the entry is still emitted. Consumers requiring presence-vs-absence
 // semantics check `_, ok := e.Raw["message"]` directly.
+//
+// RawLine is the verbatim source-line bytes the tail goroutine read,
+// with the trailing "\r\n" or "\n" stripped — byte-identical to what
+// parseEntry consumed. It is NOT a round-trip of Raw: re-marshalling
+// Raw via encoding/json normalises key order and whitespace, which
+// RawLine preserves. Consumers that re-emit JSONL byte-for-byte (e.g.
+// stream-json bridges) should read from RawLine, not from Raw.
+//
+// RawLine is populated for every entry delivered on the TailJSONL
+// channel and owned by the entry — the library will not mutate it
+// after emission. For entries constructed directly by callers (test
+// fixtures, synthetic events), RawLine may be nil: its presence is
+// the TailJSONL contract, not a struct invariant.
 type JSONLEntry struct {
 	Type    string
 	Message *EntryMessage
 	Raw     map[string]any
+	RawLine []byte
 }
 
 // EntryMessage is the nested `message` object on assistant and user
@@ -223,7 +237,9 @@ func parseEntry(line []byte) (JSONLEntry, bool) {
 	if raw == nil {
 		return JSONLEntry{}, false
 	}
-	entry := JSONLEntry{Raw: raw}
+	// bytes.Clone is mandatory — line aliases tailJSONLLoop's rolling
+	// `partial` buffer, which the next iteration's append may clobber.
+	entry := JSONLEntry{Raw: raw, RawLine: bytes.Clone(line)}
 	entry.Type, _ = raw["type"].(string)
 	if m, ok := raw["message"].(map[string]any); ok {
 		msg := parseMessage(m)
