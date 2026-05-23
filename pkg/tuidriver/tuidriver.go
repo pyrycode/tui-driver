@@ -7,7 +7,8 @@
 // polling, tail-with-parsed-entries, and per-entry assistant-text /
 // end-of-turn helpers, ANSI/OSC stripping, vt10x-backed grid rendering,
 // modal-class detection, modal parsers (picker / mcp / agents),
-// trust-folder + MCP-failure banner detectors. Out of scope (consumer's
+// trust-folder + MCP-failure banner detectors, unified PTY+JSONL event
+// subscription. Out of scope (consumer's
 // job): JSONL semantic interpretation across lines (msg_id grouping,
 // cross-line content aggregation, cancellation-marker detection), ACP
 // protocol, agent-stage logic, dispatcher coordination, cost telemetry.
