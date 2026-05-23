@@ -25,23 +25,38 @@ func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 		{"agents header + running tab", []byte("...Agents...Running..."), ModalClassAgents},
 		{"agents header + library tab", []byte("...Agents...Library..."), ModalClassAgents},
 		{
-			"slash-picker SGR row 246",
-			[]byte("noise\x1b[38;5;246m/figma-use more"),
+			"slash-picker bare line (no color)",
+			[]byte("noise\n/figma-use description\n"),
 			ModalClassSlashPicker,
 		},
 		{
-			"slash-picker SGR row 153 highlighted",
-			[]byte("noise\x1b[38;5;153m/clear more"),
+			"slash-picker indexed-color row",
+			[]byte("noise\n\x1b[38;5;246m/figma-use\x1b[39m\n"),
 			ModalClassSlashPicker,
 		},
 		{
-			"slash-picker filtered (color + nested color)",
-			[]byte("noise\x1b[38;5;246m/\x1b[38;5;153mp\x1b[38;5;246mlugin more"),
+			"slash-picker truecolor row",
+			[]byte("noise\n\x1b[38;2;148;148;148m/figma-use\x1b[39m\n"),
+			ModalClassSlashPicker,
+		},
+		{
+			"slash-picker filtered (multiple colors mid-row)",
+			[]byte("noise\n\x1b[38;5;246m/\x1b[38;5;153mp\x1b[38;5;246mlugin desc\n"),
+			ModalClassSlashPicker,
+		},
+		{
+			"slash-picker truecolor highlighted row",
+			[]byte("noise\n\x1b[38;2;177;185;249m/code-review desc\n"),
 			ModalClassSlashPicker,
 		},
 		{
 			"hint-bar text alone is NOT a picker (welcome banner false-positive guard)",
 			[]byte("...? for shortcuts · ← for agents..."),
+			ModalClassUnknown,
+		},
+		{
+			"slash mid-line is NOT a picker (markdown body false-positive guard)",
+			[]byte("see /usr/local/bin for binaries"),
 			ModalClassUnknown,
 		},
 		{"ask-user stripped", []byte("...Entertoselect..."), ModalClassAskUserQuestion},
@@ -93,6 +108,7 @@ func TestDetectModalClassRealFixtures(t *testing.T) {
 		{"mcp-snapshot.bin", ModalClassMCP},
 		{"agents-snapshot.bin", ModalClassAgents},
 		{"picker-snapshot.bin", ModalClassSlashPicker},
+		{"picker-truecolor-snapshot.bin", ModalClassSlashPicker},
 	}
 	for _, tc := range cases {
 		t.Run(tc.fixture, func(t *testing.T) {

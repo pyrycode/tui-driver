@@ -2,7 +2,6 @@ package tuidriver
 
 import (
 	"bytes"
-	"regexp"
 )
 
 // ModalClass identifies which of claude's modal/picker UI states a PTY
@@ -42,19 +41,21 @@ const (
 //
 //	mcp                 → "ManageMCPservers"
 //	agents              → "Agents" header + "Running" or "Library" tab
-//	slash-picker        → SGR-colored picker row (`\x1b[38;5;{246|153}m/<letter>`)
+//	slash-picker        → ≥1 line whose stripped content starts with `/<letter>`
 //	ask-user-question   → "Entertoselect" or "Enter to select"
 //	trust-folder        → "Quicksafetycheck"
 //	permission          → "Doyouwanttoproceed" or "Do you want to proceed"
 //	model-select        → "Selectmodel" or "Select model" (the `/model` modal)
 //	permissions-config  → "Permissions" header + one of Allow/Ask/Deny tabs
 //
-// slash-picker uses the SGR-row pattern rather than the "? for shortcuts"
-// hint-bar text. The hint-bar text appears at idle too (it's part of the
-// welcome banner's input-line hint), causing false-positive picker
-// classifications. The SGR row pattern only matches when actual picker
-// rows are rendered. The same regex doubles as the parser's item-start
-// matcher in picker.go.
+// slash-picker keys on the structural row anchor (a line that begins
+// `/<letter>` after stripping CSI) rather than on color SGRs. The "? for
+// shortcuts" hint-bar text appears at idle too — it's part of the
+// welcome banner's input-line hint — and historically false-positived
+// any naive picker predicate. The structural anchor avoids that trap:
+// the hint-bar line doesn't begin with `/`. See findPickerRows in
+// picker.go for the row-finding seam; classification is shared with the
+// parser so any future row-shape change updates both call sites at once.
 var (
 	anchorMCP                = []byte("ManageMCPservers")
 	anchorAgentsHeader       = []byte("Agents")
@@ -73,16 +74,9 @@ var (
 	anchorPermissionsTabDeny  = []byte("Deny")
 )
 
-// slashPickerRowRe matches a picker item-start. Identical pattern to
-// pickerItemStartRe in picker.go (kept independent to avoid coupling the
-// detector to the parser's internals; the patterns are documented as
-// the same in both files).
-var slashPickerRowRe = regexp.MustCompile(
-	`\x1b\[38;5;(246|153)m/(?:\x1b\[38;5;\d+m)?[a-zA-Z]`,
-)
-
 // DetectModalClass classifies the modal/picker currently rendered in snap.
-// Cheap predicate: StripANSI + StripOSC + substring matches. Use Render
+// Cheap predicate: StripANSI + StripOSC + substring matches (plus the
+// structural slash-picker scan in findPickerRows). Use Render
 // (vt10x-backed) when you need to extract content from the modal, not just
 // classify it.
 //
@@ -94,11 +88,7 @@ var slashPickerRowRe = regexp.MustCompile(
 // Returns ModalClassUnknown when no anchor matches (the common case at
 // idle — no modal currently rendered).
 func DetectModalClass(snap []byte) ModalClass {
-	// slash-picker is detected on the RAW snapshot — the row anchor is an
-	// SGR sequence which StripANSI would remove. Check it first so the
-	// unstripped path doesn't get hit by the other anchors' matching on
-	// the welcome-banner text.
-	if slashPickerRowRe.Match(snap) {
+	if len(findPickerRows(snap)) > 0 {
 		return ModalClassSlashPicker
 	}
 	stripped := StripOSC(StripANSI(snap))
