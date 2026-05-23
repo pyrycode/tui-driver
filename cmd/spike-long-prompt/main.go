@@ -22,19 +22,14 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	_ "embed"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -46,10 +41,7 @@ import (
 )
 
 const (
-	statePollInterval  = 50 * time.Millisecond
-	jsonlTailInterval  = 50 * time.Millisecond
 	sessionFileWait    = 10 * time.Second
-	sessionFilePoll    = 100 * time.Millisecond
 	watchdogTick       = 1 * time.Second
 	ptyQuietLimit      = 60 * time.Second
 	spinnerFreezeLimit = 30 * time.Second
@@ -98,18 +90,21 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	// indentation are intentional test surface — they stay.
 	promptBody := strings.TrimRight(promptFixture, "\n")
 
-	projDir, err := projectsDir()
-	if err != nil {
-		return fmt.Errorf("resolve projects dir: %w", err)
-	}
-	logger.Printf("projects-dir path=%s", projDir)
-
-	sessionID, jsonlPath, err := resolveSession(sessionIDFlag, projDir)
+	sessionID, err := resolveSession(sessionIDFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		flag.Usage()
 		os.Exit(2)
 	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolve home dir: %w", err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("resolve cwd: %w", err)
+	}
+	jsonlPath := tuidriver.SessionJSONLPath(home, cwd, sessionID)
 	logger.Printf("session-id-resolved id=%s jsonl=%s", sessionID, jsonlPath)
 
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
@@ -154,8 +149,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			case <-ticker.C:
 				snap := rb.Snapshot()
 				stripped := tuidriver.StripANSI(snap)
-				verb, total, ok := matchSpinner(stripped)
-				_ = verb
+				_, total, ok := matchSpinner(stripped)
 				tr.ObserveSpinner(ok, total)
 				if werr := tr.CheckWatchdog(rb); werr != nil {
 					logger.Printf("%v", werr)
@@ -200,8 +194,6 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 		}
 	}
 
-	logger.Printf("prompt-loaded bytes=%d", len(promptBody))
-
 	if err := session.WritePrompt(promptBody); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
 	}
@@ -212,24 +204,20 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	// under --session-id defers JSONL creation until first input is received
 	// (verified empirically; documented in spike-one-turn README finding #9),
 	// so we poll AFTER prompt-written rather than after idle. The file is
-	// brand new in this flow — tail from offset 0 and let the parser filter
-	// skip startup envelopes the same way it does for non-assistant events.
-	if err := openSessionJSONL(jsonlPath); err != nil {
-		return fmt.Errorf("open session jsonl: %w", err)
+	// brand new in this flow — tail from offset 0 and let the library's
+	// per-entry discriminator filter out non-end_turn lines.
+	jsonlCtx, jsonlCancel := context.WithTimeout(rootCtx, sessionFileWait)
+	jsonlErr := tuidriver.WaitForSessionJSONL(jsonlCtx, jsonlPath)
+	jsonlCancel()
+	if jsonlErr != nil {
+		return fmt.Errorf("open session jsonl: %w", jsonlErr)
 	}
 	logger.Printf("session-jsonl-opened path=%s offset=0", jsonlPath)
 
-	eventCh := make(chan map[string]any, 32)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if terr := tailJSONL(rootCtx, logger, jsonlPath, 0, eventCh); terr != nil {
-			if !errors.Is(terr, context.Canceled) {
-				logger.Printf("jsonl-tailer-error err=%v", terr)
-				cancelCause(terr)
-			}
-		}
-	}()
+	events, err := session.Events(rootCtx, jsonlPath, 0)
+	if err != nil {
+		return fmt.Errorf("open events stream: %w", err)
+	}
 
 	// Terminate on JSONL end_turn. Spinner observation is opportunistic: the
 	// slow path emits thinking-detected → spinner-gone; the fast path skips
@@ -244,34 +232,55 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 		gotEndTurn       bool
 		assistantText    string
 	)
-	probe := time.NewTicker(statePollInterval)
-	defer probe.Stop()
-	for !(gotEndTurn && (!thinkingObserved || spinnerGone)) {
-		select {
-		case <-rootCtx.Done():
-			return fmt.Errorf("wait termination: %w", context.Cause(rootCtx))
-		case ev := <-eventCh:
-			if !gotEndTurn && isEndTurn(ev) {
-				assistantText = extractAssistantText(ev)
-				gotEndTurn = true
-				tr.RecordTransition("end-turn-detected")
-				logger.Printf("end-turn-detected")
+	for ev := range events {
+		switch ev.Kind {
+		case tuidriver.EventKindPtyThinking:
+			if thinkingObserved {
+				continue
 			}
-		case <-probe.C:
-			stripped := tuidriver.StripANSI(rb.Snapshot())
-			v, _, ok := matchSpinner(stripped)
-			switch {
-			case ok && !thinkingObserved:
-				thinkingVerb = v
-				thinkingObserved = true
-				tr.RecordTransition("thinking-detected")
-				logger.Printf("thinking-detected verb=%q", thinkingVerb)
-			case !ok && thinkingObserved && !spinnerGone:
-				spinnerGone = true
-				tr.RecordTransition("spinner-gone")
-				logger.Printf("spinner-gone")
+			// The library's PtyThinking event fires on ✻ glyph presence;
+			// the spike gates `thinkingObserved` on the local regex
+			// matching the verb. Reason: the rolling buffer (4 KB)
+			// retains the ✻ bytes past the visual end-of-spinner, so the
+			// library's IsIdle predicate (✻-absent) often never flips
+			// back to true for short turns. Gating on regex-match
+			// preserves the pre-refactor fast-path skip-through
+			// (gotEndTurn && !thinkingObserved) when the regex misses
+			// (the documented class-C case; spike-one-turn finding #8).
+			v, _, ok := matchSpinner(tuidriver.StripANSI(rb.Snapshot()))
+			if !ok {
+				continue
 			}
+			thinkingVerb = v
+			thinkingObserved = true
+			tr.RecordTransition("thinking-detected")
+			logger.Printf("thinking-detected verb=%q", thinkingVerb)
+		case tuidriver.EventKindPtyIdle:
+			// The merge loop is start-blind, so an already-idle buffer at
+			// subscription fires this on tick one. Gate on thinkingObserved
+			// to ignore that pre-thinking idle event.
+			if !thinkingObserved || spinnerGone {
+				continue
+			}
+			spinnerGone = true
+			tr.RecordTransition("spinner-gone")
+			logger.Printf("spinner-gone")
+		case tuidriver.EventKindJsonlEndOfTurn:
+			if gotEndTurn {
+				continue
+			}
+			assistantText = tuidriver.AssistantText(ev.Entry)
+			gotEndTurn = true
+			tr.RecordTransition("end-turn-detected")
+			logger.Printf("end-turn-detected")
 		}
+		if gotEndTurn && (!thinkingObserved || spinnerGone) {
+			break
+		}
+	}
+
+	if rootCtx.Err() != nil {
+		return fmt.Errorf("wait termination: %w", context.Cause(rootCtx))
 	}
 
 	tr.RecordTransition("assistant-text-extracted")
@@ -303,161 +312,22 @@ func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
 	return string(m[1]), minutes*60 + seconds, true
 }
 
-
-
-// --- JSONL discovery + tailing ---
-
-// projectsDir resolves $HOME/.claude/projects/<encoded-cwd>/ at runtime.
-// The encoding is byte-by-byte: '/', '.', and ' ' become '-', everything else
-// passes through. Adjacent chars therefore produce '--' (non-reversible).
-// Space mapping confirmed empirically against vault cwd `Second Brain`
-// landing at `...-Second-Brain` in claude's projects dir (2026-05-17).
-func projectsDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".claude", "projects", tuidriver.EncodeCwd(cwd)), nil
-}
-
-// resolveSession turns the operator-supplied flag into a normalised session ID
-// and the deterministic JSONL path. Empty flag → generate a fresh v4 UUID;
-// non-empty → must parse as a valid UUID (uuid.Parse accepts hyphenated and
-// non-hyphenated forms; .String() re-emits the canonical lowercase-hyphenated
-// shape that matches claude's filename convention).
-//
-// The function does not stat jsonlPath — the discovery loop owns that.
-func resolveSession(flagValue string, dir string) (sessionID string, jsonlPath string, err error) {
+// resolveSession turns the operator-supplied flag into a normalised session ID.
+// Empty flag → generate a fresh v4 UUID; non-empty → must parse as a valid
+// UUID (uuid.Parse accepts hyphenated and non-hyphenated forms; .String()
+// re-emits the canonical lowercase-hyphenated shape that matches claude's
+// filename convention).
+func resolveSession(flagValue string) (string, error) {
 	if flagValue == "" {
-		u, gerr := uuid.NewRandom()
-		if gerr != nil {
-			return "", "", fmt.Errorf("generate session id: %w", gerr)
+		u, err := uuid.NewRandom()
+		if err != nil {
+			return "", fmt.Errorf("generate session id: %w", err)
 		}
-		sessionID = u.String()
-	} else {
-		u, perr := uuid.Parse(flagValue)
-		if perr != nil {
-			return "", "", fmt.Errorf("invalid --session-id: %w", perr)
-		}
-		sessionID = u.String()
+		return u.String(), nil
 	}
-	jsonlPath = filepath.Join(dir, sessionID+".jsonl")
-	return sessionID, jsonlPath, nil
-}
-
-// openSessionJSONL polls the deterministic JSONL path until it appears. The
-// path was pinned up-front via --session-id, so there is no directory scan
-// and no mtime heuristic — pre-existing stale .jsonl files in the same
-// directory are structurally invisible. Interactive claude defers JSONL
-// creation until first input (see spike-one-turn README finding #9), so
-// callers should wait until after prompt-written before invoking this.
-func openSessionJSONL(jsonlPath string) error {
-	deadline := time.Now().Add(sessionFileWait)
-	for {
-		_, err := os.Stat(jsonlPath)
-		if err == nil {
-			return nil
-		}
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("stat session jsonl: %w", err)
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("session JSONL did not appear at %s within %s", jsonlPath, sessionFileWait)
-		}
-		time.Sleep(sessionFilePoll)
-	}
-}
-
-func tailJSONL(
-	ctx context.Context,
-	logger *log.Logger,
-	path string,
-	startOffset int64,
-	out chan<- map[string]any,
-) error {
-	f, err := os.Open(path)
+	u, err := uuid.Parse(flagValue)
 	if err != nil {
-		return fmt.Errorf("open session jsonl: %w", err)
+		return "", fmt.Errorf("invalid --session-id: %w", err)
 	}
-	defer f.Close()
-
-	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
-		return fmt.Errorf("seek session jsonl: %w", err)
-	}
-
-	reader := bufio.NewReader(f)
-	var partial []byte
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		chunk, rerr := reader.ReadBytes('\n')
-		if len(chunk) > 0 {
-			partial = append(partial, chunk...)
-		}
-		if rerr == nil {
-			line := bytes.TrimRight(partial, "\r\n")
-			partial = partial[:0]
-			if len(line) == 0 {
-				continue
-			}
-			var obj map[string]any
-			if jerr := json.Unmarshal(line, &obj); jerr != nil {
-				logger.Printf("jsonl-parse-warning err=%v", jerr)
-				continue
-			}
-			// Filter: only assistant events with a message object can carry
-			// stop_reason. Everything else (permission-mode, file-history-snapshot,
-			// attachment, ai-title, system, last-prompt, user, and future
-			// envelopes) is silently ignored.
-			if _, ok := obj["message"].(map[string]any); !ok {
-				continue
-			}
-			if t, _ := obj["type"].(string); t != "assistant" {
-				continue
-			}
-			select {
-			case out <- obj:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		} else if rerr == io.EOF {
-			// EOF with no newline → keep the partial bytes and wait for more.
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(jsonlTailInterval):
-			}
-		} else {
-			return fmt.Errorf("read session jsonl: %w", rerr)
-		}
-	}
-}
-
-// --- assistant-event helpers ---
-
-func isEndTurn(ev map[string]any) bool {
-	msg, _ := ev["message"].(map[string]any)
-	stop, _ := msg["stop_reason"].(string)
-	return stop == "end_turn"
-}
-
-func extractAssistantText(ev map[string]any) string {
-	msg, _ := ev["message"].(map[string]any)
-	content, _ := msg["content"].([]any)
-	var b strings.Builder
-	for _, c := range content {
-		cm, _ := c.(map[string]any)
-		if t, _ := cm["type"].(string); t != "text" {
-			continue
-		}
-		if txt, _ := cm["text"].(string); txt != "" {
-			b.WriteString(txt)
-		}
-	}
-	return b.String()
+	return u.String(), nil
 }
