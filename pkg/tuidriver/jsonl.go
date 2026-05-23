@@ -335,3 +335,54 @@ func AssistantText(e JSONLEntry) string {
 	}
 	return b.String()
 }
+
+// Usage is the four token counters carried by an assistant entry's
+// message.usage block (Anthropic API shape: input_tokens, output_tokens,
+// cache_creation_input_tokens, cache_read_input_tokens). A counter
+// value of zero is the wire value; absence of the usage block itself
+// is signalled by AssistantUsage returning nil — see that function.
+//
+// Additional usage fields claude may emit (service_tier, cache TTL
+// breakdowns, …) are intentionally not surfaced here; consumers needing
+// them reach through e.Message.Raw["usage"] directly.
+type Usage struct {
+	InputTokens              int
+	OutputTokens             int
+	CacheCreationInputTokens int
+	CacheReadInputTokens     int
+}
+
+// AssistantUsage returns the four token counters carried by e's
+// message.usage block as a *Usage, or nil if e is not an assistant
+// entry, has a nil Message, or carries no usage map. Safe to call on a
+// JSONLEntry{} — never panics.
+//
+// A nil return distinguishes "usage block absent" from "usage block
+// present, all counters zero" (the latter returns a non-nil &Usage{}).
+// Each counter is read from Message.Raw["usage"] as a JSON number
+// (float64 after encoding/json) and converted to int; missing or
+// non-numeric keys contribute 0, matching AssistantText's
+// zero-value-on-mismatch posture.
+//
+// This is the per-entry primitive. Consumers needing per-turn totals
+// aggregate across entries (typically grouped by message.id) — out of
+// scope for the library.
+func AssistantUsage(e JSONLEntry) *Usage {
+	if e.Type != "assistant" || e.Message == nil {
+		return nil
+	}
+	usage, ok := e.Message.Raw["usage"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	intField := func(key string) int {
+		n, _ := usage[key].(float64)
+		return int(n)
+	}
+	return &Usage{
+		InputTokens:              intField("input_tokens"),
+		OutputTokens:             intField("output_tokens"),
+		CacheCreationInputTokens: intField("cache_creation_input_tokens"),
+		CacheReadInputTokens:     intField("cache_read_input_tokens"),
+	}
+}
