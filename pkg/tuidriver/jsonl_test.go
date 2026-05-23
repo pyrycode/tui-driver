@@ -400,6 +400,239 @@ func TestTailJSONL_OpenFailsWhenFileMissing(t *testing.T) {
 	}
 }
 
+// textBlock builds a content block of type "text" with the given text.
+func textBlock(text string) ContentBlock {
+	return ContentBlock{Type: "text", Raw: map[string]any{"type": "text", "text": text}}
+}
+
+// blockWithRaw builds a content block of arbitrary type carrying the
+// given raw payload. Used for malformed-shape scenarios (non-string
+// "text" field, missing "text" field, non-text block types).
+func blockWithRaw(kind string, raw map[string]any) ContentBlock {
+	return ContentBlock{Type: kind, Raw: raw}
+}
+
+func TestIsEndTurn(t *testing.T) {
+	cases := []struct {
+		name string
+		e    JSONLEntry
+		want bool
+	}{
+		{
+			name: "assistant + end_turn + non-empty text block",
+			e: JSONLEntry{
+				Type: "assistant",
+				Message: &EntryMessage{
+					StopReason: "end_turn",
+					Content:    []ContentBlock{textBlock("hello")},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "assistant + end_turn + empty text block",
+			e: JSONLEntry{
+				Type: "assistant",
+				Message: &EntryMessage{
+					StopReason: "end_turn",
+					Content:    []ContentBlock{textBlock("")},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "assistant + end_turn + only tool_use blocks",
+			e: JSONLEntry{
+				Type: "assistant",
+				Message: &EntryMessage{
+					StopReason: "end_turn",
+					Content: []ContentBlock{
+						blockWithRaw("tool_use", map[string]any{"type": "tool_use", "name": "bash"}),
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "assistant + end_turn + only thinking blocks",
+			e: JSONLEntry{
+				Type: "assistant",
+				Message: &EntryMessage{
+					StopReason: "end_turn",
+					Content: []ContentBlock{
+						blockWithRaw("thinking", map[string]any{"type": "thinking", "thinking": "musing"}),
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "assistant + end_turn + thinking AND text blocks",
+			e: JSONLEntry{
+				Type: "assistant",
+				Message: &EntryMessage{
+					StopReason: "end_turn",
+					Content: []ContentBlock{
+						blockWithRaw("thinking", map[string]any{"type": "thinking", "thinking": "musing"}),
+						textBlock("hello"),
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "assistant + stop_reason=tool_use + text block",
+			e: JSONLEntry{
+				Type: "assistant",
+				Message: &EntryMessage{
+					StopReason: "tool_use",
+					Content:    []ContentBlock{textBlock("hello")},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "assistant + empty stop_reason + text block",
+			e: JSONLEntry{
+				Type: "assistant",
+				Message: &EntryMessage{
+					StopReason: "",
+					Content:    []ContentBlock{textBlock("hello")},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "assistant + nil Message",
+			e:    JSONLEntry{Type: "assistant", Message: nil},
+			want: false,
+		},
+		{
+			name: "type=user + end_turn + text block",
+			e: JSONLEntry{
+				Type: "user",
+				Message: &EntryMessage{
+					StopReason: "end_turn",
+					Content:    []ContentBlock{textBlock("hello")},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "type=system",
+			e:    JSONLEntry{Type: "system"},
+			want: false,
+		},
+		{
+			name: "zero-value entry",
+			e:    JSONLEntry{},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsEndTurn(tc.e); got != tc.want {
+				t.Errorf("IsEndTurn = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAssistantText(t *testing.T) {
+	cases := []struct {
+		name string
+		e    JSONLEntry
+		want string
+	}{
+		{
+			name: "assistant + one text block",
+			e: JSONLEntry{
+				Type:    "assistant",
+				Message: &EntryMessage{Content: []ContentBlock{textBlock("hello")}},
+			},
+			want: "hello",
+		},
+		{
+			name: "assistant + two text blocks concatenated in order",
+			e: JSONLEntry{
+				Type: "assistant",
+				Message: &EntryMessage{Content: []ContentBlock{
+					textBlock("hello"),
+					textBlock(" world"),
+				}},
+			},
+			want: "hello world",
+		},
+		{
+			name: "assistant + text, thinking, text — thinking skipped",
+			e: JSONLEntry{
+				Type: "assistant",
+				Message: &EntryMessage{Content: []ContentBlock{
+					textBlock("hello"),
+					blockWithRaw("thinking", map[string]any{"type": "thinking", "thinking": "musing"}),
+					textBlock(" world"),
+				}},
+			},
+			want: "hello world",
+		},
+		{
+			name: "assistant + only tool_use block",
+			e: JSONLEntry{
+				Type: "assistant",
+				Message: &EntryMessage{Content: []ContentBlock{
+					blockWithRaw("tool_use", map[string]any{"type": "tool_use", "name": "bash"}),
+				}},
+			},
+			want: "",
+		},
+		{
+			name: "assistant + text block with non-string text field",
+			e: JSONLEntry{
+				Type: "assistant",
+				Message: &EntryMessage{Content: []ContentBlock{
+					blockWithRaw("text", map[string]any{"type": "text", "text": 42}),
+				}},
+			},
+			want: "",
+		},
+		{
+			name: "assistant + text block with missing text field",
+			e: JSONLEntry{
+				Type: "assistant",
+				Message: &EntryMessage{Content: []ContentBlock{
+					blockWithRaw("text", map[string]any{"type": "text"}),
+				}},
+			},
+			want: "",
+		},
+		{
+			name: "assistant + nil Message",
+			e:    JSONLEntry{Type: "assistant", Message: nil},
+			want: "",
+		},
+		{
+			name: "type=user + text block",
+			e: JSONLEntry{
+				Type:    "user",
+				Message: &EntryMessage{Content: []ContentBlock{textBlock("hello")}},
+			},
+			want: "",
+		},
+		{
+			name: "zero-value entry",
+			e:    JSONLEntry{},
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := AssistantText(tc.e); got != tc.want {
+				t.Errorf("AssistantText = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestWaitForSessionJSONL_DeadlineExpiry(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "never-appears.jsonl")
