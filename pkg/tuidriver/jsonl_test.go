@@ -1,6 +1,7 @@
 package tuidriver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io/fs"
@@ -249,6 +250,64 @@ func TestTailJSONL_PartialLineAcrossReads(t *testing.T) {
 			t.Errorf("unexpected second entry: %+v", extra)
 		}
 	case <-time.After(150 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Errorf("expected channel close after cancel, got entry")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Errorf("channel did not close within 500ms after cancel")
+	}
+}
+
+func TestTailJSONL_RawLineByteFidelity(t *testing.T) {
+	// Each scenario is one source line whose verbatim bytes must round-trip
+	// through TailJSONL unchanged. These four shapes are the realistic
+	// worst-case for re-marshal drift via json.Marshal(Raw):
+	//   - mixed-order keys: Go's encoder sorts map keys alphabetically
+	//   - unicode: multi-byte UTF-8 must not be re-encoded
+	//   - escaped newlines: \n inside a string stays escaped, not literal
+	//   - embedded base64: long string with +/= must pass through verbatim
+	lines := []string{
+		`{"z":1,"a":2,"m":3}`,
+		`{"type":"assistant","msg":"こんにちは 🎉 — ok"}`,
+		`{"type":"text","text":"line1\nline2\twith\ttabs"}`,
+		`{"type":"tool_use","input":{"payload":"SGVsbG8sIFdvcmxkISBUaGlzIGlzIGEgbG9uZ2lzaCBiYXNlNjQrLz09"}}`,
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	var buf bytes.Buffer
+	for _, line := range lines {
+		buf.WriteString(line)
+		buf.WriteByte('\n')
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := TailJSONL(ctx, path, 0)
+	if err != nil {
+		t.Fatalf("TailJSONL = %v, want nil", err)
+	}
+	entries := make([]JSONLEntry, len(lines))
+	for i, want := range lines {
+		entries[i] = mustReceive(t, ch, 500*time.Millisecond)
+		if !bytes.Equal(entries[i].RawLine, []byte(want)) {
+			t.Errorf("entry %d RawLine =\n  %q\nwant\n  %q", i, entries[i].RawLine, want)
+		}
+	}
+	// Defensive-copy pin: appending more lines must not clobber earlier
+	// entries' RawLine. If parseEntry ever returned a slice aliasing the
+	// rolling buffer, the next iteration's append would overwrite it.
+	mustAppend(t, path, `{"type":"after"}`+"\n")
+	_ = mustReceive(t, ch, 500*time.Millisecond)
+	for i, want := range lines {
+		if !bytes.Equal(entries[i].RawLine, []byte(want)) {
+			t.Errorf("entry %d RawLine clobbered after later read =\n  %q\nwant\n  %q", i, entries[i].RawLine, want)
+		}
 	}
 	cancel()
 	select {
