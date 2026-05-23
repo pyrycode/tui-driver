@@ -1,0 +1,16 @@
+{
+  "total_servers": 1,
+  "categories": [
+    {
+      "name": "Built-in MCPs",
+      "path": "(always available)",
+      "servers": [
+        {
+          "name": "computer-use",
+          "status": "disabled",
+          "highlighted": true
+        }
+      ]
+    }
+  ]
+}
