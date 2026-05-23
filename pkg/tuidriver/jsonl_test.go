@@ -3,6 +3,7 @@ package tuidriver
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -150,6 +151,252 @@ func TestWaitForSessionJSONL_ContextCancellation(t *testing.T) {
 	}
 	if !cancelled.Load() {
 		t.Errorf("returned before cancel goroutine ran — race in test or in implementation")
+	}
+}
+
+// mustReceive blocks for at most timeout waiting for an entry on ch.
+// Fails the test if no value arrives or if the channel closes early.
+// Used to bound test runtime under deadlock — a stuck tail goroutine
+// would otherwise hang until go test's default timeout.
+func mustReceive(t *testing.T, ch <-chan JSONLEntry, timeout time.Duration) JSONLEntry {
+	t.Helper()
+	select {
+	case ev, ok := <-ch:
+		if !ok {
+			t.Fatalf("channel closed before receive")
+		}
+		return ev
+	case <-time.After(timeout):
+		t.Fatalf("timed out waiting for entry (%v)", timeout)
+		return JSONLEntry{}
+	}
+}
+
+func mustAppend(t *testing.T, path, line string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for append %s: %v", path, err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(line); err != nil {
+		t.Fatalf("append %s: %v", path, err)
+	}
+}
+
+func TestTailJSONL_AppendDuringTail(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"a"}`+"\n"+`{"type":"b"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := TailJSONL(ctx, path, 0)
+	if err != nil {
+		t.Fatalf("TailJSONL = %v, want nil", err)
+	}
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "a" {
+		t.Errorf("entry 1 Type = %q, want %q", got, "a")
+	}
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "b" {
+		t.Errorf("entry 2 Type = %q, want %q", got, "b")
+	}
+	mustAppend(t, path, `{"type":"c"}`+"\n"+`{"type":"d"}`+"\n")
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "c" {
+		t.Errorf("entry 3 Type = %q, want %q", got, "c")
+	}
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "d" {
+		t.Errorf("entry 4 Type = %q, want %q", got, "d")
+	}
+	cancel()
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Errorf("expected channel close after cancel, got entry")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Errorf("channel did not close within 500ms after cancel")
+	}
+}
+
+func TestTailJSONL_PartialLineAcrossReads(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"split"`), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := TailJSONL(ctx, path, 0)
+	if err != nil {
+		t.Fatalf("TailJSONL = %v, want nil", err)
+	}
+	// Let the tail consume the partial bytes, hit EOF, park in retry.
+	time.Sleep(150 * time.Millisecond)
+	mustAppend(t, path, `,"id":"x"}`+"\n")
+	ev := mustReceive(t, ch, 500*time.Millisecond)
+	if ev.Type != "split" {
+		t.Errorf("Type = %q, want %q", ev.Type, "split")
+	}
+	if got, _ := ev.Raw["id"].(string); got != "x" {
+		t.Errorf("Raw[\"id\"] = %v, want %q", ev.Raw["id"], "x")
+	}
+	// Assert no second (spurious split) entry arrives.
+	select {
+	case extra, ok := <-ch:
+		if ok {
+			t.Errorf("unexpected second entry: %+v", extra)
+		}
+	case <-time.After(150 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Errorf("expected channel close after cancel, got entry")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Errorf("channel did not close within 500ms after cancel")
+	}
+}
+
+func TestTailJSONL_MalformedLineNonFatal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte("not json at all\n"+`{"type":"recovers"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := TailJSONL(ctx, path, 0)
+	if err != nil {
+		t.Fatalf("TailJSONL = %v, want nil", err)
+	}
+	ev := mustReceive(t, ch, 500*time.Millisecond)
+	if ev.Type != "recovers" {
+		t.Errorf("Type = %q, want %q (malformed line should be silently dropped, valid line still emitted)", ev.Type, "recovers")
+	}
+	cancel()
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Errorf("expected channel close after cancel, got entry")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Errorf("channel did not close within 500ms after cancel")
+	}
+}
+
+func TestTailJSONL_ContextCancellationMidRead(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"x"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	sentinel := errors.New("test stop")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	ch, err := TailJSONL(ctx, path, 0)
+	if err != nil {
+		t.Fatalf("TailJSONL = %v, want nil", err)
+	}
+	// Drain pre-written entry, then let the goroutine park in EOF-sleep.
+	_ = mustReceive(t, ch, 500*time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
+	cancel(sentinel)
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatalf("got entry instead of close after cancel")
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("channel did not close within 200ms after cancel (one tick is 50ms)")
+	}
+	if !errors.Is(context.Cause(ctx), sentinel) {
+		t.Errorf("context.Cause(ctx) = %v, want errors.Is(_, sentinel)", context.Cause(ctx))
+	}
+}
+
+func TestTailJSONL_EOFAppendCycles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"0"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := TailJSONL(ctx, path, 0)
+	if err != nil {
+		t.Fatalf("TailJSONL = %v, want nil", err)
+	}
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "0" {
+		t.Fatalf("entry 0 Type = %q, want %q", got, "0")
+	}
+	for i, want := range []string{"1", "2", "3"} {
+		time.Sleep(150 * time.Millisecond)
+		mustAppend(t, path, `{"type":"`+want+`"}`+"\n")
+		if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != want {
+			t.Errorf("cycle %d Type = %q, want %q", i+1, got, want)
+		}
+	}
+	cancel()
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Errorf("expected channel close after cancel, got entry")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Errorf("channel did not close within 500ms after cancel")
+	}
+}
+
+func TestTailJSONL_StartOffsetSkipsPrefix(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	const lineA = `{"type":"a"}` + "\n"
+	body := lineA + `{"type":"b"}` + "\n" + `{"type":"c"}` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	offset := int64(len(lineA))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := TailJSONL(ctx, path, offset)
+	if err != nil {
+		t.Fatalf("TailJSONL = %v, want nil", err)
+	}
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "b" {
+		t.Errorf("entry 1 Type = %q, want %q (offset must skip line a)", got, "b")
+	}
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "c" {
+		t.Errorf("entry 2 Type = %q, want %q", got, "c")
+	}
+	cancel()
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Errorf("expected channel close after cancel, got entry")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Errorf("channel did not close within 500ms after cancel")
+	}
+}
+
+func TestTailJSONL_OpenFailsWhenFileMissing(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "nonexistent", "x.jsonl")
+	ch, err := TailJSONL(context.Background(), missing, 0)
+	if err == nil {
+		t.Fatalf("TailJSONL(missing) err = nil, want error")
+	}
+	if ch != nil {
+		t.Errorf("TailJSONL(missing) ch != nil, want nil")
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Errorf("err = %q, want it to mention path %q", err.Error(), missing)
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("err = %v, want errors.Is(_, fs.ErrNotExist)", err)
 	}
 }
 
