@@ -1,6 +1,6 @@
 # e2e harness
 
-The single command (`make e2e`) that verifies the library's empirical end-to-end behaviour against a real installed `claude` binary. Runs the `claude-version-lock` check first, then every spike + probe + the snapshot-drift check serially, classifies each as pass / fail / timeout, and emits a single-file JSON report (`e2e-report.json`) suitable for CI artifact collection. Introduced by [#34](../codebase/34.md); extended by [#35](../codebase/35.md) (snapshot-drift), [#36](../codebase/36.md) (claude-version-lock), [#40](../codebase/40.md) (GitHub Actions push-to-main workflow), and [#64](../codebase/64.md) (`claude-version-lock` policy narrowed — version equality dropped, flag/value presence kept). Operator runbook lives here; per-ticket build notes live in `codebase/<N>.md`.
+The single command (`make e2e`) that verifies the library's empirical end-to-end behaviour against a real installed `claude` binary. Runs the `claude-version-lock` check first, then every spike + probe + the snapshot-drift check serially, classifies each as pass / fail / timeout, and emits a single-file JSON report (`e2e-report.json`) suitable for CI artifact collection. Introduced by [#34](../codebase/34.md); extended by [#35](../codebase/35.md) (snapshot-drift), [#36](../codebase/36.md) (claude-version-lock), [#40](../codebase/40.md) (GitHub Actions push-to-main workflow), [#64](../codebase/64.md) (`claude-version-lock` policy narrowed — version equality dropped, flag/value presence kept), and [#81](../codebase/81.md) (snapshot-drift byte-compare → parsed-shape JSON compare; renderer-byte volatility absorbed by parsers). Operator runbook lives here; per-ticket build notes live in `codebase/<N>.md`.
 
 ## What it does
 
@@ -101,7 +101,7 @@ Four kinds today (`Kind` is informational — every check goes through the same 
   - Result spikes (`one-turn`, `multi-turn`, `cancel`, `permission`, `long-prompt`) use `^SUCCESS` as their marker (they print `SUCCESS: <text>` on green).
   - Observation spikes (`multiselect`, `ask-user`) use `^OBSERVED` as their marker (they print `OBSERVED: <text>` — their contract is "exit 0 + observation logged").
 - **`probe`** — same as spike but with a 30s default timeout (instead of 60s) and an `OnFailure` callback that scrapes the recording-dir path from probe stderr (`probe outDir=<path>`) and emits it as `recording_dir` in the report entry. The probe's own internal `wallTimeout` is 3 min; the runner's 30s timeout kills it earlier (only on hang), and 30s is looser than the probe's 10s "fast" verdict so a healthy 2–3s baseline doesn't trip it.
-- **`snapshot`** — drives `cmd/e2e-snapshot-check` (a thin orchestrator that invokes `spike-multiselect` three times via its `-trigger` / `-settle` flags, scrapes the dump path from spike-multiselect's stderr, and byte-compares each capture to the committed `pkg/tuidriver/testdata/{picker,mcp,agents}-snapshot.bin`). 180s default timeout (`-timeout snapshot-drift=DUR` to override). No `SuccessMarker` — exit code is authoritative. An `OnComplete` callback (see below) parses one `SNAPSHOT <name> match|diff` stdout line per fixture into a `snapshots[]` list that appears on both `pass` AND `fail` so the operator can always pinpoint which fixture(s) drifted (or confirm none did). **Read-only** — never writes to the committed fixtures; re-recording is a separate maintainer step (see [#35](../codebase/35.md)). Introduced by [#35](../codebase/35.md). Byte-equality is intentional even though it's fragile — false positives are a feature that force the maintainer to look and re-record deliberately.
+- **`snapshot`** — drives `cmd/e2e-snapshot-check` (a thin orchestrator that invokes `spike-multiselect` three times via its `-trigger` / `-settle` flags, scrapes the dump path from spike-multiselect's stderr, reads the `<dump>.parsed.json` sidecar the spike writes after running `ParsePicker` / `ParseMcpStatus` / `ParseAgentList`, and `reflect.DeepEqual`-compares the JSON tree to the committed `pkg/tuidriver/testdata/{picker,mcp,agents}-snapshot.json`). 180s default timeout (`-timeout snapshot-drift=DUR` to override). No `SuccessMarker` — exit code is authoritative. An `OnComplete` callback (see below) parses one `SNAPSHOT <name> match|diff` stdout line per fixture into a `snapshots[]` list that appears on both `pass` AND `fail` so the operator can always pinpoint which fixture(s) drifted (or confirm none did). Default mode is **read-only** — re-recording rides on an opt-in `-record` flag (operator-driven via `make rerecord-snapshots`); `make e2e` never sets it. Introduced by [#35](../codebase/35.md) (byte-compare); switched to parsed-shape JSON compare by [#81](../codebase/81.md) after #72 evidence that every byte-level mitigation surfaces the next layer of renderer volatility (Try-line rotation, bimodal whitespace-clear pass). The parsers absorb the volatile bytes; the parsed shape is stable. Comparison is exact-equal across the entire parsed struct — no field whitelist, no subset matching. The check binary unconditionally sets `TUIDRIVER_STRICT_MCP_CONFIG=1` on every spike-multiselect child so re-recorded fixtures don't leak operator MCP-config paths into `mcp-snapshot.json`.
 
 Future check kinds will add one entry each to the hardcoded check list; the abstraction is intentionally a leaf, not a framework. The first subprocess-vs-in-process inflection point landed with `version-lock` — when the check's inputs already live in the runner's scope (the captured `claude --version` output, the lock-file path from a `-lock` flag), an in-process `Run` callback is the right shape; when the work is non-trivial orchestration that would clutter `main` (snapshot-drift's 3-spike + byte-compare flow), a dedicated `cmd/<name>/main.go` binary is.
 
@@ -140,9 +140,9 @@ Both callbacks return `map[string]any` that gets flattened into the report entry
       "recording_dir": "/tmp/probe-first-prompt-hang-2026-05-19T13-24-11Z/" },
     { "name": "snapshot-drift",          "status": "fail",    "duration_ms": 42118,
       "snapshots": [
-        { "file": "pkg/tuidriver/testdata/picker-snapshot.bin", "result": "match" },
-        { "file": "pkg/tuidriver/testdata/mcp-snapshot.bin",    "result": "diff"  },
-        { "file": "pkg/tuidriver/testdata/agents-snapshot.bin", "result": "match" }
+        { "file": "pkg/tuidriver/testdata/picker-snapshot.json", "result": "match" },
+        { "file": "pkg/tuidriver/testdata/mcp-snapshot.json",    "result": "diff"  },
+        { "file": "pkg/tuidriver/testdata/agents-snapshot.json", "result": "match" }
       ] }
   ]
 }
@@ -179,7 +179,7 @@ Both callbacks return `map[string]any` that gets flattened into the report entry
 | Probe failure | `recording_dir` scraped from probe stderr and added to the report entry. The directory is preserved on disk for forensics (not cleaned up by the runner). |
 | `recording_dir` not found in probe stderr | Report entry is well-formed without it. There's no directory to point at. |
 | Snapshot capture failure (spike-multiselect crashes, dump missing, stderr lacks the expected log line) | The check binary emits `SNAPSHOT <name> diff` for that fixture, logs `drift in <path>: <err>` to stderr, and continues with the next fixture. The aggregate exit code is `1`. `snapshots[]` still reflects every fixture the check got to. |
-| Snapshot byte-mismatch (the actual drift case) | `SNAPSHOT <name> diff` + `drift in <path>` on stderr. Maintainer inspects `/tmp/spike-multiselect-bytes-<ns>.bin` (path visible in mirrored stderr) vs the committed fixture by hand — typically `diff <(xxd /tmp/...) <(xxd pkg/tuidriver/testdata/...-snapshot.bin)`. If the change is legitimate, re-record. |
+| Snapshot parsed-shape mismatch (the actual drift case) | `SNAPSHOT <name> diff` + `drift in <path>` on stderr, followed by `  captured at <parsed.json>` on the next line. Maintainer inspects via `diff <(jq . pkg/tuidriver/testdata/<name>-snapshot.json) <(jq . /tmp/spike-multiselect-bytes-<ns>.parsed.json)`. If the change is legitimate, `make rerecord-snapshots` to refresh the JSON fixtures, bump `claude-version.lock` `version=`, commit both together. |
 | Report write fails | Print to stderr, exit 1. |
 
 The dominant invariant: **the report always emits when feasible** — even on partial failure — so CI gets a single uniform artifact.
@@ -241,40 +241,37 @@ The format is intentionally NOT JSON / TOML / YAML — hand-edit-friendliness an
 
 ## Re-recording snapshot fixtures
 
-`snapshot-drift` is **read-only** — it never overwrites `pkg/tuidriver/testdata/*-snapshot.bin`. When a diff is legitimate (claude's UI genuinely changed), the maintainer re-records the affected fixture(s) manually:
+`snapshot-drift` is **read-only by default** — `make e2e` never writes to `pkg/tuidriver/testdata/*-snapshot.json`. When a diff is legitimate (claude's UI genuinely changed) the maintainer regenerates the affected JSON fixtures via the dedicated `-record` mode (introduced by [#81](../codebase/81.md)):
 
 ```sh
-make build-bin
-# Picker (default settle is fine).
-TUIDRIVER_STRICT_MCP_CONFIG=1 ./bin/spike-multiselect -trust-folder=accept -trigger='/'
-cp /tmp/spike-multiselect-bytes-<latest>.bin pkg/tuidriver/testdata/picker-snapshot.bin
-
-# Mcp (needs longer settle for the MCP-server-connecting state to resolve).
-TUIDRIVER_STRICT_MCP_CONFIG=1 ./bin/spike-multiselect -trust-folder=accept -trigger="$(printf '/mcp\r')" -settle=5s
-cp /tmp/spike-multiselect-bytes-<latest>.bin pkg/tuidriver/testdata/mcp-snapshot.bin
-
-# Agents.
-TUIDRIVER_STRICT_MCP_CONFIG=1 ./bin/spike-multiselect -trust-folder=accept -trigger="$(printf '/agents\r')"
-cp /tmp/spike-multiselect-bytes-<latest>.bin pkg/tuidriver/testdata/agents-snapshot.bin
+make rerecord-snapshots          # build-bin + bin/e2e-snapshot-check -record -bin-dir ./bin
+git diff pkg/tuidriver/testdata/ # review the parsed-shape changes
+# bump claude-version.lock version= to match `claude --version`
+git add pkg/tuidriver/testdata/*-snapshot.json claude-version.lock
+git commit -m "fixtures: re-record snapshot-drift fixtures for claude X.Y.Z"
+make e2e                         # validate the re-record produced a green run
 ```
 
-The `TUIDRIVER_STRICT_MCP_CONFIG=1` env var matters: the e2e runner sets it on every child, so the captures the check derives are under `--strict-mcp-config`. Re-recording without the env var would produce fixtures that diff against every CI run.
+The check binary unconditionally sets `TUIDRIVER_STRICT_MCP_CONFIG=1` on every spike-multiselect child it spawns (regardless of `-record`), so re-recorded JSON is reproducible across hosts — operator MCP config does not leak into `mcp-snapshot.json`'s `categories[].path` field. The `.bin` fixtures in the same directory are unit-test fixtures (consumed by `pkg/tuidriver/{picker,mcp,agents,grid,modal}_test.go`) and are NOT touched by `-record`; if claude's TUI byte stream changes structurally and breaks unit tests, the `.bin` files are refreshed manually via the legacy `spike-multiselect` invocation pattern (see [#35](../codebase/35.md) history).
+
+**Don't relax the comparison policy on intermittent drift.** If a fixture diffs across two consecutive `make e2e` runs without any code change, the parser has a non-deterministic input filter — file a separate parser-stabilisation ticket, don't whitelist fields. The exact-equal policy is load-bearing; subset matching is the failure mode that #72 evidence already rejected.
 
 ## Files
 
 - `cmd/e2e-runner/main.go` — orchestrator binary; `Check.Run`/`Check.OnComplete`, `claude-version-lock` + `snapshot-drift` entries, `parseClaudeVersion`, `parseLockFile`, `parseSnapshotResults`, `runClaudeVersionLockCheck`, `skipRest` short-circuit branch.
-- `cmd/e2e-snapshot-check/main.go` — snapshot-drift orchestrator; serial spike-multiselect invocations + byte-compare.
+- `cmd/e2e-snapshot-check/main.go` — snapshot-drift orchestrator; serial spike-multiselect invocations + parsed-shape JSON compare via `reflect.DeepEqual`; `-record` flag for fixture refresh; unconditional `TUIDRIVER_STRICT_MCP_CONFIG=1` on each child. See [#81](../codebase/81.md).
 - `cmd/e2e-runner/main_test.go` — `parseSnapshotResults`, `parseClaudeVersion`, `parseLockFile` table tests.
 - `claude-version.lock` — pinned claude-version + flag contract; hand-edited per upgrade.
-- `Makefile` — `e2e`, `build-bin`, `clean-bin`, `clean-report` targets; `CHECKERS` variable for non-spike/non-probe check binaries; `MODEL` / `EFFORT` overrides inlined per-recipe on `e2e`. The per-binary pattern rule (`$(BIN_DIR)/%: FORCE`) lists a recipe-less `FORCE:` target as a prereq so `go build` runs every invocation and its cache handles incremental rebuilds across `cmd/` and `pkg/` — without this, stale binaries from a previous build would silently shadow source edits (see [#79](../codebase/79.md)). Steady-state no-op `make build-bin` ≈ 480 ms across all 10 binaries.
+- `Makefile` — `e2e`, `build-bin`, `clean-bin`, `clean-report`, `rerecord-snapshots` targets; `CHECKERS` variable for non-spike/non-probe check binaries; `MODEL` / `EFFORT` overrides inlined per-recipe on `e2e`. The per-binary pattern rule (`$(BIN_DIR)/%: FORCE`) lists a recipe-less `FORCE:` target as a prereq so `go build` runs every invocation and its cache handles incremental rebuilds across `cmd/` and `pkg/` — without this, stale binaries from a previous build would silently shadow source edits (see [#79](../codebase/79.md)). Steady-state no-op `make build-bin` ≈ 480 ms across all 10 binaries.
 - `pkg/tuidriver/pty.go` — `EnsureClaudeEnv` + the `StrictMcpConfigEnv` opt-in + the `ClaudeModelEnv` / `ClaudeEffortEnv` `--model`/`--effort` passthrough seam.
-- `pkg/tuidriver/testdata/{picker,mcp,agents}-snapshot.bin` — committed byte fixtures consumed by both the unit tests in `pkg/tuidriver/` and the snapshot-drift check.
+- `pkg/tuidriver/testdata/{picker,mcp,agents}-snapshot.json` — committed parsed-shape fixtures consumed by the snapshot-drift check. Output of `ParsePicker` / `ParseMcpStatus` / `ParseAgentList` marshalled via `json.MarshalIndent(_, "", "  ")`. Hand-editable; `git diff`-friendly. Regenerated via `make rerecord-snapshots`. See [#81](../codebase/81.md).
+- `pkg/tuidriver/testdata/{picker,mcp,agents}-snapshot.bin` — raw PTY byte fixtures consumed by unit tests in `pkg/tuidriver/` (picker_test.go, mcp_test.go, agents_test.go, grid_test.go, modal_test.go). NOT read by the snapshot-drift check since [#81](../codebase/81.md); kept because the unit tests feed raw bytes into parsers and detectors (input ≠ output for those tests).
 - `.gitignore` — `/e2e-report.json` and `/e2e-runner` (generated artifacts).
 - `.github/workflows/e2e.yml` — push-to-main + `workflow_dispatch` GitHub Actions workflow that invokes `make e2e`, caches the claude install on `claude-version.lock`, and uploads `e2e-report.json` + `/tmp/probe-first-prompt-hang-*` artifacts. Introduced by [#40](../codebase/40.md).
 
 ## Related
 
-- Per-ticket notes: [#34](../codebase/34.md), [#35](../codebase/35.md), [#36](../codebase/36.md), [#40](../codebase/40.md), [#64](../codebase/64.md)
-- Specs: [#34](../../specs/architecture/34-e2e-harness-foundation.md), [#35](../../specs/architecture/35-snapshot-drift.md), [#36](../../specs/architecture/36-claude-version-lock.md), [#40](../../specs/architecture/40-ci-e2e-workflow.md), [#64](../../specs/architecture/64-claude-version-lock-policy.md)
+- Per-ticket notes: [#34](../codebase/34.md), [#35](../codebase/35.md), [#36](../codebase/36.md), [#40](../codebase/40.md), [#64](../codebase/64.md), [#81](../codebase/81.md)
+- Specs: [#34](../../specs/architecture/34-e2e-harness-foundation.md), [#35](../../specs/architecture/35-snapshot-drift.md) (superseded), [#36](../../specs/architecture/36-claude-version-lock.md), [#40](../../specs/architecture/40-ci-e2e-workflow.md), [#64](../../specs/architecture/64-claude-version-lock-policy.md), [#81](../../specs/architecture/81-snapshot-drift-parsed-shape.md) (current snapshot-drift design)
 - ADRs: orthogonal to both [0001](../decisions/0001-hybrid-jsonl-tui.md) and [0002](../decisions/0002-pattern-matching-over-emulation.md) — the harness shells out (and now also runs an in-process structural check); neither extends the library's signal model.
 - System overview: [architecture/system-overview.md](../architecture/system-overview.md)
