@@ -43,6 +43,31 @@ const (
 	// carries the just-hidden class.
 	EventKindPtyModalHidden
 
+	// EventKindPtyMcpFailureShown fires when the "N MCP server(s)
+	// failed" status banner appears in the snapshot (rising edge:
+	// HasMcpFailureBanner false → true on a poll tick). No payload
+	// fields — the kind itself is the signal; consumers wanting the
+	// failure count call FailedMcpCount(snap) directly.
+	//
+	// Independent of modal/idle/thinking state: this event can fire
+	// while a modal is up or while the spinner is running. The banner
+	// persists in the status area regardless of the dominant UI axis.
+	EventKindPtyMcpFailureShown
+
+	// EventKindPtyMcpFailureHidden is the paired falling edge —
+	// HasMcpFailureBanner true → false on a poll tick. Same
+	// payload-free shape.
+	EventKindPtyMcpFailureHidden
+
+	// EventKindPtyNetworkFailureShown fires when a network-failure
+	// anchor (e.g. FailedToOpenSocket) appears in the snapshot. Same
+	// rising-edge semantics, same payload-free shape, same
+	// independence from the modal/idle/thinking axes.
+	EventKindPtyNetworkFailureShown
+
+	// EventKindPtyNetworkFailureHidden is the paired falling edge.
+	EventKindPtyNetworkFailureHidden
+
 	// EventKindJsonlEntry carries one parsed JSONL line forwarded from
 	// the internal tail. Entry carries the JSONLEntry.
 	EventKindJsonlEntry
@@ -71,6 +96,10 @@ const (
 //   - EventKindPtyModalShown, EventKindPtyModalHidden: Modal carries
 //     the class (the appearing class on Shown; the just-hidden class
 //     on Hidden).
+//   - EventKindPtyMcpFailureShown, EventKindPtyMcpFailureHidden,
+//     EventKindPtyNetworkFailureShown, EventKindPtyNetworkFailureHidden:
+//     no payload fields. The kind itself is the signal; the predicate
+//     identity is implicit.
 //   - EventKindJsonlEntry, EventKindJsonlEndOfTurn: Entry carries the
 //     parsed entry. Both events for one end-of-turn carry the same
 //     entry.
@@ -88,9 +117,10 @@ type Event struct {
 }
 
 // Events spawns a merge goroutine that emits PTY-state transitions
-// (idle / thinking / modal) and per-entry JSONL events on a single
-// unified channel in arrival order. Internally tails the JSONL file
-// at jsonlPath from startOffset (composes with WaitForSessionJSONL +
+// (idle / thinking / modal / mcp-failure / network-failure) and
+// per-entry JSONL events on a single unified channel in arrival
+// order. Internally tails the JSONL file at jsonlPath from
+// startOffset (composes with WaitForSessionJSONL +
 // SessionJSONLPath); errors from the synchronous open/seek phase are
 // returned directly with the wrap shape TailJSONL provides. The
 // returned channel is buffered (capacity 32 — matches TailJSONL); it
@@ -101,7 +131,10 @@ type Event struct {
 // channel — at most one Event is emitted per select iteration; the
 // consumer sees a fully ordered stream. PTY-state polling cadence is
 // DefaultPollInterval (50 ms); idle/thinking events are suppressed
-// while a modal is active (the modal axis dominates).
+// while a modal is active (the modal axis dominates). The mcp-failure
+// and network-failure banner axes are independent: their Shown/Hidden
+// events fire regardless of modal state because the banners coexist
+// with modal/idle/thinking UI in the lower status area.
 //
 // Calling Events twice on one *Session spawns two independent merge
 // loops; both work but each polls the same buffer at the same
@@ -117,14 +150,17 @@ func (s *Session) Events(ctx context.Context, jsonlPath string, startOffset int6
 }
 
 // mergeEvents owns the unified merge loop. Polls snapshot at
-// pollInterval for PTY-state transitions (idle / thinking / modal),
-// drains entries from jsonlCh, and writes typed Event values to out
-// in arrival order. Closes out on every return path.
+// pollInterval for PTY-state transitions (idle / thinking / modal /
+// mcp-failure / network-failure), drains entries from jsonlCh, and
+// writes typed Event values to out in arrival order. Closes out on
+// every return path.
 //
 // The loop starts transition-blind (prev state all-zero); the first
 // tick emits whichever rising edges hold relative to that — a buffer
 // already idle at subscription fires EventKindPtyIdle on tick one. A
-// buffer already showing a modal fires EventKindPtyModalShown.
+// buffer already showing a modal fires EventKindPtyModalShown. The
+// mcp-failure and network-failure axes follow the same rising-edge
+// rule and are not suppressed by modal state.
 func mergeEvents(
 	ctx context.Context,
 	snapshot func() []byte,
@@ -136,11 +172,7 @@ func mergeEvents(
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
-	var (
-		prevIdle     bool
-		prevThinking bool
-		prevModal    ModalClass
-	)
+	var prev ptyState
 
 	// send delivers ev with backpressure-aware ctx-abort. Returns
 	// false on ctx cancellation; the caller returns from the loop.
@@ -181,36 +213,35 @@ func mergeEvents(
 				}
 			}
 		case <-ticker.C:
-			snap := snapshot()
-			curIdle, curThinking, curModal := classify(snap)
+			cur := classify(snapshot())
 			now := time.Now()
 			// Modal axis dominates: emit modal transitions first
 			// (Hidden before Shown on a class→class change), then
 			// idle/thinking only when no modal is active.
-			if curModal != prevModal {
-				if prevModal != ModalClassUnknown {
+			if cur.modal != prev.modal {
+				if prev.modal != ModalClassUnknown {
 					if !send(Event{
 						Kind:   EventKindPtyModalHidden,
 						Source: EventSourcePty,
 						Time:   now,
-						Modal:  prevModal,
+						Modal:  prev.modal,
 					}) {
 						return
 					}
 				}
-				if curModal != ModalClassUnknown {
+				if cur.modal != ModalClassUnknown {
 					if !send(Event{
 						Kind:   EventKindPtyModalShown,
 						Source: EventSourcePty,
 						Time:   now,
-						Modal:  curModal,
+						Modal:  cur.modal,
 					}) {
 						return
 					}
 				}
 			}
-			if curModal == ModalClassUnknown {
-				if curIdle && !prevIdle {
+			if cur.modal == ModalClassUnknown {
+				if cur.idle && !prev.idle {
 					if !send(Event{
 						Kind:   EventKindPtyIdle,
 						Source: EventSourcePty,
@@ -219,7 +250,7 @@ func mergeEvents(
 						return
 					}
 				}
-				if curThinking && !prevThinking {
+				if cur.thinking && !prev.thinking {
 					if !send(Event{
 						Kind:   EventKindPtyThinking,
 						Source: EventSourcePty,
@@ -229,17 +260,69 @@ func mergeEvents(
 					}
 				}
 			}
-			prevIdle = curIdle
-			prevThinking = curThinking
-			prevModal = curModal
+			// Banner axes are independent of modal state — they fire
+			// whenever the boolean flips, even with a modal up or the
+			// spinner running. Internal emission order (MCP then
+			// network) is not part of the public contract.
+			if cur.mcpFailure && !prev.mcpFailure {
+				if !send(Event{
+					Kind:   EventKindPtyMcpFailureShown,
+					Source: EventSourcePty,
+					Time:   now,
+				}) {
+					return
+				}
+			} else if !cur.mcpFailure && prev.mcpFailure {
+				if !send(Event{
+					Kind:   EventKindPtyMcpFailureHidden,
+					Source: EventSourcePty,
+					Time:   now,
+				}) {
+					return
+				}
+			}
+			if cur.networkFailure && !prev.networkFailure {
+				if !send(Event{
+					Kind:   EventKindPtyNetworkFailureShown,
+					Source: EventSourcePty,
+					Time:   now,
+				}) {
+					return
+				}
+			} else if !cur.networkFailure && prev.networkFailure {
+				if !send(Event{
+					Kind:   EventKindPtyNetworkFailureHidden,
+					Source: EventSourcePty,
+					Time:   now,
+				}) {
+					return
+				}
+			}
+			prev = cur
 		}
 	}
 }
 
-// classify reduces snap to the three independent PTY-state axes the
-// merge loop tracks. Each predicate strips ANSI internally; the snap
-// is bounded by DefaultBufferCap (4 KB) so the cost of stripping
-// thrice per tick is negligible.
-func classify(snap []byte) (idle bool, thinking bool, modal ModalClass) {
-	return IsIdle(snap), IsThinking(snap), DetectModalClass(snap)
+// ptyState is one tick's PTY-derived classification across the axes
+// the merge loop tracks. Internal to events.go — never exported.
+type ptyState struct {
+	idle           bool
+	thinking       bool
+	modal          ModalClass
+	mcpFailure     bool
+	networkFailure bool
+}
+
+// classify reduces snap to the independent PTY-state axes the merge
+// loop tracks. Each predicate strips ANSI internally; the snap is
+// bounded by DefaultBufferCap (4 KB) so the cost of stripping per
+// tick is negligible.
+func classify(snap []byte) ptyState {
+	return ptyState{
+		idle:           IsIdle(snap),
+		thinking:       IsThinking(snap),
+		modal:          DetectModalClass(snap),
+		mcpFailure:     HasMcpFailureBanner(snap),
+		networkFailure: HasNetworkFailure(snap),
+	}
 }

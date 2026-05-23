@@ -349,6 +349,172 @@ func TestMergeEvents_JsonlChClosureClosesOutput(t *testing.T) {
 	}
 }
 
+func TestMergeEvents_McpFailureBannerTransitions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	snap := &testSnap{}
+	jsonlCh := make(chan JSONLEntry)
+	out := make(chan Event, defaultEventBuffer)
+	go mergeEvents(ctx, snap.Snapshot, jsonlCh, out, DefaultPollInterval)
+
+	// Phase 1: empty snap, no banner → no event within two ticks.
+	select {
+	case ev, ok := <-out:
+		if ok {
+			t.Fatalf("phase 1 got unexpected event %+v on empty snap", ev)
+		}
+		t.Fatalf("phase 1 channel closed unexpectedly")
+	case <-time.After(2 * DefaultPollInterval):
+	}
+
+	// Phase 2: banner appears → McpFailureShown fires once.
+	snap.Set([]byte("...1 MCP server failed · /mcp..."))
+	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyMcpFailureShown {
+		t.Errorf("phase 2 Kind = %v, want EventKindPtyMcpFailureShown", ev.Kind)
+	}
+	if ev.Source != EventSourcePty {
+		t.Errorf("phase 2 Source = %v, want EventSourcePty", ev.Source)
+	}
+	if ev.Time.IsZero() {
+		t.Errorf("phase 2 Time is zero, want non-zero wall-clock")
+	}
+	if ev.Modal != ModalClassUnknown {
+		t.Errorf("phase 2 Modal = %q, want unset (zero)", ev.Modal)
+	}
+
+	// Phase 3: banner clears → McpFailureHidden fires.
+	snap.Set([]byte("plain text"))
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyMcpFailureHidden {
+		t.Errorf("phase 3 Kind = %v, want EventKindPtyMcpFailureHidden", ev.Kind)
+	}
+	if ev.Source != EventSourcePty {
+		t.Errorf("phase 3 Source = %v, want EventSourcePty", ev.Source)
+	}
+
+	// Phase 4: banner reappears (different count, plural form) →
+	// McpFailureShown fires again (rising-edge semantics).
+	snap.Set([]byte("2 MCP servers failed"))
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyMcpFailureShown {
+		t.Errorf("phase 4 Kind = %v, want EventKindPtyMcpFailureShown", ev.Kind)
+	}
+
+	cancel()
+	assertEventChClosed(t, out, 500*time.Millisecond)
+}
+
+func TestMergeEvents_NetworkFailureTransitions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	snap := &testSnap{}
+	jsonlCh := make(chan JSONLEntry)
+	out := make(chan Event, defaultEventBuffer)
+	go mergeEvents(ctx, snap.Snapshot, jsonlCh, out, DefaultPollInterval)
+
+	// Phase 1: empty snap → no event.
+	select {
+	case ev, ok := <-out:
+		if ok {
+			t.Fatalf("phase 1 got unexpected event %+v on empty snap", ev)
+		}
+		t.Fatalf("phase 1 channel closed unexpectedly")
+	case <-time.After(2 * DefaultPollInterval):
+	}
+
+	// Phase 2: anchor appears → NetworkFailureShown fires once.
+	snap.Set([]byte("...FailedToOpenSocket..."))
+	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyNetworkFailureShown {
+		t.Errorf("phase 2 Kind = %v, want EventKindPtyNetworkFailureShown", ev.Kind)
+	}
+	if ev.Source != EventSourcePty {
+		t.Errorf("phase 2 Source = %v, want EventSourcePty", ev.Source)
+	}
+	if ev.Time.IsZero() {
+		t.Errorf("phase 2 Time is zero, want non-zero wall-clock")
+	}
+
+	// Phase 3: anchor clears → NetworkFailureHidden fires.
+	snap.Set([]byte("recovered"))
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyNetworkFailureHidden {
+		t.Errorf("phase 3 Kind = %v, want EventKindPtyNetworkFailureHidden", ev.Kind)
+	}
+
+	// Phase 4: ANSI-wrapped reappearance → NetworkFailureShown again.
+	snap.Set([]byte("\x1b[31mFailedToOpenSocket\x1b[0m"))
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyNetworkFailureShown {
+		t.Errorf("phase 4 Kind = %v, want EventKindPtyNetworkFailureShown", ev.Kind)
+	}
+
+	cancel()
+	assertEventChClosed(t, out, 500*time.Millisecond)
+}
+
+func TestMergeEvents_BannerCoexistsWithIdleAndModal(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	snap := &testSnap{}
+	jsonlCh := make(chan JSONLEntry)
+	out := make(chan Event, defaultEventBuffer)
+	go mergeEvents(ctx, snap.Snapshot, jsonlCh, out, DefaultPollInterval)
+
+	// Phase 1: idle glyph AND banner in one snapshot. Expect two events
+	// in the same tick: PtyIdle and McpFailureShown. Internal emission
+	// order is not contract — collect both into a set before asserting.
+	snap.Set([]byte("\xe2\x9d\xaf input ... 1 MCP server failed · /mcp"))
+	got := map[EventKind]bool{}
+	for i := 0; i < 2; i++ {
+		ev := mustReceiveEvent(t, out, 500*time.Millisecond)
+		if ev.Source != EventSourcePty {
+			t.Errorf("phase 1 event %d Source = %v, want EventSourcePty", i, ev.Source)
+		}
+		got[ev.Kind] = true
+	}
+	if !got[EventKindPtyIdle] {
+		t.Errorf("phase 1 missing EventKindPtyIdle, got %v", got)
+	}
+	if !got[EventKindPtyMcpFailureShown] {
+		t.Errorf("phase 1 missing EventKindPtyMcpFailureShown, got %v", got)
+	}
+
+	// Phase 2: permission modal anchor + banner still present. Modal
+	// axis flips Unknown → Permission (Shown fires); banner unchanged
+	// (no Hidden); idle/thinking suppressed under modal. Expect exactly
+	// one event: ModalShown(Permission). Critically, no
+	// McpFailureHidden — modal does not suppress the banner axis.
+	snap.Set([]byte("Do you want to proceed ... 1 MCP server failed · /mcp"))
+	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyModalShown {
+		t.Errorf("phase 2 Kind = %v, want EventKindPtyModalShown", ev.Kind)
+	}
+	if ev.Modal != ModalClassPermission {
+		t.Errorf("phase 2 Modal = %q, want %q", ev.Modal, ModalClassPermission)
+	}
+	select {
+	case extra, ok := <-out:
+		if !ok {
+			t.Fatalf("phase 2 channel closed unexpectedly")
+		}
+		t.Fatalf("phase 2 unexpected follow-up event %+v (banner should still be shown)", extra)
+	case <-time.After(2 * DefaultPollInterval):
+	}
+
+	// Phase 3: modal still up, banner gone. Expect exactly one event:
+	// McpFailureHidden. Modal axis unchanged → no modal event.
+	snap.Set([]byte("Do you want to proceed"))
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyMcpFailureHidden {
+		t.Errorf("phase 3 Kind = %v, want EventKindPtyMcpFailureHidden", ev.Kind)
+	}
+
+	cancel()
+	assertEventChClosed(t, out, 500*time.Millisecond)
+}
+
 func TestEvents_TailJSONLErrorBubbles(t *testing.T) {
 	s := &Session{Buffer: NewBuffer(0)}
 	missing := filepath.Join(t.TempDir(), "nonexistent", "x.jsonl")
