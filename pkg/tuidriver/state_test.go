@@ -146,3 +146,78 @@ func TestParseSpinnerTokensIgnoresUnrelatedTokensText(t *testing.T) {
 		t.Errorf("matched unrelated 'tokens' text")
 	}
 }
+
+func TestParseSpinnerClassAMatches(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       []byte
+		wantVerb string
+		wantSecs int
+	}{
+		{
+			"class A — single-word verb",
+			[]byte("\xe2\x9c\xbb Baked for 2s"),
+			"Baked",
+			2,
+		},
+		{
+			"class A — two-word verb",
+			[]byte("\xe2\x9c\xbb Quick witted for 13s"),
+			"Quick witted",
+			13,
+		},
+		{
+			"class A — minutes + seconds",
+			[]byte("\xe2\x9c\xbb Baked for 2m 5s"),
+			"Baked",
+			125,
+		},
+		{
+			"class A — ANSI-wrapped spinner glyph",
+			[]byte("\x1b[2K\x1b[1G\xe2\x9c\xbb Baked for 2s"),
+			"Baked",
+			2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			verb, secs, ok := ParseSpinner(tc.in)
+			if !ok {
+				t.Fatalf("ParseSpinner(%q) returned ok=false", tc.in)
+			}
+			if verb != tc.wantVerb {
+				t.Errorf("verb = %q, want %q", verb, tc.wantVerb)
+			}
+			if secs != tc.wantSecs {
+				t.Errorf("totalSeconds = %d, want %d", secs, tc.wantSecs)
+			}
+		})
+	}
+}
+
+func TestParseSpinnerNonClassA(t *testing.T) {
+	// Classes B (`✻ Channeling…`), C (`✻ Verb… (Ns · ↓N tokens)`), and
+	// snapshots without the spinner glyph all return ok=false. The
+	// regex requires the literal `for` keyword that only class A emits.
+	cases := []struct {
+		name string
+		in   []byte
+	}{
+		{"class B — ellipsis only", []byte("\xe2\x9c\xbb Channeling…")},
+		{"class C — parens + bullet", []byte("\xe2\x9c\xbb Actualizing… (2s · ↓1 tokens)")},
+		{"no spinner glyph", []byte("\xe2\x9d\xaf ready")},
+		{"empty snapshot", []byte("")},
+		{"nil snapshot", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			verb, secs, ok := ParseSpinner(tc.in)
+			if ok {
+				t.Errorf("ParseSpinner(%q) = (%q, %d, true), want (\"\", 0, false)", tc.in, verb, secs)
+			}
+			if verb != "" || secs != 0 {
+				t.Errorf("ParseSpinner(%q) returned non-zero (%q, %d) with ok=false", tc.in, verb, secs)
+			}
+		})
+	}
+}

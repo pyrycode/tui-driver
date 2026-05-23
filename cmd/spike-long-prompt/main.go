@@ -30,8 +30,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,7 +40,6 @@ import (
 
 const (
 	sessionFileWait    = 10 * time.Second
-	watchdogTick       = 1 * time.Second
 	ptyQuietLimit      = 60 * time.Second
 	spinnerFreezeLimit = 30 * time.Second
 	shutdownGrace      = 3 * time.Second
@@ -57,11 +54,6 @@ const (
 
 //go:embed testdata/long-prompt.txt
 var promptFixture string
-
-// spinnerRe matches the thinking indicator. The verb (group 1) is 1–2 words and
-// varies per prompt — capture it for the empirical log; do NOT depend on any
-// specific value. Time-tail is `Ns` or `Nm Ns` (groups 2,3).
-var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
 
 func main() {
 	sessionIDFlag := flag.String("session-id", "", "UUID to pin claude's session ID and JSONL filename (default: generate one)")
@@ -140,23 +132,9 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(watchdogTick)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-rootCtx.Done():
-				return
-			case <-ticker.C:
-				snap := rb.Snapshot()
-				stripped := tuidriver.StripANSI(snap)
-				_, total, ok := matchSpinner(stripped)
-				tr.ObserveSpinner(ok, total)
-				if werr := tr.CheckWatchdog(rb); werr != nil {
-					logger.Printf("%v", werr)
-					cancelCause(werr)
-					return
-				}
-			}
+		if err := tuidriver.RunWatchdog(rootCtx, rb, tr, tuidriver.WatchdogOpts{}); err != nil {
+			logger.Printf("%v", err)
+			cancelCause(err)
 		}
 	}()
 
@@ -239,15 +217,15 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 				continue
 			}
 			// The library's PtyThinking event fires on ✻ glyph presence;
-			// the spike gates `thinkingObserved` on the local regex
-			// matching the verb. Reason: the rolling buffer (4 KB)
-			// retains the ✻ bytes past the visual end-of-spinner, so the
-			// library's IsIdle predicate (✻-absent) often never flips
-			// back to true for short turns. Gating on regex-match
-			// preserves the pre-refactor fast-path skip-through
-			// (gotEndTurn && !thinkingObserved) when the regex misses
-			// (the documented class-C case; spike-one-turn finding #8).
-			v, _, ok := matchSpinner(tuidriver.StripANSI(rb.Snapshot()))
+			// the spike gates `thinkingObserved` on ParseSpinner matching
+			// the verb. Reason: the rolling buffer (4 KB) retains the ✻
+			// bytes past the visual end-of-spinner, so the library's
+			// IsIdle predicate (✻-absent) often never flips back to true
+			// for short turns. Gating on ParseSpinner match preserves the
+			// pre-refactor fast-path skip-through (gotEndTurn &&
+			// !thinkingObserved) when ParseSpinner misses (the documented
+			// class-C case; spike-one-turn finding #8).
+			v, _, ok := tuidriver.ParseSpinner(rb.Snapshot())
 			if !ok {
 				continue
 			}
@@ -295,21 +273,6 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 
 	logger.Printf("complete elapsed=%s", time.Since(startedAt).Round(time.Millisecond))
 	return nil
-}
-
-// --- pattern matching ---
-
-func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
-	m := spinnerRe.FindSubmatch(stripped)
-	if m == nil {
-		return "", 0, false
-	}
-	var minutes int
-	if len(m[2]) > 0 {
-		minutes, _ = strconv.Atoi(string(m[2]))
-	}
-	seconds, _ := strconv.Atoi(string(m[3]))
-	return string(m[1]), minutes*60 + seconds, true
 }
 
 // resolveSession turns the operator-supplied flag into a normalised session ID.
