@@ -73,10 +73,6 @@ const (
 	askUserQuestionLimit = 60 * time.Second
 	postAnswerLimit      = 60 * time.Second
 	settleWindow         = 1500 * time.Millisecond
-
-	// clearLineSettle: brief pause after Ctrl-U so the input handler can
-	// process the line-kill before the next byte arrives.
-	clearLineSettle = 50 * time.Millisecond
 )
 
 var oscRe = regexp.MustCompile(`\x1b\][^\x07]*\x07`)
@@ -198,10 +194,10 @@ func run(prompt, trustFolderPolicy, answer string) error {
 	// when it arrives in the same buffered write as a long prompt body,
 	// per the empirical finding documented in docs/knowledge/codebase/9.md.
 	// Matches the typePrompt convention used by every other spike.
-	if err := clearInputLine(ptmx); err != nil {
+	if err := session.ClearInputLine(); err != nil {
 		return fmt.Errorf("clear input line: %w", err)
 	}
-	if err := typePrompt(ptmx, prompt); err != nil {
+	if err := session.TypePrompt(prompt); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
 	}
 	tr.RecordTransition("prompt-written")
@@ -436,33 +432,3 @@ func isEndTurn(ev map[string]any) bool {
 	return stop == "end_turn"
 }
 
-// clearInputLine sends Ctrl-U (0x15, kill-to-beginning-of-line) so any
-// drafted text left in claude's input box is cleared before the next
-// prompt is typed. Idempotent on an empty input. Copied from
-// cmd/spike-cancel/main.go — keep in sync until library extraction.
-func clearInputLine(ptmx *os.File) error {
-	if _, err := ptmx.Write([]byte{0x15}); err != nil {
-		return err
-	}
-	time.Sleep(clearLineSettle)
-	return nil
-}
-
-// typePrompt writes the prompt one byte at a time with a 10 ms inter-byte
-// delay, then a 50 ms pause, then `\r`. Bulk-writing `prompt+"\r"` loses
-// the `\r` against long prompts on claude 2.1.148 — see finding #9.
-// Copied from cmd/spike-cancel/main.go — keep in sync until library
-// extraction.
-func typePrompt(ptmx *os.File, prompt string) error {
-	for i := 0; i < len(prompt); i++ {
-		if _, err := ptmx.Write([]byte{prompt[i]}); err != nil {
-			return err
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	time.Sleep(50 * time.Millisecond)
-	if _, err := ptmx.Write([]byte("\r")); err != nil {
-		return err
-	}
-	return nil
-}

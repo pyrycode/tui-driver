@@ -14,6 +14,26 @@ import (
 // spike binaries used.
 const DefaultShutdownGrace = 3 * time.Second
 
+// PromptInterByteDelay is the pause between bytes when TypePrompt writes a
+// prompt body. Empirical value from #71 / PR #77.
+const PromptInterByteDelay = 10 * time.Millisecond
+
+// PromptCommitSettle is the pause between the last prompt byte and the
+// trailing \r commit byte that TypePrompt writes. Empirical value from
+// #71 / PR #77.
+const PromptCommitSettle = 50 * time.Millisecond
+
+// ClearLineSettle is the pause after the Ctrl-U byte ClearInputLine writes,
+// allowing the input handler to process the line-kill before the next byte
+// arrives.
+const ClearLineSettle = 50 * time.Millisecond
+
+// sleepFn is the clock seam TypePrompt and ClearInputLine call instead of
+// time.Sleep directly. Tests swap this for a fake that records durations
+// so the inter-byte / settle timing can be asserted without wall-clock
+// dependence. Package-private — not a public knob.
+var sleepFn = time.Sleep
+
 // SpawnOpts configures Spawn.
 type SpawnOpts struct {
 	// Mirror, if non-nil, receives a copy of every PTY byte. Typical
@@ -157,6 +177,56 @@ func bracketedPaste(text string) []byte {
 	out = append(out, text...)
 	out = append(out, "\x1b[201~\r"...)
 	return out
+}
+
+// TypePrompt sends text to the PTY one byte at a time, waiting
+// PromptInterByteDelay between bytes, pausing PromptCommitSettle after the
+// body, then writing a single \r commit byte as a separate write. Use this
+// for short prompts (no newlines, well under ~1 KB); use WritePrompt for
+// long or multi-line prompts.
+//
+// Why: claude 2.1.148's TUI auto-paste-detection heuristic mis-classifies
+// fast bulk writes of short prompts. When tripped, the trailing \r is
+// absorbed into the paste body and the turn never commits, leaving claude
+// idle indefinitely. Spacing the bytes (and isolating the \r) keeps the
+// stream below the paste-detection threshold. Empirical fix from #71 /
+// PR #77, commit e7c3dd2.
+//
+// Single-byte or single-bulk-write keystrokes (e.g. ESC, "1\r" for a
+// permission modal) should still use Write — they are below the paste
+// heuristic by construction.
+//
+// Returns the first non-nil error from the underlying PTY write.
+func (s *Session) TypePrompt(text string) error {
+	for i := 0; i < len(text); i++ {
+		if _, err := s.PTY.Write([]byte{text[i]}); err != nil {
+			return err
+		}
+		sleepFn(PromptInterByteDelay)
+	}
+	sleepFn(PromptCommitSettle)
+	if _, err := s.PTY.Write([]byte("\r")); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ClearInputLine sends Ctrl-U (0x15, kill-to-beginning-of-line) to the PTY
+// and waits ClearLineSettle so the input handler can process the line-kill
+// before the next byte arrives. Idempotent on an empty input box.
+//
+// Why: after a cancel (or any wind-down that leaves drafted input in
+// claude's input area), the next TypePrompt would concatenate onto that
+// residue rather than starting fresh. Recommended before every TypePrompt
+// that follows a prior turn. See cmd/spike-cancel/README.md surprise 2.
+//
+// Returns the first non-nil error from the underlying PTY write.
+func (s *Session) ClearInputLine() error {
+	if _, err := s.PTY.Write([]byte{0x15}); err != nil {
+		return err
+	}
+	sleepFn(ClearLineSettle)
+	return nil
 }
 
 // Wait blocks until the underlying process exits. Returns the exit error
