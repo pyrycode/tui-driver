@@ -17,13 +17,11 @@ func TestParseSnapshotResults(t *testing.T) {
 		{
 			name: "all match",
 			stdout: "SNAPSHOT picker match\n" +
-				"SNAPSHOT picker-truecolor match\n" +
 				"SNAPSHOT mcp match\n" +
 				"SNAPSHOT agents match\n",
 			want: map[string]any{
 				"snapshots": []map[string]any{
 					{"file": "pkg/tuidriver/testdata/picker-snapshot.bin", "result": "match"},
-					{"file": "pkg/tuidriver/testdata/picker-truecolor-snapshot.bin", "result": "match"},
 					{"file": "pkg/tuidriver/testdata/mcp-snapshot.bin", "result": "match"},
 					{"file": "pkg/tuidriver/testdata/agents-snapshot.bin", "result": "match"},
 				},

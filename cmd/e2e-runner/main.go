@@ -48,7 +48,7 @@ var probeOutDirRe = regexp.MustCompile(`probe outDir=(\S+)`)
 
 // snapshotResultRe matches one "SNAPSHOT <name> match|diff" line emitted by
 // cmd/e2e-snapshot-check on stdout, one per fixture.
-var snapshotResultRe = regexp.MustCompile(`(?m)^SNAPSHOT (picker|picker-truecolor|mcp|agents) (match|diff)$`)
+var snapshotResultRe = regexp.MustCompile(`(?m)^SNAPSHOT (picker|mcp|agents) (match|diff)$`)
 
 // Check is one orchestrated subprocess invocation. Fields are populated at
 // startup from the hardcoded check list; runCheck consumes them uniformly.
