@@ -94,3 +94,56 @@ func ParseSpinnerTokens(snap []byte) (n int, ok bool) {
 	}
 	return v, true
 }
+
+// spinnerForRe matches claude's class-A spinner rendering (verb + time
+// counter): `✻ Verb for Ns` or `✻ Verb for Nm Ns`. The verb (group 1) is
+// 1–2 words and varies per prompt — its empirical value is logged but
+// no consumer depends on a specific verb. Groups 2 and 3 are the
+// optional minutes-tail and the seconds-tail respectively.
+//
+// Loop 2 B-3 catalogued the four spinner-class renderings claude emits:
+//
+//	`✻ Baked for 2s`                       (class A — verb + counter)
+//	`✻ Channeling…`                        (class B — verb + ellipsis)
+//	`✻ Actualizing… (2s · ↓1 tokens)`      (class C — verb + ellipsis + tokens)
+//	`✻ <full-sentence aphorism>`           (class D — unobserved as of 2026-05-23)
+//
+// This regex requires the literal `for` keyword so it matches class A
+// only — neither the parens-and-bullet form of class C nor the bare
+// ellipsis of classes B/D produce a match. The class gap is the
+// documented sibling of ParseSpinnerTokens's class-A/B gap.
+var spinnerForRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
+
+// ParseSpinner extracts the verb and total-seconds counter from claude's
+// class-A spinner rendering. Returns (verb, minutes*60+seconds, true) on
+// match and ("", 0, false) otherwise — including when the spinner is in
+// class B (no `for Ns` tail), class C (parentheses, not `for`), class D
+// (unobserved as of 2026-05-23), no spinner is visible, or the buffer
+// doesn't contain the marker. Strips ANSI internally.
+//
+// Consumer paths:
+//   - The verb is empirical telemetry, logged by every spike binary
+//     when the thinking-detected transition fires; no consumer makes a
+//     correctness decision on the verb's specific value.
+//   - The total-seconds counter feeds Tracker.ObserveSpinner — the
+//     spinner-freeze arm of Tracker.CheckWatchdog needs strictly-
+//     increasing readings while the spinner stays visible. A class-B or
+//     class-C snapshot returns ok=false, which ObserveSpinner treats
+//     identically to "spinner not visible" — the freeze arm goes dormant
+//     until a class-A rendering appears.
+//
+// Sibling extractor: ParseSpinnerTokens (over the same snapshot, extracts
+// the live token counter from class-C renderings). Both are class-
+// incomplete by construction.
+func ParseSpinner(snap []byte) (verb string, totalSeconds int, ok bool) {
+	m := spinnerForRe.FindSubmatch(StripANSI(snap))
+	if m == nil {
+		return "", 0, false
+	}
+	var minutes int
+	if len(m[2]) > 0 {
+		minutes, _ = strconv.Atoi(string(m[2]))
+	}
+	seconds, _ := strconv.Atoi(string(m[3]))
+	return string(m[1]), minutes*60 + seconds, true
+}
