@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -687,6 +688,112 @@ func TestAssistantText(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := AssistantText(tc.e); got != tc.want {
 				t.Errorf("AssistantText = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// assistantEntryWithUsage builds an assistant JSONLEntry whose
+// Message.Raw["usage"] is set to usage. usage of nil means the key is
+// omitted entirely (distinct from a present-but-empty map).
+func assistantEntryWithUsage(usage any) JSONLEntry {
+	raw := map[string]any{"role": "assistant"}
+	if usage != nil {
+		raw["usage"] = usage
+	}
+	return JSONLEntry{
+		Type:    "assistant",
+		Message: &EntryMessage{Raw: raw},
+	}
+}
+
+func TestAssistantUsage(t *testing.T) {
+	cases := []struct {
+		name string
+		e    JSONLEntry
+		want *Usage
+	}{
+		{
+			name: "assistant + usage with all four counters populated",
+			e: assistantEntryWithUsage(map[string]any{
+				"input_tokens":                float64(11),
+				"output_tokens":               float64(22),
+				"cache_creation_input_tokens": float64(33),
+				"cache_read_input_tokens":     float64(44),
+			}),
+			want: &Usage{
+				InputTokens:              11,
+				OutputTokens:             22,
+				CacheCreationInputTokens: 33,
+				CacheReadInputTokens:     44,
+			},
+		},
+		{
+			name: "assistant + usage map present but counter keys omitted",
+			e:    assistantEntryWithUsage(map[string]any{}),
+			want: &Usage{},
+		},
+		{
+			name: "assistant + usage with non-numeric counter — that counter zeroed",
+			e: assistantEntryWithUsage(map[string]any{
+				"input_tokens":                "lots",
+				"output_tokens":               float64(22),
+				"cache_creation_input_tokens": float64(33),
+				"cache_read_input_tokens":     float64(44),
+			}),
+			want: &Usage{
+				InputTokens:              0,
+				OutputTokens:             22,
+				CacheCreationInputTokens: 33,
+				CacheReadInputTokens:     44,
+			},
+		},
+		{
+			name: "assistant + no usage key in Message.Raw",
+			e:    assistantEntryWithUsage(nil),
+			want: nil,
+		},
+		{
+			name: "assistant + Raw[usage] of wrong shape (string)",
+			e:    assistantEntryWithUsage("not-a-map"),
+			want: nil,
+		},
+		{
+			name: "assistant + Raw[usage] of wrong shape (number)",
+			e:    assistantEntryWithUsage(float64(42)),
+			want: nil,
+		},
+		{
+			name: "assistant + nil Message",
+			e:    JSONLEntry{Type: "assistant", Message: nil},
+			want: nil,
+		},
+		{
+			name: "type=user + usage map present",
+			e: JSONLEntry{
+				Type: "user",
+				Message: &EntryMessage{Raw: map[string]any{
+					"usage": map[string]any{
+						"input_tokens":                float64(11),
+						"output_tokens":               float64(22),
+						"cache_creation_input_tokens": float64(33),
+						"cache_read_input_tokens":     float64(44),
+					},
+				}},
+			},
+			want: nil,
+		},
+		{
+			name: "zero-value entry",
+			e:    JSONLEntry{},
+			want: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := AssistantUsage(tc.e)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("AssistantUsage = %+v, want %+v", got, tc.want)
 			}
 		})
 	}
