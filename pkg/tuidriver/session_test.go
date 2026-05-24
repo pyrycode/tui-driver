@@ -25,9 +25,6 @@ func TestSpawnAndBufferReceivesOutput(t *testing.T) {
 	if err := s.Wait(); err != nil {
 		t.Fatalf("Wait: %v", err)
 	}
-	// Reader goroutine drains synchronously with the PTY close, but the
-	// PTY may take a beat to deliver the EOF after the child exits.
-	time.Sleep(50 * time.Millisecond)
 	got := string(s.Buffer.Snapshot())
 	if !strings.Contains(got, "hello") {
 		t.Errorf("Buffer.Snapshot = %q, want it to contain %q", got, "hello")
@@ -38,11 +35,6 @@ func TestSpawnMirrorReceivesOutput(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY tests skipped on Windows")
 	}
-	// Skipped: pre-existing race between the reader goroutine writing to
-	// mirror (session.go:103) and the test reading mirror.String() — Wait()
-	// does not synchronise on readerDone. Filed as #38; re-enable once that
-	// lands. Surfaced while running `go test -race` for #34.
-	t.Skip("blocked on #38 — Mirror buffer race between reader goroutine and test read")
 	var mirror bytes.Buffer
 	cmd := exec.Command("echo", "mirrored")
 	s, err := Spawn(cmd, SpawnOpts{Mirror: &mirror})
@@ -51,7 +43,6 @@ func TestSpawnMirrorReceivesOutput(t *testing.T) {
 	}
 	defer s.Close()
 	_ = s.Wait()
-	time.Sleep(50 * time.Millisecond)
 	if !strings.Contains(mirror.String(), "mirrored") {
 		t.Errorf("Mirror = %q, want it to contain %q", mirror.String(), "mirrored")
 	}
