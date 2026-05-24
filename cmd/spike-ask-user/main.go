@@ -32,18 +32,14 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"sync"
 	"time"
@@ -53,11 +49,7 @@ import (
 )
 
 const (
-	statePollInterval = 50 * time.Millisecond
-	jsonlTailInterval = 50 * time.Millisecond
-	sessionFileWait   = 10 * time.Second
-	sessionFilePoll   = 100 * time.Millisecond
-	watchdogTick      = 1 * time.Second
+	sessionFileWait = 10 * time.Second
 	// AskUserQuestion modals render then claude goes QUIET waiting for
 	// user input. The PTY-heartbeat semantic ("no bytes = wedge") wrongly
 	// fires in this state. Bumped to 120 s so the probe can capture the
@@ -76,7 +68,6 @@ const (
 )
 
 var oscRe = regexp.MustCompile(`\x1b\][^\x07]*\x07`)
-var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
 
 func main() {
 	promptFlag := flag.String("prompt", defaultPrompt, "prompt to send that should trigger AskUserQuestion")
@@ -101,14 +92,16 @@ func run(prompt, trustFolderPolicy, answer string) error {
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
 	startedAt := time.Now()
 
-	projDir, err := projectsDir()
+	home, err := os.UserHomeDir()
 	if err != nil {
-		return fmt.Errorf("resolve projects dir: %w", err)
+		return fmt.Errorf("resolve home dir: %w", err)
 	}
-	logger.Printf("projects-dir path=%s", projDir)
-
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("resolve cwd: %w", err)
+	}
 	sessionID := uuid.NewString()
-	jsonlPath := filepath.Join(projDir, sessionID+".jsonl")
+	jsonlPath := tuidriver.SessionJSONLPath(home, cwd, sessionID)
 	logger.Printf("session-id-resolved id=%s jsonl=%s", sessionID, jsonlPath)
 
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
@@ -143,23 +136,9 @@ func run(prompt, trustFolderPolicy, answer string) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(watchdogTick)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-rootCtx.Done():
-				return
-			case <-ticker.C:
-				snap := rb.Snapshot()
-				stripped := tuidriver.StripANSI(snap)
-				_, total, ok := matchSpinner(stripped)
-				tr.ObserveSpinner(ok, total)
-				if werr := tr.CheckWatchdog(rb); werr != nil {
-					logger.Printf("%v", werr)
-					cancelCause(werr)
-					return
-				}
-			}
+		if err := tuidriver.RunWatchdog(rootCtx, rb, tr, tuidriver.WatchdogOpts{}); err != nil {
+			logger.Printf("%v", err)
+			cancelCause(err)
 		}
 	}()
 
@@ -205,22 +184,18 @@ func run(prompt, trustFolderPolicy, answer string) error {
 
 	// Tail JSONL from start; the deterministic --session-id path means we
 	// know exactly where to look.
-	if err := openSessionJSONL(jsonlPath); err != nil {
-		return fmt.Errorf("open session jsonl: %w", err)
+	jsonlCtx, jsonlCancel := context.WithTimeout(rootCtx, sessionFileWait)
+	jsonlErr := tuidriver.WaitForSessionJSONL(jsonlCtx, jsonlPath)
+	jsonlCancel()
+	if jsonlErr != nil {
+		return fmt.Errorf("open session jsonl: %w", jsonlErr)
 	}
 	logger.Printf("session-jsonl-opened path=%s", jsonlPath)
 
-	eventCh := make(chan map[string]any, 32)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if terr := tailJSONL(rootCtx, logger, jsonlPath, 0, eventCh); terr != nil {
-			if !errors.Is(terr, context.Canceled) {
-				logger.Printf("jsonl-tailer-error err=%v", terr)
-				cancelCause(terr)
-			}
-		}
-	}()
+	eventCh, terr := tuidriver.TailJSONL(rootCtx, jsonlPath, 0)
+	if terr != nil {
+		return fmt.Errorf("open events stream: %w", terr)
+	}
 
 	// Detect AskUserQuestion modal via PTY (zero JSONL footprint pre-answer,
 	// same as permission modal per finding #15). The modal's unique marker
@@ -292,8 +267,15 @@ func run(prompt, trustFolderPolicy, answer string) error {
 		select {
 		case <-rootCtx.Done():
 			return context.Cause(rootCtx)
-		case ev := <-eventCh:
-			if isEndTurn(ev) {
+		case ev, ok := <-eventCh:
+			if !ok {
+				eventCh = nil
+				continue
+			}
+			if ev.Type != "assistant" {
+				continue
+			}
+			if tuidriver.IsEndTurn(ev) {
 				gotEnd = true
 				tr.RecordTransition("end-turn-detected")
 				logger.Printf("end-turn-detected")
@@ -340,95 +322,5 @@ func hasAskUserModal(snap []byte) bool {
 	stripped := tuidriver.StripANSI(snap)
 	return bytes.Contains(stripped, []byte("Enter to select")) ||
 		bytes.Contains(stripped, []byte("Entertoselect"))
-}
-
-func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
-	m := spinnerRe.FindSubmatch(stripped)
-	if m == nil {
-		return "", 0, false
-	}
-	verb = string(m[1])
-	if len(m[3]) > 0 {
-		fmt.Sscanf(string(m[3]), "%d", &totalSeconds)
-		if len(m[2]) > 0 {
-			var minutes int
-			fmt.Sscanf(string(m[2]), "%d", &minutes)
-			totalSeconds += minutes * 60
-		}
-	}
-	return verb, totalSeconds, true
-}
-
-func projectsDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".claude", "projects", tuidriver.EncodeCwd(cwd)), nil
-}
-
-
-func openSessionJSONL(path string) error {
-	deadline := time.Now().Add(sessionFileWait)
-	for {
-		if _, err := os.Stat(path); err == nil {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("session JSONL did not appear at %s within %s", path, sessionFileWait)
-		}
-		time.Sleep(sessionFilePoll)
-	}
-}
-
-func tailJSONL(ctx context.Context, logger *log.Logger, path string, startOffset int64, out chan<- map[string]any) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", path, err)
-	}
-	defer f.Close()
-	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
-		return fmt.Errorf("seek: %w", err)
-	}
-	rd := bufio.NewReader(f)
-	for {
-		line, rerr := rd.ReadBytes('\n')
-		if len(line) > 0 && line[len(line)-1] == '\n' {
-			var obj map[string]any
-			if jerr := json.Unmarshal(line, &obj); jerr != nil {
-				logger.Printf("jsonl-parse-warning err=%v", jerr)
-				continue
-			}
-			if _, ok := obj["message"].(map[string]any); !ok {
-				continue
-			}
-			if t, _ := obj["type"].(string); t != "assistant" {
-				continue
-			}
-			select {
-			case out <- obj:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		} else if rerr == io.EOF {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(jsonlTailInterval):
-			}
-		} else {
-			return fmt.Errorf("read: %w", rerr)
-		}
-	}
-}
-
-func isEndTurn(ev map[string]any) bool {
-	msg, _ := ev["message"].(map[string]any)
-	stop, _ := msg["stop_reason"].(string)
-	return stop == "end_turn"
 }
 

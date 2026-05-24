@@ -19,9 +19,7 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -39,12 +37,10 @@ import (
 )
 
 const (
-	statePollInterval  = 50 * time.Millisecond
-	jsonlTailInterval  = 50 * time.Millisecond
-	sessionFileWait    = 30 * time.Second // longer than spike-one-turn — hangs can delay JSONL creation
-	sessionFilePoll    = 100 * time.Millisecond
-	wallTimeout        = 3 * time.Minute
-	hangThreshold      = 10 * time.Second // first-assistant > this → flag as hang in summary
+	statePollInterval = 50 * time.Millisecond
+	sessionFileWait   = 30 * time.Second // longer than spike-one-turn — hangs can delay JSONL creation
+	wallTimeout       = 3 * time.Minute
+	hangThreshold     = 10 * time.Second // first-assistant > this → flag as hang in summary
 
 	promptText = "ready?\r"
 )
@@ -130,7 +126,7 @@ func run(trustFolderPolicy string) error {
 
 	home, _ := os.UserHomeDir()
 	cwd, _ := os.Getwd()
-	jsonlPath := filepath.Join(home, ".claude", "projects", tuidriver.EncodeCwd(cwd), sessionID+".jsonl")
+	jsonlPath := tuidriver.SessionJSONLPath(home, cwd, sessionID)
 	logger.Printf("expected-jsonl=%s", jsonlPath)
 
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
@@ -216,32 +212,54 @@ func run(trustFolderPolicy string) error {
 	recordMarker("prompt-written")
 
 	// Wait for JSONL.
-	if err := openSessionJSONL(rootCtx, jsonlPath); err != nil {
-		return fmt.Errorf("open session jsonl: %w", err)
+	jsonlCtx, jsonlCancel := context.WithTimeout(rootCtx, sessionFileWait)
+	jsonlErr := tuidriver.WaitForSessionJSONL(jsonlCtx, jsonlPath)
+	jsonlCancel()
+	if jsonlErr != nil {
+		return fmt.Errorf("open session jsonl: %w", jsonlErr)
 	}
 	recordMarker("session-jsonl-appeared")
 
 	// Tail JSONL — ALL events, no filter. Log every line with timestamp,
 	// extract deferred_tools_delta specifics.
+	eventCh, terr := tuidriver.TailJSONL(rootCtx, jsonlPath, 0)
+	if terr != nil {
+		return fmt.Errorf("open events stream: %w", terr)
+	}
 	var wg sync.WaitGroup
 	wg.Add(1)
 	gotFirstAssistant := false
 	gotEndTurn := false
 	go func() {
 		defer wg.Done()
-		_ = tailJSONLAll(rootCtx, jsonlLog, recordMarker, jsonlPath, startedAt,
-			func(ev map[string]any) {
-				t, _ := ev["type"].(string)
-				if t == "assistant" && !gotFirstAssistant {
-					gotFirstAssistant = true
-					recordMarker("first-assistant-event")
+		for ev := range eventCh {
+			fmt.Fprintf(jsonlLog, "[+%9.3fs] %s\n", time.Since(startedAt).Seconds(), ev.RawLine)
+			if ev.Type == "attachment" {
+				if att, _ := ev.Raw["attachment"].(map[string]any); att != nil {
+					if atype, _ := att["type"].(string); atype == "deferred_tools_delta" {
+						if pending, ok := att["pendingMcpServers"].([]any); ok {
+							names := make([]string, 0, len(pending))
+							for _, p := range pending {
+								if s, ok := p.(string); ok {
+									names = append(names, s)
+								}
+							}
+							recordMarker(fmt.Sprintf("deferred_tools_delta pending=%d [%s]",
+								len(names), strings.Join(names, ",")))
+						}
+					}
 				}
-				if t == "assistant" && isEndTurn(ev) && !gotEndTurn {
-					gotEndTurn = true
-					recordMarker("end-turn-detected")
-					cancelCause(errors.New("end-turn reached"))
-				}
-			})
+			}
+			if ev.Type == "assistant" && !gotFirstAssistant {
+				gotFirstAssistant = true
+				recordMarker("first-assistant-event")
+			}
+			if ev.Type == "assistant" && tuidriver.IsEndTurn(ev) && !gotEndTurn {
+				gotEndTurn = true
+				recordMarker("end-turn-detected")
+				cancelCause(errors.New("end-turn reached"))
+			}
+		}
 	}()
 
 	// Block until either end-turn fires (cancelCause above) or wall timeout.
@@ -315,96 +333,3 @@ func (w *timestampedWriter) Write(p []byte) (int, error) {
 	return w.base.Write(p)
 }
 
-func openSessionJSONL(ctx context.Context, jsonlPath string) error {
-	deadline := time.Now().Add(sessionFileWait)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		_, err := os.Stat(jsonlPath)
-		if err == nil {
-			return nil
-		}
-		if !os.IsNotExist(err) {
-			return err
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("jsonl never appeared at %s within %s", jsonlPath, sessionFileWait)
-		}
-		time.Sleep(sessionFilePoll)
-	}
-}
-
-// tailJSONLAll reads every line, writes it timestamp-prefixed to jsonlLog,
-// extracts and surfaces deferred_tools_delta.pendingMcpServers as marker
-// events, and feeds parsed events through onEvent for higher-level marker
-// tracking (first-assistant, end-turn).
-func tailJSONLAll(
-	ctx context.Context,
-	jsonlLog io.Writer,
-	recordMarker func(string),
-	path string,
-	startedAt time.Time,
-	onEvent func(map[string]any),
-) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	reader := bufio.NewReader(f)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		line, rerr := reader.ReadString('\n')
-		if len(line) > 0 {
-			dt := time.Since(startedAt).Seconds()
-			fmt.Fprintf(jsonlLog, "[+%9.3fs] %s", dt, line)
-			trimmed := strings.TrimRight(line, "\r\n")
-			if trimmed != "" {
-				var ev map[string]any
-				if jerr := json.Unmarshal([]byte(trimmed), &ev); jerr == nil {
-					// Surface deferred_tools_delta.pendingMcpServers as
-					// explicit marker events — these are the headline data.
-					if t, _ := ev["type"].(string); t == "attachment" {
-						if att, _ := ev["attachment"].(map[string]any); att != nil {
-							if atype, _ := att["type"].(string); atype == "deferred_tools_delta" {
-								if pending, ok := att["pendingMcpServers"].([]any); ok {
-									names := make([]string, 0, len(pending))
-									for _, p := range pending {
-										if s, ok := p.(string); ok {
-											names = append(names, s)
-										}
-									}
-									recordMarker(fmt.Sprintf("deferred_tools_delta pending=%d [%s]",
-										len(names), strings.Join(names, ",")))
-								}
-							}
-						}
-					}
-					onEvent(ev)
-				}
-			}
-		}
-		if rerr == nil {
-			continue
-		}
-		if rerr == io.EOF {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(jsonlTailInterval):
-			}
-			continue
-		}
-		return rerr
-	}
-}
-
-func isEndTurn(ev map[string]any) bool {
-	msg, _ := ev["message"].(map[string]any)
-	stop, _ := msg["stop_reason"].(string)
-	return stop == "end_turn"
-}
