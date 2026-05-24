@@ -6,8 +6,9 @@
 //	→ open the session JSONL claude already created at startup and record its size
 //	→ write "What is 2+2?\r"
 //	→ start JSONL tailer (seek to recorded offset, then tail appended lines)
-//	→ wait for the ✻ spinner regex (thinking)
-//	→ wait for BOTH: spinner gone AND assistant event with stop_reason=="end_turn"
+//	→ wait for assistant event with stop_reason=="end_turn"
+//	  AND ❯ idle glyph visible in the rolling buffer
+//	  AND PTY quiet for ptyQuietWindow (1.5 s) — see #97 rationale
 //	→ concatenate every content[].text on that record → SUCCESS: <text>
 //	→ SIGTERM (3 s grace) → SIGKILL → close PTY → wg.Wait
 //
@@ -48,6 +49,11 @@ const (
 	ptyQuietLimit      = 60 * time.Second
 	spinnerFreezeLimit = 30 * time.Second
 	shutdownGrace      = 3 * time.Second
+
+	// ptyQuietWindow: see cmd/spike-cancel/main.go:81-90 for the empirical
+	// derivation. Reused unchanged across cmd/spike-multi-turn (#73),
+	// cmd/spike-permission (#70), and cmd/spike-cancel itself (#11/#69).
+	ptyQuietWindow = 1500 * time.Millisecond
 
 	promptText = "What is 2+2?\r"
 )
@@ -209,21 +215,53 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 		}
 	}()
 
-	// Terminate on JSONL end_turn. Spinner observation is opportunistic: the
-	// slow path emits thinking-detected → spinner-gone; the fast path skips
-	// both (trivial prompts can resolve before the spinner renders, and even
-	// when it does render, finding #8 currently blocks regex match). The
-	// thinkingObserved && !spinnerGone guard preserves slow-path log order.
+	// Wait for turn complete via a three-clause conjunction: (a) JSONL has
+	// surfaced an assistant message with stop_reason=end_turn, (b) the ❯
+	// idle glyph is present in the stripped rolling buffer, AND (c) the PTY
+	// has been quiet for at least ptyQuietWindow. All three are load-
+	// bearing — JSONL end_turn says "model done speaking"; ❯-present says
+	// "input prompt is on screen"; PTY-quiescence says "claude has stopped
+	// redrawing."
+	//
+	// We deliberately do NOT use tuidriver.IsIdle here. IsIdle's spinner-
+	// absent half is exactly what wedges this spike on claude 2.1.150:
+	// a stuck `✻ <verb> for Ns` glyph stays painted in the 4 KB rolling
+	// buffer (pkg/tuidriver/buffer.go:8-13) because post-end_turn claude
+	// doesn't emit enough bytes to roll it past the cap. Any predicate
+	// composed against "spinner absent" wedges the same way — the previous
+	// `gotEndTurn && (!thinkingObserved || spinnerGone)` shape that lived
+	// here was exactly that, and #97 documents the 1/5 failure rate it
+	// produced before this swap. PTY-quiescence subsumes the safety
+	// property the spinner-absent clause was meant to provide: when claude
+	// has emitted zero bytes for 1.5 s it has by definition stopped
+	// redrawing the spinner (or anything else), so it is safe to act on
+	// the JSONL-side end_turn. PTY-quiescence is strictly stronger than a
+	// glyph-absence-on-buffer debounce on the rendering-activity axis —
+	// 1500 ms of zero bytes cannot be faked by a transient buffer state.
+	//
+	// Same predicate shape as cmd/spike-multi-turn/main.go:391-400, which
+	// adopted PTY-quiescence in #73 / PR #74 against the identical stuck-
+	// glyph-in-rolling-buffer failure mode (see cmd/spike-cancel/main.go:
+	// 81-90 for the empirical derivation of the 1500 ms window).
 	var (
-		thinkingObserved bool
-		thinkingVerb     string
-		spinnerGone      bool
-		gotEndTurn       bool
-		assistantText    string
+		gotEndTurn    bool
+		assistantText string
 	)
-	probe := time.NewTicker(statePollInterval)
-	defer probe.Stop()
-	for !(gotEndTurn && (!thinkingObserved || spinnerGone)) {
+
+	check := func() bool {
+		if !gotEndTurn {
+			return false
+		}
+		stripped := tuidriver.StripANSI(rb.Snapshot())
+		if !bytes.Contains(stripped, tuidriver.IdleGlyph) {
+			return false
+		}
+		return rb.QuietFor() >= ptyQuietWindow
+	}
+
+	ticker := time.NewTicker(statePollInterval)
+	defer ticker.Stop()
+	for !check() {
 		select {
 		case <-rootCtx.Done():
 			return fmt.Errorf("wait termination: %w", context.Cause(rootCtx))
@@ -234,20 +272,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 				tr.RecordTransition("end-turn-detected")
 				logger.Printf("end-turn-detected")
 			}
-		case <-probe.C:
-			stripped := tuidriver.StripANSI(rb.Snapshot())
-			v, _, ok := matchSpinner(stripped)
-			switch {
-			case ok && !thinkingObserved:
-				thinkingVerb = v
-				thinkingObserved = true
-				tr.RecordTransition("thinking-detected")
-				logger.Printf("thinking-detected verb=%q", thinkingVerb)
-			case !ok && thinkingObserved && !spinnerGone:
-				spinnerGone = true
-				tr.RecordTransition("spinner-gone")
-				logger.Printf("spinner-gone")
-			}
+		case <-ticker.C:
 		}
 	}
 
