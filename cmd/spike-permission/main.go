@@ -43,20 +43,15 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -66,11 +61,8 @@ import (
 )
 
 const (
-	statePollInterval  = 50 * time.Millisecond
-	jsonlTailInterval  = 50 * time.Millisecond
-	sessionFileWait    = 10 * time.Second
-	sessionFilePoll    = 100 * time.Millisecond
-	watchdogTick = 1 * time.Second
+	statePollInterval = 50 * time.Millisecond
+	sessionFileWait   = 10 * time.Second
 
 	// ptyQuietLimit: universal liveness watchdog. Fires when no new PTY
 	// bytes have arrived for this long, regardless of which "phase" of a
@@ -114,10 +106,6 @@ const (
 	// the same stuck-glyph failure mode. Ticket #70.
 	ptyQuietWindow = 1500 * time.Millisecond
 
-	// clearLineSettle: brief pause after Ctrl-U so the input handler can
-	// process the line-kill before the next byte arrives.
-	clearLineSettle = 50 * time.Millisecond
-
 	// --- spike-permission constants ---
 
 	// modalDetectLimit: how long each probe waits for the permission modal
@@ -134,11 +122,6 @@ const (
 	escalationWindow = 3 * time.Second
 
 )
-
-// copied from cmd/spike-cancel/main.go — keep in sync until library extraction
-var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
-
-// copied from cmd/spike-cancel/main.go — keep in sync until library extraction
 
 // oscRe matches OSC (Operating System Command) sequences — ESC ] ... BEL.
 // Claude uses these for window title and similar metadata; they show up
@@ -300,22 +283,26 @@ func run(sessionIDFlag string, approveKey []byte, approveHex string, pred modalP
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
 	startedAt := time.Now()
 
-	projDir, err := projectsDir()
+	home, err := os.UserHomeDir()
 	if err != nil {
-		return fmt.Errorf("resolve projects dir: %w", err)
+		return fmt.Errorf("resolve home dir: %w", err)
 	}
-	logger.Printf("projects-dir path=%s", projDir)
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("resolve cwd: %w", err)
+	}
 
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
 	defer cancelCause(errors.New("run: returning"))
 
 	// Session A: Probe 1 only.
-	sessionA, jsonlA, err := newSessionID(sessionIDFlag, projDir)
+	sessionA, err := resolveSession(sessionIDFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		flag.Usage()
 		os.Exit(2)
 	}
+	jsonlA := tuidriver.SessionJSONLPath(home, cwd, sessionA)
 	logger.Printf("session-id-resolved id=%s jsonl=%s tag=a", sessionA, jsonlA)
 
 	if err := runSession(rootCtx, logger, sessionA, jsonlA, "a", 1, approveKey, approveHex, pred, trustFolderPolicy,
@@ -325,11 +312,11 @@ func run(sessionIDFlag string, approveKey []byte, approveHex string, pred modalP
 
 	// Session B: Probes 2 + 3. Always generate a fresh UUID — the
 	// -session-id flag is consumed by Session A only.
-	sessionB, jsonlB, err := newSessionID("", projDir)
+	sessionB, err := resolveSession("")
 	if err != nil {
 		return fmt.Errorf("session B: generate session id: %w", err)
 	}
-	logger.Printf("session-id-resolved id=%s jsonl=%s tag=b", sessionB, jsonlB)
+	jsonlB := tuidriver.SessionJSONLPath(home, cwd, sessionB)
 
 	if err := runSession(rootCtx, logger, sessionB, jsonlB, "b", 2, approveKey, approveHex, pred, trustFolderPolicy,
 		[]probeSpec{
@@ -403,23 +390,9 @@ func runSession(
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(watchdogTick)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				snap := rb.Snapshot()
-				stripped := tuidriver.StripANSI(snap)
-				_, total, ok := matchSpinner(stripped)
-				tr.ObserveSpinner(ok, total)
-				if werr := tr.CheckWatchdog(rb); werr != nil {
-					logger.Printf("%v", werr)
-					cancelCause(werr)
-					return
-				}
-			}
+		if err := tuidriver.RunWatchdog(ctx, rb, tr, tuidriver.WatchdogOpts{}); err != nil {
+			logger.Printf("%v", err)
+			cancelCause(err)
 		}
 	}()
 
@@ -460,27 +433,29 @@ func runSession(
 	logger.Printf("idle-predicate-check tag=%s predicate=%s has_modal=%v",
 		tag, pred.String(), idleHasModal)
 
-	eventCh := make(chan map[string]any, 32)
+	// Session-scoped JSONL event stream. Populated lazily by openTailerHook
+	// (after the first probe writes a prompt, since interactive `claude
+	// --session-id` defers JSONL creation until the first input arrives).
+	var eventCh <-chan tuidriver.JSONLEntry
 
 	openTailerOnce := sync.Once{}
 	openTailerHook := func() error {
 		var hookErr error
 		openTailerOnce.Do(func() {
-			if err := openSessionJSONL(jsonlPath); err != nil {
-				hookErr = fmt.Errorf("open session jsonl: %w", err)
+			jsonlCtx, jsonlCancel := context.WithTimeout(ctx, sessionFileWait)
+			jsonlErr := tuidriver.WaitForSessionJSONL(jsonlCtx, jsonlPath)
+			jsonlCancel()
+			if jsonlErr != nil {
+				hookErr = fmt.Errorf("open session jsonl: %w", jsonlErr)
 				return
 			}
 			logger.Printf("session-jsonl-opened path=%s offset=0 tag=%s", jsonlPath, tag)
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if terr := tailJSONL(ctx, logger, jsonlPath, 0, eventCh); terr != nil {
-					if !errors.Is(terr, context.Canceled) {
-						logger.Printf("jsonl-tailer-error err=%v", terr)
-						cancelCause(terr)
-					}
-				}
-			}()
+			ch, terr := tuidriver.TailJSONL(ctx, jsonlPath, 0)
+			if terr != nil {
+				hookErr = fmt.Errorf("open events stream: %w", terr)
+				return
+			}
+			eventCh = ch
 		})
 		return hookErr
 	}
@@ -489,15 +464,15 @@ func runSession(
 		probeN := startProbeN + i
 		switch p.kind {
 		case kindObserve:
-			if err := runObserve(ctx, logger, probeN, p.prompt, pred, ptmx, rb, eventCh, tr, openTailerHook); err != nil {
+			if err := runObserve(ctx, logger, probeN, p.prompt, pred, session, rb, &eventCh, tr, openTailerHook); err != nil {
 				return fmt.Errorf("probe %d: %w", probeN, err)
 			}
 		case kindAutoRespond:
-			if err := runAutoRespond(ctx, logger, probeN, p.prompt, approveKey, approveHex, pred, ptmx, rb, eventCh, tr, openTailerHook); err != nil {
+			if err := runAutoRespond(ctx, logger, probeN, p.prompt, approveKey, approveHex, pred, session, rb, &eventCh, tr, openTailerHook); err != nil {
 				return fmt.Errorf("probe %d: %w", probeN, err)
 			}
 		case kindEscalate:
-			if err := runEscalate(ctx, logger, probeN, p.prompt, pred, ptmx, rb, eventCh, tr); err != nil {
+			if err := runEscalate(ctx, logger, probeN, p.prompt, pred, session, rb, &eventCh, tr); err != nil {
 				return fmt.Errorf("probe %d: %w", probeN, err)
 			}
 		default:
@@ -518,19 +493,19 @@ func runObserve(
 	probeN int,
 	prompt string,
 	pred modalPredicate,
-	ptmx *os.File,
+	session *tuidriver.Session,
 	rb *tuidriver.Buffer,
-	eventCh <-chan map[string]any,
+	eventChRef *<-chan tuidriver.JSONLEntry,
 	tr *tuidriver.Tracker,
 	postPromptHook func() error,
 ) error {
 	logger.Printf("probe=%d probe-start kind=%q prompt=%q", probeN, ProbeKind(kindObserve).String(), prompt)
 	tr.RecordTransition(fmt.Sprintf("probe=%d probe-start", probeN))
 
-	if err := clearInputLine(ptmx); err != nil {
+	if err := session.ClearInputLine(); err != nil {
 		return fmt.Errorf("clear input line: %w", err)
 	}
-	if err := typePrompt(ptmx, prompt); err != nil {
+	if err := session.TypePrompt(prompt); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
 	}
 	tr.RecordTransition(fmt.Sprintf("probe=%d prompt-written", probeN))
@@ -541,6 +516,8 @@ func runObserve(
 			return err
 		}
 	}
+
+	eventCh := *eventChRef
 
 	// Wait for the modal to appear.
 	if err := waitForModal(ctx, rb, pred, modalDetectLimit); err != nil {
@@ -578,7 +555,14 @@ loop:
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)
-		case ev := <-eventCh:
+		case ev, ok := <-eventCh:
+			if !ok {
+				eventCh = nil
+				continue
+			}
+			if ev.Type != "assistant" {
+				continue
+			}
 			logObservationEvent(logger, probeN, ev)
 			count++
 		case <-deadline:
@@ -602,19 +586,19 @@ func runAutoRespond(
 	approveKey []byte,
 	approveHex string,
 	pred modalPredicate,
-	ptmx *os.File,
+	session *tuidriver.Session,
 	rb *tuidriver.Buffer,
-	eventCh <-chan map[string]any,
+	eventChRef *<-chan tuidriver.JSONLEntry,
 	tr *tuidriver.Tracker,
 	postPromptHook func() error,
 ) error {
 	logger.Printf("probe=%d probe-start kind=%q prompt=%q", probeN, ProbeKind(kindAutoRespond).String(), prompt)
 	tr.RecordTransition(fmt.Sprintf("probe=%d probe-start", probeN))
 
-	if err := clearInputLine(ptmx); err != nil {
+	if err := session.ClearInputLine(); err != nil {
 		return fmt.Errorf("clear input line: %w", err)
 	}
-	if err := typePrompt(ptmx, prompt); err != nil {
+	if err := session.TypePrompt(prompt); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
 	}
 	tr.RecordTransition(fmt.Sprintf("probe=%d prompt-written", probeN))
@@ -626,6 +610,8 @@ func runAutoRespond(
 		}
 	}
 
+	eventCh := *eventChRef
+
 	if err := waitForModal(ctx, rb, pred, modalDetectLimit); err != nil {
 		return fmt.Errorf("probe %d: %w", probeN, err)
 	}
@@ -635,7 +621,7 @@ func runAutoRespond(
 	text := extractModalText(rb.Snapshot())
 	logger.Printf("probe=%d modal-text-extracted text=%q", probeN, truncateForLog(text, 200))
 
-	if err := sendKeystroke(ptmx, approveKey); err != nil {
+	if err := sendKeystroke(session, approveKey); err != nil {
 		return fmt.Errorf("send approve: %w", err)
 	}
 	tr.RecordTransition(fmt.Sprintf("probe=%d response-keystroke-sent", probeN))
@@ -689,7 +675,7 @@ func runAutoRespond(
 	// PTY quiet for >ptyQuietLimit fires `cancelCause` and surfaces via
 	// ctx.Done. The session wall-cap is the outer safety net.
 	var (
-		events             []map[string]any
+		events             []tuidriver.JSONLEntry
 		latestEndTurnMsgID string
 		gotEndTurn         bool
 		modalCleared       bool
@@ -713,14 +699,21 @@ func runAutoRespond(
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)
-		case ev := <-eventCh:
+		case ev, ok := <-eventCh:
+			if !ok {
+				eventCh = nil
+				continue
+			}
+			if ev.Type != "assistant" {
+				continue
+			}
 			events = append(events, ev)
 			if !modalCleared {
 				modalCleared = true
 				tr.RecordTransition(fmt.Sprintf("probe=%d modal-cleared", probeN))
 				logger.Printf("probe=%d modal-cleared", probeN)
 			}
-			if isEndTurn(ev) {
+			if tuidriver.IsEndTurn(ev) {
 				if id := msgIDOf(ev); id != "" {
 					latestEndTurnMsgID = id
 				}
@@ -753,13 +746,15 @@ func runEscalate(
 	probeN int,
 	prompt string,
 	pred modalPredicate,
-	ptmx *os.File,
+	session *tuidriver.Session,
 	rb *tuidriver.Buffer,
-	eventCh <-chan map[string]any,
+	eventChRef *<-chan tuidriver.JSONLEntry,
 	tr *tuidriver.Tracker,
 ) error {
 	logger.Printf("probe=%d probe-start kind=%q prompt=%q", probeN, ProbeKind(kindEscalate).String(), prompt)
 	tr.RecordTransition(fmt.Sprintf("probe=%d probe-start", probeN))
+
+	eventCh := *eventChRef
 
 	// Drain any straggler events from Probe 2 so they don't pollute
 	// Probe 3's diagnostics.
@@ -772,10 +767,10 @@ drain:
 		}
 	}
 
-	if err := clearInputLine(ptmx); err != nil {
+	if err := session.ClearInputLine(); err != nil {
 		return fmt.Errorf("clear input line: %w", err)
 	}
-	if err := typePrompt(ptmx, prompt); err != nil {
+	if err := session.TypePrompt(prompt); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
 	}
 	tr.RecordTransition(fmt.Sprintf("probe=%d prompt-written", probeN))
@@ -1004,8 +999,8 @@ func extractToolName(snap []byte) string {
 // keystroke is at most a few bytes (approve: "1\r" / "y\r" / "\r" /
 // "\x1b[B\r"). Renamed from spike-cancel's sendCancel because this spike
 // uses the same writer for the approve keystroke too.
-func sendKeystroke(ptmx *os.File, keystroke []byte) error {
-	_, err := ptmx.Write(keystroke)
+func sendKeystroke(session *tuidriver.Session, keystroke []byte) error {
+	_, err := session.Write(keystroke)
 	return err
 }
 
@@ -1034,12 +1029,16 @@ func truncateForLog(s string, max int) string {
 // logObservationEvent emits one log line for an assistant JSONL event that
 // arrived during Probe 1's observation window. Same shape as
 // logCancelEvent from spike-cancel.
-func logObservationEvent(logger *log.Logger, probeN int, ev map[string]any) {
-	msg, _ := ev["message"].(map[string]any)
-	msgID, _ := msg["id"].(string)
+func logObservationEvent(logger *log.Logger, probeN int, ev tuidriver.JSONLEntry) {
+	var msgID string
+	var rawMap map[string]any
+	if ev.Message != nil {
+		msgID = ev.Message.ID
+		rawMap = ev.Message.Raw
+	}
 
 	stopRepr := "<missing>"
-	if raw, present := msg["stop_reason"]; present {
+	if raw, present := rawMap["stop_reason"]; present {
 		if raw == nil {
 			stopRepr = "<nil>"
 		} else if s, ok := raw.(string); ok {
@@ -1053,54 +1052,27 @@ func logObservationEvent(logger *log.Logger, probeN int, ev map[string]any) {
 		probeN, stopRepr, msgID)
 }
 
-// clearInputLine sends Ctrl-U (0x15) so any drafted text left in claude's
-// input box is cleared before the next prompt is typed. Idempotent on an
-// empty input. copied from cmd/spike-cancel/main.go — keep in sync until
-// library extraction.
-func clearInputLine(ptmx *os.File) error {
-	if _, err := ptmx.Write([]byte{0x15}); err != nil {
-		return err
-	}
-	time.Sleep(clearLineSettle)
-	return nil
-}
-
-// typePrompt: copied from cmd/spike-cancel/main.go — keep in sync until
-// library extraction. Writes the prompt one byte at a time with a 10 ms
-// inter-byte delay, then a 50 ms pause, then `\r`.
-func typePrompt(ptmx *os.File, prompt string) error {
-	for i := 0; i < len(prompt); i++ {
-		if _, err := ptmx.Write([]byte{prompt[i]}); err != nil {
-			return err
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	time.Sleep(50 * time.Millisecond)
-	if _, err := ptmx.Write([]byte("\r")); err != nil {
-		return err
-	}
-	return nil
-}
-
-// hasSpinnerGlyph: copied from cmd/spike-cancel/main.go — keep in sync until
-// library extraction.
+// hasSpinnerGlyph: kept for spike-suite parity with cmd/spike-cancel; not
+// referenced by any active spike-permission probe.
 func hasSpinnerGlyph(snap []byte) bool {
 	stripped := tuidriver.StripANSI(snap)
 	return bytes.Contains(stripped, tuidriver.SpinnerGlyph)
 }
 
-// isToolUse: copied from cmd/spike-cancel/main.go — keep in sync until
-// library extraction.
-func isToolUse(ev map[string]any) bool {
-	msg, _ := ev["message"].(map[string]any)
-	stop, _ := msg["stop_reason"].(string)
-	return stop == "tool_use"
+// isToolUse reports whether an assistant event carries
+// stop_reason=tool_use. Nil-Message guard for non-assistant envelopes
+// emitted by library TailJSONL.
+func isToolUse(ev tuidriver.JSONLEntry) bool {
+	if ev.Message == nil {
+		return false
+	}
+	return ev.Message.StopReason == "tool_use"
 }
 
-// extractByMsgID: copied from cmd/spike-cancel/main.go — keep in sync until
-// library extraction. Walks every assistant event whose .message.id ==
-// targetID, concatenates content[].type=="text" blocks in arrival order.
-func extractByMsgID(events []map[string]any, targetID string) string {
+// extractByMsgID walks every assistant event whose .message.id == targetID
+// and concatenates content[].type=="text" blocks in JSONL arrival order.
+// Same shape as cmd/spike-cancel/main.go's extractByMsgID.
+func extractByMsgID(events []tuidriver.JSONLEntry, targetID string) string {
 	if targetID == "" {
 		return ""
 	}
@@ -1109,14 +1081,11 @@ func extractByMsgID(events []map[string]any, targetID string) string {
 		if msgIDOf(ev) != targetID {
 			continue
 		}
-		msg, _ := ev["message"].(map[string]any)
-		content, _ := msg["content"].([]any)
-		for _, c := range content {
-			cm, _ := c.(map[string]any)
-			if t, _ := cm["type"].(string); t != "text" {
+		for _, c := range ev.Message.Content {
+			if c.Type != "text" {
 				continue
 			}
-			if txt, _ := cm["text"].(string); txt != "" {
+			if txt, _ := c.Raw["text"].(string); txt != "" {
 				b.WriteString(txt)
 			}
 		}
@@ -1124,152 +1093,32 @@ func extractByMsgID(events []map[string]any, targetID string) string {
 	return b.String()
 }
 
-// msgIDOf: copied from cmd/spike-cancel/main.go — keep in sync until
-// library extraction.
-func msgIDOf(ev map[string]any) string {
-	msg, _ := ev["message"].(map[string]any)
-	id, _ := msg["id"].(string)
-	return id
+// msgIDOf returns the message ID of ev, or "" if ev has no Message
+// envelope. The nil guard is load-bearing: TailJSONL emits every entry
+// type and only assistant/user carry a Message.
+func msgIDOf(ev tuidriver.JSONLEntry) string {
+	if ev.Message == nil {
+		return ""
+	}
+	return ev.Message.ID
 }
 
-// --- pattern matching ---
-// copied from cmd/spike-cancel/main.go — keep in sync until library extraction
-
-func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
-	m := spinnerRe.FindSubmatch(stripped)
-	if m == nil {
-		return "", 0, false
-	}
-	var minutes int
-	if len(m[2]) > 0 {
-		minutes, _ = strconv.Atoi(string(m[2]))
-	}
-	seconds, _ := strconv.Atoi(string(m[3]))
-	return string(m[1]), minutes*60 + seconds, true
-}
-
-
-// --- JSONL discovery + tailing ---
-// copied from cmd/spike-cancel/main.go — keep in sync until library extraction
-
-func projectsDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".claude", "projects", tuidriver.EncodeCwd(cwd)), nil
-}
-
-// newSessionID is like spike-cancel's resolveSession but takes a single
-// projectsDir argument and returns (id, jsonlPath, err). The flag value
-// (if non-empty) is parsed; otherwise a fresh UUIDv4 is generated.
-func newSessionID(flagValue string, dir string) (sessionID string, jsonlPath string, err error) {
+// resolveSession turns the operator-supplied flag into a normalised session
+// ID. Empty flag → generate a fresh v4 UUID; non-empty → must parse as a
+// valid UUID.
+func resolveSession(flagValue string) (string, error) {
 	if flagValue == "" {
-		u, gerr := uuid.NewRandom()
-		if gerr != nil {
-			return "", "", fmt.Errorf("generate session id: %w", gerr)
+		u, err := uuid.NewRandom()
+		if err != nil {
+			return "", fmt.Errorf("generate session id: %w", err)
 		}
-		sessionID = u.String()
-	} else {
-		u, perr := uuid.Parse(flagValue)
-		if perr != nil {
-			return "", "", fmt.Errorf("invalid --session-id: %w", perr)
-		}
-		sessionID = u.String()
+		return u.String(), nil
 	}
-	jsonlPath = filepath.Join(dir, sessionID+".jsonl")
-	return sessionID, jsonlPath, nil
-}
-
-func openSessionJSONL(jsonlPath string) error {
-	deadline := time.Now().Add(sessionFileWait)
-	for {
-		_, err := os.Stat(jsonlPath)
-		if err == nil {
-			return nil
-		}
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("stat session jsonl: %w", err)
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("session JSONL did not appear at %s within %s", jsonlPath, sessionFileWait)
-		}
-		time.Sleep(sessionFilePoll)
-	}
-}
-
-func tailJSONL(
-	ctx context.Context,
-	logger *log.Logger,
-	path string,
-	startOffset int64,
-	out chan<- map[string]any,
-) error {
-	f, err := os.Open(path)
+	u, err := uuid.Parse(flagValue)
 	if err != nil {
-		return fmt.Errorf("open session jsonl: %w", err)
+		return "", fmt.Errorf("invalid --session-id: %w", err)
 	}
-	defer f.Close()
-
-	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
-		return fmt.Errorf("seek session jsonl: %w", err)
-	}
-
-	reader := bufio.NewReader(f)
-	var partial []byte
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		chunk, rerr := reader.ReadBytes('\n')
-		if len(chunk) > 0 {
-			partial = append(partial, chunk...)
-		}
-		if rerr == nil {
-			line := bytes.TrimRight(partial, "\r\n")
-			partial = partial[:0]
-			if len(line) == 0 {
-				continue
-			}
-			var obj map[string]any
-			if jerr := json.Unmarshal(line, &obj); jerr != nil {
-				logger.Printf("jsonl-parse-warning err=%v", jerr)
-				continue
-			}
-			if _, ok := obj["message"].(map[string]any); !ok {
-				continue
-			}
-			if t, _ := obj["type"].(string); t != "assistant" {
-				continue
-			}
-			select {
-			case out <- obj:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		} else if rerr == io.EOF {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(jsonlTailInterval):
-			}
-		} else {
-			return fmt.Errorf("read session jsonl: %w", rerr)
-		}
-	}
-}
-
-// --- assistant-event helpers ---
-// copied from cmd/spike-cancel/main.go — keep in sync until library extraction
-
-func isEndTurn(ev map[string]any) bool {
-	msg, _ := ev["message"].(map[string]any)
-	stop, _ := msg["stop_reason"].(string)
-	return stop == "end_turn"
+	return u.String(), nil
 }
 
 // Compile-time references to symbols that exist for parity with
