@@ -1,0 +1,23 @@
+{
+  "questions": [
+    {
+      "question": "Which programming language should you learn next?",
+      "header": "Language",
+      "multiSelect": false,
+      "options": [
+        {
+          "label": "Rust",
+          "description": "Systems language with strong memory safety guarantees via ownership/borrow checker. Great for performance-critical work, CLIs, and WebAssembly."
+        },
+        {
+          "label": "Zig",
+          "description": "Modern low-level language emphasizing simplicity, explicit control, and seamless C interop. Smaller ecosystem but excellent for systems work."
+        },
+        {
+          "label": "Go",
+          "description": "Simple, pragmatic language with excellent concurrency primitives and a fast toolchain. Strong for backend services, networking, and DevOps tooling."
+        }
+      ]
+    }
+  ]
+}
