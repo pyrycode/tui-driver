@@ -229,11 +229,19 @@ func (s *Session) ClearInputLine() error {
 	return nil
 }
 
-// Wait blocks until the underlying process exits. Returns the exit error
-// (or nil for clean exit). Safe to call from multiple goroutines and
-// before/after Close.
+// Wait blocks until both the underlying process has exited AND the PTY
+// reader goroutine has drained the final bytes from the PTY master FD.
+// Returns the exit error (or nil for clean exit). Safe to call from
+// multiple goroutines and before/after Close.
+//
+// After Wait returns, any bytes the reader wrote into Buffer or into
+// SpawnOpts.Mirror before the subprocess exited are guaranteed visible
+// to the caller (happens-before via the readerDone channel close). This
+// is the synchronisation point for inspecting Buffer.Snapshot() or any
+// Mirror writer without racing the reader.
 func (s *Session) Wait() error {
 	<-s.exited
+	<-s.readerDone
 	return s.exitErr
 }
 
