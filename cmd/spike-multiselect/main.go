@@ -34,7 +34,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -44,7 +43,6 @@ import (
 
 const (
 	statePollInterval  = 50 * time.Millisecond
-	watchdogTick       = 1 * time.Second
 	ptyQuietLimit      = 30 * time.Second
 	spinnerFreezeLimit = 30 * time.Second
 	shutdownGrace      = 3 * time.Second
@@ -54,8 +52,6 @@ const (
 	// so a too-short window misses the fully-rendered state. 1.5 s is plenty.
 	settleWindow = 1500 * time.Millisecond
 )
-
-var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
 
 func main() {
 	triggerFlag := flag.String("trigger", "/",
@@ -120,23 +116,9 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(watchdogTick)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-rootCtx.Done():
-				return
-			case <-ticker.C:
-				snap := rb.Snapshot()
-				stripped := tuidriver.StripANSI(snap)
-				_, total, ok := matchSpinner(stripped)
-				tr.ObserveSpinner(ok, total)
-				if werr := tr.CheckWatchdog(rb); werr != nil {
-					logger.Printf("%v", werr)
-					cancelCause(werr)
-					return
-				}
-			}
+		if err := tuidriver.RunWatchdog(rootCtx, rb, tr, tuidriver.WatchdogOpts{}); err != nil {
+			logger.Printf("%v", err)
+			cancelCause(err)
 		}
 	}()
 
@@ -383,23 +365,5 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	logger.Printf("complete elapsed=%s", time.Since(startedAt).Round(time.Millisecond))
 	fmt.Printf("OBSERVED: picker snapshot at %s\n", dumpPath)
 	return nil
-}
-
-
-func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
-	m := spinnerRe.FindSubmatch(stripped)
-	if m == nil {
-		return "", 0, false
-	}
-	verb = string(m[1])
-	if len(m[3]) > 0 {
-		fmt.Sscanf(string(m[3]), "%d", &totalSeconds)
-		if len(m[2]) > 0 {
-			var minutes int
-			fmt.Sscanf(string(m[2]), "%d", &minutes)
-			totalSeconds += minutes * 60
-		}
-	}
-	return verb, totalSeconds, true
 }
 
