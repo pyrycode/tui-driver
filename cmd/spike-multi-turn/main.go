@@ -16,26 +16,19 @@
 // Extraction groups assistant events by `.message.id == latestEndTurnMsgID`
 // and concatenates content[].type=="text" blocks in JSONL order.
 //
-// Spike-quality: single binary, no public API. Helpers copy-pasted from
-// cmd/spike-one-turn (attributed inline) — kept here until library
-// extraction lands. See cmd/spike-multi-turn/README.md for the empirical log.
+// Spike-quality: single binary, no public API. See
+// cmd/spike-multi-turn/README.md for the empirical log.
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,10 +39,7 @@ import (
 
 const (
 	statePollInterval  = 50 * time.Millisecond
-	jsonlTailInterval  = 50 * time.Millisecond
 	sessionFileWait    = 10 * time.Second
-	sessionFilePoll    = 100 * time.Millisecond
-	watchdogTick       = 1 * time.Second
 	ptyQuietLimit      = 60 * time.Second
 	spinnerFreezeLimit = 30 * time.Second
 	shutdownGrace      = 3 * time.Second
@@ -70,11 +60,6 @@ const (
 	// problem entirely by observing silence directly.
 	ptyQuietWindow = 1500 * time.Millisecond
 )
-
-// copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
-var spinnerRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s`)
-
-// copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
 
 // The probe prompts.
 //
@@ -124,18 +109,21 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
 	startedAt := time.Now()
 
-	projDir, err := projectsDir()
-	if err != nil {
-		return fmt.Errorf("resolve projects dir: %w", err)
-	}
-	logger.Printf("projects-dir path=%s", projDir)
-
-	sessionID, jsonlPath, err := resolveSession(sessionIDFlag, projDir)
+	sessionID, err := resolveSession(sessionIDFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		flag.Usage()
 		os.Exit(2)
 	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolve home dir: %w", err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("resolve cwd: %w", err)
+	}
+	jsonlPath := tuidriver.SessionJSONLPath(home, cwd, sessionID)
 	logger.Printf("session-id-resolved id=%s jsonl=%s", sessionID, jsonlPath)
 
 	rootCtx, cancelCause := context.WithCancelCause(context.Background())
@@ -179,27 +167,12 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	var wg sync.WaitGroup
 
 	// Watchdog: 1 Hz inactivity + spinner-freeze enforcement.
-	// copied from cmd/spike-one-turn/main.go
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(watchdogTick)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-rootCtx.Done():
-				return
-			case <-ticker.C:
-				snap := rb.Snapshot()
-				stripped := tuidriver.StripANSI(snap)
-				_, total, ok := matchSpinner(stripped)
-				tr.ObserveSpinner(ok, total)
-				if werr := tr.CheckWatchdog(rb); werr != nil {
-					logger.Printf("%v", werr)
-					cancelCause(werr)
-					return
-				}
-			}
+		if err := tuidriver.RunWatchdog(rootCtx, rb, tr, tuidriver.WatchdogOpts{}); err != nil {
+			logger.Printf("%v", err)
+			cancelCause(err)
 		}
 	}()
 
@@ -235,26 +208,24 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	}
 
 	// Shared events channel for the whole session; one tailer goroutine
-	// services all three turns. Tailer is started inside turn 1's
+	// services all turns. Tailer is started inside turn 1's
 	// postPromptHook because interactive `claude --session-id` defers JSONL
 	// creation until the first input arrives (see spike-one-turn finding #9).
-	eventCh := make(chan map[string]any, 32)
+	var eventCh <-chan tuidriver.JSONLEntry
 
 	turn1Hook := func() error {
-		if err := openSessionJSONL(jsonlPath); err != nil {
-			return fmt.Errorf("open session jsonl: %w", err)
+		jsonlCtx, jsonlCancel := context.WithTimeout(rootCtx, sessionFileWait)
+		jsonlErr := tuidriver.WaitForSessionJSONL(jsonlCtx, jsonlPath)
+		jsonlCancel()
+		if jsonlErr != nil {
+			return fmt.Errorf("open session jsonl: %w", jsonlErr)
 		}
 		logger.Printf("session-jsonl-opened path=%s offset=0", jsonlPath)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if terr := tailJSONL(rootCtx, logger, jsonlPath, 0, eventCh); terr != nil {
-				if !errors.Is(terr, context.Canceled) {
-					logger.Printf("jsonl-tailer-error err=%v", terr)
-					cancelCause(terr)
-				}
-			}
-		}()
+		ch, terr := tuidriver.TailJSONL(rootCtx, jsonlPath, 0)
+		if terr != nil {
+			return fmt.Errorf("open events stream: %w", terr)
+		}
+		eventCh = ch
 		return nil
 	}
 
@@ -264,7 +235,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 		if turn == 1 {
 			hook = turn1Hook
 		}
-		if _, _, err := runTurn(rootCtx, logger, turn, p, ptmx, rb, eventCh, tr, hook); err != nil {
+		if _, _, err := runTurn(rootCtx, logger, turn, p, session, rb, &eventCh, tr, hook); err != nil {
 			return fmt.Errorf("turn %d: %w", turn, err)
 		}
 	}
@@ -280,7 +251,12 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 // On turn 1, postPromptHook opens the deterministic JSONL and starts the
 // tailer goroutine — the file only exists once claude processes the first
 // input, so the open MUST happen after prompt-written but before this turn
-// reads any events. For turns 2 and 3 postPromptHook is nil.
+// reads any events. For turns 2+ postPromptHook is nil.
+//
+// eventChRef points at the caller's session-scoped tail channel slot. On
+// turn 1 the slot is nil at entry and the hook fills it; on turns 2+ the
+// slot is already populated. The pre-hook drain therefore gates on
+// `*eventChRef != nil`, and the receive loop dereferences once post-hook.
 //
 // Returns the extracted assistant text and the msg_id used for extraction.
 func runTurn(
@@ -288,9 +264,9 @@ func runTurn(
 	logger *log.Logger,
 	turn int,
 	prompt string,
-	ptmx *os.File,
+	session *tuidriver.Session,
 	rb *tuidriver.Buffer,
-	eventCh <-chan map[string]any,
+	eventChRef *<-chan tuidriver.JSONLEntry,
 	tr *tuidriver.Tracker,
 	postPromptHook func() error,
 ) (string, string, error) {
@@ -302,17 +278,20 @@ func runTurn(
 	// msg_id may have been buffered onto eventCh while runTurn was already
 	// returning. If any of those slip into this turn's accumulation, the
 	// "gotEndTurn && isIdle" predicate could fire spuriously before this
-	// turn's response even begins. Drain non-blocking.
-drain:
-	for {
-		select {
-		case <-eventCh:
-		default:
-			break drain
+	// turn's response even begins. Drain non-blocking. Turn 1's pre-hook
+	// drain is a no-op because the channel slot is still nil.
+	if ch := *eventChRef; ch != nil {
+	drain:
+		for {
+			select {
+			case <-ch:
+			default:
+				break drain
+			}
 		}
 	}
 
-	if err := typePrompt(ptmx, prompt); err != nil {
+	if err := session.TypePrompt(prompt); err != nil {
 		return "", "", fmt.Errorf("write prompt: %w", err)
 	}
 	tr.RecordTransition(fmt.Sprintf("turn=%d prompt-written", turn))
@@ -350,6 +329,8 @@ drain:
 		}
 	}
 
+	eventCh := *eventChRef
+
 	// Accumulate assistant events and detect turn-complete.
 	//
 	// Predicate: (a) at least one assistant line with stop_reason=end_turn
@@ -380,7 +361,7 @@ drain:
 	// cmd/spike-cancel/main.go:82-91 for the empirical derivation of the
 	// 1500 ms window). Ticket #73.
 	var (
-		events             []map[string]any
+		events             []tuidriver.JSONLEntry
 		latestEndTurnMsgID string
 		gotEndTurn         bool
 		assistantText      string
@@ -404,9 +385,17 @@ drain:
 		case <-ctx.Done():
 			<-observerDone
 			return "", "", fmt.Errorf("turn=%d: %w", turn, context.Cause(ctx))
-		case ev := <-eventCh:
+		case ev, ok := <-eventCh:
+			if !ok {
+				// Tail goroutine exited (ctx-cancel or unrecoverable read
+				// error). Nil the local copy so this case stops firing on
+				// the closed-channel zero value at every tick; the loop
+				// continues until check() flips or the watchdog wedges ctx.
+				eventCh = nil
+				continue
+			}
 			events = append(events, ev)
-			if isEndTurn(ev) {
+			if tuidriver.IsEndTurn(ev) {
 				if id := msgIDOf(ev); id != "" {
 					latestEndTurnMsgID = id
 				}
@@ -442,7 +431,7 @@ drain:
 // least one end_turn-tagged event for targetID has been observed, so empty
 // means every block under that msg_id was non-text (which would be a
 // finding worth recording in the README).
-func extractByMsgID(events []map[string]any, targetID string) string {
+func extractByMsgID(events []tuidriver.JSONLEntry, targetID string) string {
 	if targetID == "" {
 		return ""
 	}
@@ -451,14 +440,11 @@ func extractByMsgID(events []map[string]any, targetID string) string {
 		if msgIDOf(ev) != targetID {
 			continue
 		}
-		msg, _ := ev["message"].(map[string]any)
-		content, _ := msg["content"].([]any)
-		for _, c := range content {
-			cm, _ := c.(map[string]any)
-			if t, _ := cm["type"].(string); t != "text" {
+		for _, c := range ev.Message.Content {
+			if c.Type != "text" {
 				continue
 			}
-			if txt, _ := cm["text"].(string); txt != "" {
+			if txt, _ := c.Raw["text"].(string); txt != "" {
 				b.WriteString(txt)
 			}
 		}
@@ -466,175 +452,33 @@ func extractByMsgID(events []map[string]any, targetID string) string {
 	return b.String()
 }
 
-// typePrompt writes the prompt body one byte at a time with a small delay
-// between bytes, then a brief pause, then `\r`. Observed empirically: writing
-// `prompt+"\r"` as a single buffered write works for turn 1 (after the
-// session boot redraw) but fails after a tool-use turn 2 — claude's input
-// area echoes every character but never recognises the trailing `\r` as
-// submit. Char-by-char with a 10 ms inter-byte delay reliably submits.
-//
-// Hypothesis: claude's input handler debounces input differently when a
-// previous turn's wind-down redraw is still in flight; a single bulk write
-// arrives faster than the input handler can transition out of the prior
-// turn's state. Spike documents this as a finding; the post-spike library
-// will need to make the inter-byte delay configurable.
-func typePrompt(ptmx *os.File, prompt string) error {
-	for i := 0; i < len(prompt); i++ {
-		if _, err := ptmx.Write([]byte{prompt[i]}); err != nil {
-			return err
-		}
-		time.Sleep(10 * time.Millisecond)
+// msgIDOf returns the message ID of ev, or "" if ev has no Message
+// envelope. The nil guard is load-bearing: TailJSONL emits every entry
+// type (assistant, user, attachment, …) and only assistant/user carry a
+// Message — non-message envelopes would nil-deref without the guard.
+func msgIDOf(ev tuidriver.JSONLEntry) string {
+	if ev.Message == nil {
+		return ""
 	}
-	time.Sleep(50 * time.Millisecond)
-	if _, err := ptmx.Write([]byte("\r")); err != nil {
-		return err
-	}
-	return nil
+	return ev.Message.ID
 }
 
-func msgIDOf(ev map[string]any) string {
-	msg, _ := ev["message"].(map[string]any)
-	id, _ := msg["id"].(string)
-	return id
-}
-
-// --- pattern matching ---
-// copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
-
-func matchSpinner(stripped []byte) (verb string, totalSeconds int, ok bool) {
-	m := spinnerRe.FindSubmatch(stripped)
-	if m == nil {
-		return "", 0, false
-	}
-	var minutes int
-	if len(m[2]) > 0 {
-		minutes, _ = strconv.Atoi(string(m[2]))
-	}
-	seconds, _ := strconv.Atoi(string(m[3]))
-	return string(m[1]), minutes*60 + seconds, true
-}
-
-
-// --- generic predicate wait ---
-// copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
-
-
-// --- JSONL discovery + tailing ---
-// copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
-
-func projectsDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".claude", "projects", tuidriver.EncodeCwd(cwd)), nil
-}
-
-func resolveSession(flagValue string, dir string) (sessionID string, jsonlPath string, err error) {
+// resolveSession turns the operator-supplied flag into a normalised session ID.
+// Empty flag → generate a fresh v4 UUID; non-empty → must parse as a valid
+// UUID (uuid.Parse accepts hyphenated and non-hyphenated forms; .String()
+// re-emits the canonical lowercase-hyphenated shape that matches claude's
+// filename convention).
+func resolveSession(flagValue string) (string, error) {
 	if flagValue == "" {
-		u, gerr := uuid.NewRandom()
-		if gerr != nil {
-			return "", "", fmt.Errorf("generate session id: %w", gerr)
+		u, err := uuid.NewRandom()
+		if err != nil {
+			return "", fmt.Errorf("generate session id: %w", err)
 		}
-		sessionID = u.String()
-	} else {
-		u, perr := uuid.Parse(flagValue)
-		if perr != nil {
-			return "", "", fmt.Errorf("invalid --session-id: %w", perr)
-		}
-		sessionID = u.String()
+		return u.String(), nil
 	}
-	jsonlPath = filepath.Join(dir, sessionID+".jsonl")
-	return sessionID, jsonlPath, nil
-}
-
-func openSessionJSONL(jsonlPath string) error {
-	deadline := time.Now().Add(sessionFileWait)
-	for {
-		_, err := os.Stat(jsonlPath)
-		if err == nil {
-			return nil
-		}
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("stat session jsonl: %w", err)
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("session JSONL did not appear at %s within %s", jsonlPath, sessionFileWait)
-		}
-		time.Sleep(sessionFilePoll)
-	}
-}
-
-func tailJSONL(
-	ctx context.Context,
-	logger *log.Logger,
-	path string,
-	startOffset int64,
-	out chan<- map[string]any,
-) error {
-	f, err := os.Open(path)
+	u, err := uuid.Parse(flagValue)
 	if err != nil {
-		return fmt.Errorf("open session jsonl: %w", err)
+		return "", fmt.Errorf("invalid --session-id: %w", err)
 	}
-	defer f.Close()
-
-	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
-		return fmt.Errorf("seek session jsonl: %w", err)
-	}
-
-	reader := bufio.NewReader(f)
-	var partial []byte
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		chunk, rerr := reader.ReadBytes('\n')
-		if len(chunk) > 0 {
-			partial = append(partial, chunk...)
-		}
-		if rerr == nil {
-			line := bytes.TrimRight(partial, "\r\n")
-			partial = partial[:0]
-			if len(line) == 0 {
-				continue
-			}
-			var obj map[string]any
-			if jerr := json.Unmarshal(line, &obj); jerr != nil {
-				logger.Printf("jsonl-parse-warning err=%v", jerr)
-				continue
-			}
-			if _, ok := obj["message"].(map[string]any); !ok {
-				continue
-			}
-			if t, _ := obj["type"].(string); t != "assistant" {
-				continue
-			}
-			select {
-			case out <- obj:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		} else if rerr == io.EOF {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(jsonlTailInterval):
-			}
-		} else {
-			return fmt.Errorf("read session jsonl: %w", rerr)
-		}
-	}
-}
-
-// --- assistant-event helpers ---
-// copied from cmd/spike-one-turn/main.go — keep in sync until library extraction
-
-func isEndTurn(ev map[string]any) bool {
-	msg, _ := ev["message"].(map[string]any)
-	stop, _ := msg["stop_reason"].(string)
-	return stop == "end_turn"
+	return u.String(), nil
 }
