@@ -4,38 +4,37 @@ Where things live and how data flows. Update when modules, types, or data flows 
 
 ## Current state
 
-The library proper (`pkg/tuidriver/`) does **not exist yet**. The Go code in the repo is four throwaway spike binaries that exercise every primitive the eventual library will own without committing to an API:
+The library proper (`pkg/tuidriver/`) is **shipped** (~25 files, ~80 tests) and exports the consumer-facing API: session lifecycle, state detection, modal-class detection + parsers, two-arm watchdog, and a unified PTY+JSONL `Events()` channel. The seven `cmd/spike-*` binaries graduated from throwaway prototypes to example consumers — they import `pkg/tuidriver/` and compose its primitives into specific workflows, doubling as regression-detection harnesses:
 
 - `cmd/spike-one-turn/` — single-turn happy path (idle → prompt → spinner → `end_turn` → SUCCESS). See [#1](../codebase/1.md), [#3](../codebase/3.md), [#4](../codebase/4.md), [#7](../codebase/7.md).
 - `cmd/spike-multi-turn/` — three-turn loop (simple text → Bash tool use → slow thinking) with msg_id-grouped content extraction and a `runTurn` per-turn driver. See [#9](../codebase/9.md).
 - `cmd/spike-cancel/` — three-probe cancellation binary (cancel during thinking → cancel during tool-use → recovery turn). Validates ESC as the cancel keystroke, documents the `user(text "[Request interrupted by user]")` JSONL cancellation marker, and verifies the same `--session-id` is recoverable post-cancel. See [#11](../codebase/11.md).
 - `cmd/spike-permission/` — two-session three-probe permission-modal binary (observe modal with no response → auto-respond + complete turn → simulated escalation). First spike to drop `--permission-mode bypassPermissions`. Validates `1\r` as the approve keystroke, documents that permission modals have zero JSONL footprint (detection MUST be PTY-side), and sketches the consumer escalation-callback shape. See [#13](../codebase/13.md).
+- `cmd/spike-multiselect/` — slash-command picker / `/mcp` / `/agents` modal parsers.
+- `cmd/spike-ask-user/` — claude-initiated AskUserQuestion modal (`ParseAskUserQuestion`, shipped #109).
+- `cmd/spike-long-prompt/` — bracketed-paste long/multi-line prompt submission; first consumer migrated onto the library `Events()` / `RunWatchdog` surface.
 
-All four spikes share ~600 LOC of helpers under `// copied from cmd/spike-one-turn/main.go — keep in sync until library extraction` (or `…/spike-multi-turn/main.go` / `…/spike-cancel/main.go`) attribution comments. The duplication is deliberate — every spike binary deletes when `pkg/tuidriver/` lands.
+The spike binaries no longer carry `// copied from … — keep in sync until library extraction` attribution comments — the shared primitives now live in `pkg/tuidriver/` and the spikes call them directly.
 
-## Intended modules (post-spike, not yet built)
-
-- `pkg/tuidriver/` — public API: session lifecycle, state subscription, input writers. Shape will settle after multiple ticket cycles produce enough integration pressure to justify abstractions.
-
-## Layout (today)
+## Layout
 
 ```
-cmd/spike-one-turn/   # throwaway single-file spike (single turn)
-  main.go             # PTY + reader + state machine + JSONL tailer + watchdog + shutdown
+pkg/tuidriver/        # the shipped library (~25 files, ~80 tests)
+                      # session lifecycle, buffer, state detection, modal parsers,
+                      # rendering, Events() merge channel, RunWatchdog, prompt writers
+cmd/spike-one-turn/   # example consumer — single turn
+  main.go             # idle → prompt → end_turn → extracted text
   README.md           # empirical observations log
-cmd/spike-multi-turn/ # throwaway single-file spike (three turns)
-  main.go             # adds runTurn per-turn driver + msg_id-grouped extractor + char-by-char typePrompt
+cmd/spike-multi-turn/ # example consumer — three turns
   README.md           # multi-turn empirical observations log
-cmd/spike-cancel/     # throwaway single-file spike (three cancellation probes)
-  main.go             # adds runProbe (cancel-thinking/cancel-tool-use/recovery) + sendCancel
-                      # + clearInputLine (Ctrl-U) + rollingBuffer.quietFor (PTY-quiescence)
+cmd/spike-cancel/     # example consumer — three cancellation probes
   README.md           # cancellation empirical observations log
-cmd/spike-permission/ # throwaway single-file spike (two sessions, three modal probes)
-  main.go             # adds runSession (per-session orchestrator) + runObserve/runAutoRespond/
-                      # runEscalate + hasModal (literal-text + box-drawing variants) +
-                      # extractModalText (last-dash-run anchor) + extractToolName +
-                      # sendKeystroke (renamed sendCancel) + oscRe
+cmd/spike-permission/ # example consumer — two sessions, three modal probes
   README.md           # permission-modal empirical observations log
+cmd/spike-multiselect/ # example consumer — slash-picker / /mcp / /agents parsers
+cmd/spike-ask-user/   # example consumer — AskUserQuestion modal
+cmd/spike-long-prompt/ # example consumer — bracketed-paste long-prompt submission
+cmd/e2e-runner/       # top-level e2e orchestrator (make e2e)
 docs/
   specs/architecture/ # per-ticket specs from the architect
   knowledge/          # this directory (evergreen)
@@ -89,7 +88,7 @@ Shutdown is a `defer` with a `sync.Once`-guarded body: SIGTERM → 3 s grace rac
 ## Key signals
 
 - **Idle:** `❯` glyph (UTF-8 `\xe2\x9d\xaf`) present in the ANSI-stripped rolling buffer AND the spinner regex does NOT match.
-- **Thinking:** `✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s` — captures a 1–2-word verb (variable per prompt) and a time-tail in `Ns` or `Nm Ns` form. Currently misses every observed verb in practice (CSI cursor-forward between glyph and verb eaten by ANSI strip; ellipsis-form verbs lack the `for Ns` counter); slow-path log lines are dormant pending a regex fix. A bare-glyph fallback (`hasSpinnerGlyph` — `bytes.Contains` against `\xe2\x9c\xbb` after ANSI strip) is the practical "claude has started processing" signal until the regex is fixed; introduced in `cmd/spike-cancel/main.go`.
+- **Thinking:** `✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\s+)?(\d+)s` — captures a 1–2-word verb (variable per prompt) and a time-tail in `Ns` or `Nm Ns` form. **`ParseSpinner` (`✻ … for Ns`) matches 0/667 frames on claude 2.1.158 — spinner-freeze watchdog dead, see tui-driver#124.** Use `IsThinking` (bare `✻` presence) or the `"esc to interrupt"` hint as the in-flight anchor instead. Currently misses every observed verb in practice (CSI cursor-forward between glyph and verb eaten by ANSI strip; ellipsis-form verbs lack the `for Ns` counter); slow-path log lines are dormant pending a regex fix. A bare-glyph fallback (`hasSpinnerGlyph` — `bytes.Contains` against `\xe2\x9c\xbb` after ANSI strip) is the practical "claude has started processing" signal until the regex is fixed; introduced in `cmd/spike-cancel/main.go`.
 - **Turn done (JSONL side):** at least one `type=="assistant"` line for the turn with `message.stop_reason=="end_turn"` AND non-empty concatenated `type:"text"` content on that line — the canonical per-entry predicate is `tuidriver.IsEndTurn(e JSONLEntry) bool` since [#60](../codebase/60.md). Note that `stop_reason` rides every delta of a multi-block message, not only the last line, so the text-non-empty half is what rejects the `thinking`-only / `tool_use`-only delta lines (see [JSONL layout § One Anthropic message ⇒ N JSONL lines](jsonl-layout.md)). The seven in-tree spike `isEndTurn` open-codes still check stop_reason alone; migration to the library helper is tracked separately.
 - **Turn-complete predicate (multi-turn):** JSONL `end_turn` observed AND `❯` glyph present in the ANSI-stripped rolling buffer AND `rb.QuietFor() ≥ 1500 ms` (PTY-quiescence; `ptyQuietWindow` in `cmd/spike-multi-turn/main.go`). Composes the JSONL `end_turn` signal with the shared PTY-quiescence readiness predicate (below). The original `gotEndTurn ∧ isIdle for 250 ms` wedged against `claude 2.1.148` because a stuck `✻ Brewed for Ns` glyph stayed painted in the 4 KB rolling buffer after a fast assistant response, keeping `isIdle` false forever — quiescence sidesteps the buffer-residue problem by observing silence directly. See [#73](../codebase/73.md).
 - **Post-approve readiness (permission modals):** in spike-permission's `runAutoRespond`, the post-approve return-to-idle is gated by `gotEndTurn ∧ ❯ glyph present in StripANSI(rb.Snapshot()) ∧ rb.QuietFor() ≥ ptyQuietWindow` (`cmd/spike-permission/main.go`). Same shape as the multi-turn turn-complete predicate (above), same empirical 1500 ms window, same buffer-residue failure mode it replaces — the original `gotEndTurn ∧ isIdle for 250 ms` wedged when a `✻` glyph painted during tool execution stayed in the 4 KB rolling buffer past `end_turn`. The approve keystroke and the JSONL-side end-of-turn signal are unchanged; only the PTY-side readiness predicate's shape changed. See [#70](../codebase/70.md).

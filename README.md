@@ -12,9 +12,7 @@ Consumer pairs `tui-driver` output (live state) with the target binary's session
 
 ## Status
 
-**Library substantively complete (2026-05-18).** Six spike binaries under `cmd/` validate the primitives end-to-end and serve as regression-detection harnesses. `pkg/tuidriver/` exports the consumer-facing API. ~80 unit tests + 3 PTY-snapshot regression fixtures.
-
-Pending: `ParseAskUserQuestion` (blocked by first-prompt-blocks-on-tool-readiness bug); pyry-acp consumer integration.
+**Library shipped (2026-05-18).** Seven spike binaries under `cmd/` validate the primitives end-to-end and serve as regression-detection harnesses. `pkg/tuidriver/` exports the consumer-facing API. ~80 unit tests + 3 PTY-snapshot regression fixtures. Consumer migration to `pyry agent-run` shipped to pyrycode `main` 2026-05-23.
 
 ## Running the e2e harness
 
@@ -138,7 +136,7 @@ if err := tr.CheckWatchdog(session.Buffer); err != nil {
 }
 ```
 
-The 6 spike binaries under `cmd/` are working examples — they import `pkg/tuidriver/` and compose the primitives into specific workflows:
+The 7 spike binaries under `cmd/` are working examples — they import `pkg/tuidriver/` and compose the primitives into specific workflows:
 
 - `spike-one-turn` — single-turn happy path, ❯ → prompt → end_turn → extracted text
 - `spike-multi-turn` — N sequential turns including tool use
@@ -146,16 +144,17 @@ The 6 spike binaries under `cmd/` are working examples — they import `pkg/tuid
 - `spike-permission` — permission-modal detection + auto-respond
 - `spike-multiselect` — slash-command picker / `/mcp` / `/agents` parsers
 - `spike-ask-user` — claude-initiated AskUserQuestion modal
+- `spike-long-prompt` — bracketed-paste long/multi-line prompt submission
 
 ## Why this exists
 
-Anthropic's 2026-06-15 Agent SDK billing split moves `claude -p`, the Agent SDK, and "third-party apps that authenticate with your Claude subscription through the Agent SDK" to a metered credit pool. *Interactive* Claude Code in the terminal stays on subscription. Driving `claude` via a real PTY puts the spawned process on the explicitly-subscription-eligible surface — TTY-attached stdin/stdout, no `-p` flag, normal interactive UI. This library is the substrate that makes that approach viable for programmatic consumers (`pyry acp`, etc.).
+Anthropic's 2026-06-15 Agent SDK billing split moves `claude -p`, the Agent SDK, and "third-party apps that authenticate with your Claude subscription through the Agent SDK" to a metered credit pool. *Interactive* Claude Code in the terminal stays on subscription. Driving `claude` via a real PTY puts the spawned process on the explicitly-subscription-eligible surface — TTY-attached stdin/stdout, no `-p` flag, normal interactive UI. This library is the substrate that makes that approach viable for programmatic consumers (`pyry agent-run`, etc.).
 
 See [Drop-In Contract](../../obsidian-vault/Second%20Brain/📋%20Projects/2026-04-10%20-%20Pyrycode/Drop-In%20Contract.md) for the strategic context.
 
 ## Consumers
 
-- `pyrycode/pyrycode` — `pyry acp` mode (planned)
+- `pyrycode/pyrycode` — `pyry agent-run` mode (consumer migration shipped to pyrycode `main` 2026-05-23)
 
 ## License
 
