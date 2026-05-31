@@ -39,7 +39,11 @@ const (
 // Anchors are unexported — consumers call DetectModalClass rather than
 // matching directly. The literal forms are documented here for readers.
 //
-//	mcp                 → "ManageMCPservers"
+//	mcp                 → "ManageMCPservers" or "Manage MCP servers" (the
+//	                      modal title), or the strict-mcp inline empty-state
+//	                      "No MCP servers configured" / "NoMCPserversconfigured"
+//	                      (claude 2.1.158 renders the empty-state instead of
+//	                      the modal under --strict-mcp-config — see #128)
 //	agents              → "Agents" header + "Running" or "Library" tab
 //	slash-picker        → ≥1 line whose stripped content starts with `/<letter>`
 //	ask-user-question   → "Entertoselect" or "Enter to select"
@@ -57,15 +61,18 @@ const (
 // picker.go for the row-finding seam; classification is shared with the
 // parser so any future row-shape change updates both call sites at once.
 var (
-	anchorMCP                = []byte("ManageMCPservers")
-	anchorAgentsHeader       = []byte("Agents")
-	anchorAgentsTabRunning   = []byte("Running")
-	anchorAgentsTabLibrary   = []byte("Library")
-	anchorAskUserStripped    = []byte("Entertoselect")
-	anchorAskUserSpaced      = []byte("Enter to select")
-	anchorTrustFolder        = []byte("Quicksafetycheck")
-	anchorPermissionStripped = []byte("Doyouwanttoproceed")
-	anchorPermissionSpaced   = []byte("Do you want to proceed")
+	anchorMCP                 = []byte("ManageMCPservers")
+	anchorMCPSpaced           = []byte("Manage MCP servers")
+	anchorMCPEmptySpaced      = []byte("No MCP servers configured")
+	anchorMCPEmptyStripped    = []byte("NoMCPserversconfigured")
+	anchorAgentsHeader        = []byte("Agents")
+	anchorAgentsTabRunning    = []byte("Running")
+	anchorAgentsTabLibrary    = []byte("Library")
+	anchorAskUserStripped     = []byte("Entertoselect")
+	anchorAskUserSpaced       = []byte("Enter to select")
+	anchorTrustFolder         = []byte("Quicksafetycheck")
+	anchorPermissionStripped  = []byte("Doyouwanttoproceed")
+	anchorPermissionSpaced    = []byte("Do you want to proceed")
 	anchorModelSelectStripped = []byte("Selectmodel")
 	anchorModelSelectSpaced   = []byte("Select model")
 	anchorPermissionsHeader   = []byte("Permissions")
@@ -93,7 +100,10 @@ func DetectModalClass(snap []byte) ModalClass {
 	}
 	stripped := StripOSC(StripANSI(snap))
 	switch {
-	case bytes.Contains(stripped, anchorMCP):
+	case bytes.Contains(stripped, anchorMCP) ||
+		bytes.Contains(stripped, anchorMCPSpaced) ||
+		bytes.Contains(stripped, anchorMCPEmptySpaced) ||
+		bytes.Contains(stripped, anchorMCPEmptyStripped):
 		return ModalClassMCP
 	case bytes.Contains(stripped, anchorAgentsHeader) &&
 		(bytes.Contains(stripped, anchorAgentsTabRunning) ||

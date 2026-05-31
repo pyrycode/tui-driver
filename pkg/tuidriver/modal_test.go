@@ -22,6 +22,9 @@ func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 		want ModalClass
 	}{
 		{"mcp space-stripped", []byte("...ManageMCPservers..."), ModalClassMCP},
+		{"mcp spaced title", []byte("...Manage MCP servers..."), ModalClassMCP},
+		{"mcp empty-state spaced", []byte("...No MCP servers configured. Please run /doctor..."), ModalClassMCP},
+		{"mcp empty-state stripped", []byte("...NoMCPserversconfigured.Pleaserun/doctor..."), ModalClassMCP},
 		{"agents header + running tab", []byte("...Agents...Running..."), ModalClassAgents},
 		{"agents header + library tab", []byte("...Agents...Library..."), ModalClassAgents},
 		{
@@ -106,6 +109,7 @@ func TestDetectModalClassRealFixtures(t *testing.T) {
 		want    ModalClass
 	}{
 		{"mcp-snapshot.bin", ModalClassMCP},
+		{"mcp-empty-snapshot.bin", ModalClassMCP},
 		{"agents-snapshot.bin", ModalClassAgents},
 		{"picker-snapshot.bin", ModalClassSlashPicker},
 		{"picker-truecolor-snapshot.bin", ModalClassSlashPicker},

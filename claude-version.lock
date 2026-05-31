@@ -8,7 +8,7 @@
 # `flag=` and `value=` lines ARE enforced — each MUST appear as a
 # substring of `claude --help` for the e2e gate to pass.
 
-version=2.1.150
+version=2.1.158
 
 flag=--session-id
 flag=--permission-mode
