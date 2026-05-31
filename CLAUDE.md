@@ -1,10 +1,10 @@
 # tui-driver — Project Memory for Claude Code
 
-Go library for driving interactive `claude` CLI sessions via PTY. Pre-spike state — architecture decided 2026-05-16, no implementation yet.
+Go library for driving interactive `claude` CLI sessions via PTY. Library shipped: `pkg/tuidriver/` (~25 files, ~80 tests). Consumer is `pyry agent-run` (consumer migration shipped to pyrycode `main` 2026-05-23).
 
 ## Vault context (read these first when picking up this project)
 
-- `📋 Projects/2026-04-10 - Pyrycode/TUI Driver.md` — canonical architecture, scope, language choice, library set, spike plan
+- `📋 Projects/2026-04-10 - Pyrycode/TUI Driver.md` — canonical architecture, scope, language choice, library set
 - `📋 Projects/2026-04-10 - Pyrycode/Drop-In Contract.md` — strategic context (subscription-billing preservation via PTY-driven interactive `claude`)
 - `📋 Projects/2026-04-10 - Pyrycode/Pyrycode.md` — parent project
 
@@ -14,11 +14,13 @@ This library owns: **PTY allocation, byte-stream parsing, state detection, modal
 
 It does **NOT** own: JSONL parsing (consumer's job), ACP protocol (consumer's job), agent-stage logic (consumer's job), dispatcher coordination (consumer's job), cost telemetry (consumer extracts from JSONL).
 
-When a feature idea surfaces, first ask: does this belong in tui-driver or in the consumer? If the answer is "the consumer needs to know about claude sessions specifically," it belongs in the consumer. tui-driver should work against any TUI-style CLI in principle.
+When a feature idea surfaces, first ask: does this belong in tui-driver or in the consumer? If the answer is "the consumer needs to know about claude sessions specifically," it belongs in the consumer. tui-driver should work against any TUI-style CLI in principle. The library shipping in `pkg/tuidriver/` reflects this split; the consumer (`pyry agent-run`) owns JSONL/ACP/agent-stage logic.
 
 ## Architecture (one paragraph)
 
-PTY allocation → spawn target binary → continuous read into rolling buffer → pattern matchers classify state (idle / thinking / modal / hung / errored) → consumer subscribes to state events and writes input via library APIs. The **thinking indicator** (`✻ Baked for Ns`) is the keystone state signal. State detection uses pattern matching, not full terminal emulation.
+PTY allocation → spawn target binary → continuous read into rolling buffer → pattern matchers classify state (idle / thinking / modal / hung / errored) → consumer subscribes to state events and writes input via library APIs. State detection uses pattern matching, not full terminal emulation.
+
+**Spinner caveat (claude 2.1.158):** the class-A `✻ <verb> for Ns` spinner format matches **0/667 frames**, so `ParseSpinner` and the spinner-freeze watchdog arm are effectively dead (tui-driver#124). `IsThinking` (bare `✻` glyph presence) still works as a "claude has started processing" signal. Prefer the `"esc to interrupt"` hint as the reliable in-flight anchor.
 
 ## Library choices
 
@@ -26,9 +28,9 @@ PTY allocation → spawn target binary → continuous read into rolling buffer �
 - Regex: stdlib `regexp`
 - Concurrency: goroutines + channels (natural fit for concurrent reader / writer / state observer)
 
-## Spike plan
+## Spikes
 
-See `📋 Projects/2026-04-10 - Pyrycode/TUI Driver.md#Spike Plan (~4 hours)`.
+The spikes graduated from throwaway prototypes to example consumers of the shipped library. The seven `cmd/spike-*` binaries import `pkg/tuidriver/` and compose its primitives into specific workflows; they double as regression-detection harnesses. Historical spike plan: `📋 Projects/2026-04-10 - Pyrycode/TUI Driver.md#Spike Plan (~4 hours)`.
 
 ## Pipeline
 
