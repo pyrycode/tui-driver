@@ -16,12 +16,10 @@ func TestParseSnapshotResults(t *testing.T) {
 	}{
 		{
 			name: "all match",
-			stdout: "SNAPSHOT picker match\n" +
-				"SNAPSHOT mcp match\n" +
+			stdout: "SNAPSHOT mcp match\n" +
 				"SNAPSHOT agents match\n",
 			want: map[string]any{
 				"snapshots": []map[string]any{
-					{"file": "pkg/tuidriver/testdata/picker-snapshot.json", "result": "match"},
 					{"file": "pkg/tuidriver/testdata/mcp-snapshot.json", "result": "match"},
 					{"file": "pkg/tuidriver/testdata/agents-snapshot.json", "result": "match"},
 				},
@@ -29,12 +27,10 @@ func TestParseSnapshotResults(t *testing.T) {
 		},
 		{
 			name: "mixed match and diff",
-			stdout: "SNAPSHOT picker match\n" +
-				"SNAPSHOT mcp diff\n" +
+			stdout: "SNAPSHOT mcp diff\n" +
 				"SNAPSHOT agents match\n",
 			want: map[string]any{
 				"snapshots": []map[string]any{
-					{"file": "pkg/tuidriver/testdata/picker-snapshot.json", "result": "match"},
 					{"file": "pkg/tuidriver/testdata/mcp-snapshot.json", "result": "diff"},
 					{"file": "pkg/tuidriver/testdata/agents-snapshot.json", "result": "match"},
 				},
@@ -53,7 +49,6 @@ func TestParseSnapshotResults(t *testing.T) {
 		{
 			name: "noisy stdout with SNAPSHOT lines interspersed",
 			stdout: "2026-05-19 14:00:00 starting\n" +
-				"SNAPSHOT picker match\n" +
 				"intermediate log\n" +
 				"SNAPSHOT mcp diff\n" +
 				"final log line\n" +
@@ -61,7 +56,6 @@ func TestParseSnapshotResults(t *testing.T) {
 				"done\n",
 			want: map[string]any{
 				"snapshots": []map[string]any{
-					{"file": "pkg/tuidriver/testdata/picker-snapshot.json", "result": "match"},
 					{"file": "pkg/tuidriver/testdata/mcp-snapshot.json", "result": "diff"},
 					{"file": "pkg/tuidriver/testdata/agents-snapshot.json", "result": "match"},
 				},
@@ -69,10 +63,9 @@ func TestParseSnapshotResults(t *testing.T) {
 		},
 		{
 			name:   "partial output (timeout mid-run)",
-			stdout: "SNAPSHOT picker match\nSNAPSHOT mcp match\n",
+			stdout: "SNAPSHOT mcp match\n",
 			want: map[string]any{
 				"snapshots": []map[string]any{
-					{"file": "pkg/tuidriver/testdata/picker-snapshot.json", "result": "match"},
 					{"file": "pkg/tuidriver/testdata/mcp-snapshot.json", "result": "match"},
 				},
 			},

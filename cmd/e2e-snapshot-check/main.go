@@ -19,7 +19,6 @@
 //
 // Stdout protocol (one line per fixture, in fixture-table order):
 //
-//	SNAPSHOT picker match|diff|recorded
 //	SNAPSHOT mcp match|diff|recorded
 //	SNAPSHOT agents match|diff|recorded
 //
@@ -58,7 +57,7 @@ var dumpPathRe = regexp.MustCompile(`picker-snapshot path=(\S+)`)
 var modalClassRe = regexp.MustCompile(`modal-class detected=(\S*)`)
 
 type fixture struct {
-	name    string // "picker" | "mcp" | "agents"
+	name    string // "mcp" | "agents"
 	trigger string // raw bytes for -trigger flag
 	settle  time.Duration
 }
@@ -71,7 +70,6 @@ func main() {
 	flag.Parse()
 
 	fixtures := []fixture{
-		{name: "picker", trigger: "/", settle: 0},
 		{name: "mcp", trigger: "/mcp\r", settle: 5 * time.Second},
 		{name: "agents", trigger: "/agents\r", settle: 0},
 	}
