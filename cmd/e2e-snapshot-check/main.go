@@ -49,6 +49,14 @@ import (
 // log line. The label is "picker-snapshot" regardless of which trigger we used.
 var dumpPathRe = regexp.MustCompile(`picker-snapshot path=(\S+)`)
 
+// modalClassRe scrapes spike-multiselect's stderr "modal-class detected=<X>"
+// log line (logged before the parser dispatch, so it's present even when no
+// sidecar is written). `(\S*)` not `\S+`: ModalClassUnknown is the empty
+// string, so the line is "modal-class detected=" with nothing after it. Used
+// to enrich the missing-sidecar diff message — a missing .parsed.json with a
+// non-MCP class is classifier drift, not a content diff (#128).
+var modalClassRe = regexp.MustCompile(`modal-class detected=(\S*)`)
+
 type fixture struct {
 	name    string // "picker" | "mcp" | "agents"
 	trigger string // raw bytes for -trigger flag
@@ -118,7 +126,8 @@ func runFixture(binDir, testdataDir string, spikeTimeout time.Duration, record b
 
 	capturedJSON, err := os.ReadFile(parsedPath)
 	if err != nil {
-		emitDiff(f, fixturePath, fmt.Errorf("read parsed-json %s: %w", parsedPath, err))
+		readErr := enrichMissingSidecar(fmt.Errorf("read parsed-json %s: %w", parsedPath, err), stderrBuf.Bytes())
+		emitDiff(f, fixturePath, readErr)
 		return false
 	}
 
@@ -157,6 +166,27 @@ func runFixture(binDir, testdataDir string, spikeTimeout time.Duration, record b
 	}
 	fmt.Printf("SNAPSHOT %s match\n", f.name)
 	return true
+}
+
+// enrichMissingSidecar augments a missing-sidecar read error with the modal
+// class spike-multiselect detected, scraped from its stderr. A missing
+// .parsed.json with a non-MCP class means the classifier didn't recognise the
+// captured UI and the spike's default branch wrote nothing — classifier drift
+// masquerading as a content diff (#128). The empty-string class
+// (ModalClassUnknown) is rendered as "Unknown". When stderr has no
+// modal-class line (spike crashed before logging it), readErr is returned
+// unchanged. Only the error message is affected; control flow and exit codes
+// are not.
+func enrichMissingSidecar(readErr error, stderr []byte) error {
+	mc := modalClassRe.FindSubmatch(stderr)
+	if mc == nil {
+		return readErr
+	}
+	class := string(mc[1])
+	if class == "" {
+		class = "Unknown"
+	}
+	return fmt.Errorf("%w (spike classified modal as %q and wrote no sidecar — classifier drift, not a content diff)", readErr, class)
 }
 
 // emitDiff prints the diff verdict to stdout and the operator-facing
