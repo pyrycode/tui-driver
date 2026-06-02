@@ -22,13 +22,13 @@ type WatchdogOpts struct {
 }
 
 // RunWatchdog blocks on the calling goroutine, driving the spike-
-// validated 1 Hz watchdog loop until ctx is cancelled or tr.CheckWatchdog
-// reports a wedge. Returns nil on ctx cancellation (the caller asked to
-// stop, matching Spawn/Session.Wait's cancellation convention) and the
-// CheckWatchdog error verbatim on wedge (suitable for direct logging —
-// the error string already names the failure mode and the last recorded
-// state). The function returns at most once; the ticker is released via
-// defer on every return path.
+// validated 1 Hz watchdog loop against this session's rolling buffer until
+// ctx is cancelled or tr.CheckWatchdog reports a wedge. Returns nil on ctx
+// cancellation (the caller asked to stop, matching Spawn/Session.Wait's
+// cancellation convention) and the CheckWatchdog error verbatim on wedge
+// (suitable for direct logging — the error string already names the failure
+// mode and the last recorded state). The function returns at most once; the
+// ticker is released via defer on every return path.
 //
 // Per-tick work (in order):
 //
@@ -51,7 +51,7 @@ type WatchdogOpts struct {
 // context with the error as cause:
 //
 //	go func() {
-//	    if err := tuidriver.RunWatchdog(ctx, sess.Buffer, tr, tuidriver.WatchdogOpts{}); err != nil {
+//	    if err := sess.RunWatchdog(ctx, tr, tuidriver.WatchdogOpts{}); err != nil {
 //	        log.Printf("%v", err)
 //	        cancelCause(err)
 //	    }
@@ -63,7 +63,26 @@ type WatchdogOpts struct {
 // internal goroutines are spawned. Nil buf or tr will panic on first
 // dereference, matching the library's "construct or you get a
 // nil-deref" posture.
+func (s *Session) RunWatchdog(ctx context.Context, tr *Tracker, opts WatchdogOpts) error {
+	return runWatchdogLoop(ctx, s.Buffer, tr, opts)
+}
+
+// RunWatchdog is the free-function form, retained transitionally for consumers
+// that hold a *Buffer directly.
+//
+// Deprecated: use Session.RunWatchdog, which reaches the session's buffer
+// internally so consumers never touch the raw buffer. This free function is
+// removed in the breaking step.
 func RunWatchdog(ctx context.Context, buf *Buffer, tr *Tracker, opts WatchdogOpts) error {
+	return runWatchdogLoop(ctx, buf, tr, opts)
+}
+
+// runWatchdogLoop is the unexported loop body shared by Session.RunWatchdog and
+// the transitional free function, and the seam watchdog_test.go drives with a
+// raw *Buffer. The per-tick work list (Snapshot → ParseSpinner →
+// ObserveSpinner → CheckWatchdog) is the cross-spike-validated calibration; see
+// the RunWatchdog doc for why it is intentionally not configurable.
+func runWatchdogLoop(ctx context.Context, buf *Buffer, tr *Tracker, opts WatchdogOpts) error {
 	tick := opts.Tick
 	if tick <= 0 {
 		tick = DefaultWatchdogTick

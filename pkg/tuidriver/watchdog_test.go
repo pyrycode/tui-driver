@@ -123,6 +123,29 @@ func TestRunWatchdogSpinnerFreezeWedge(t *testing.T) {
 	}
 }
 
+// TestSessionRunWatchdogMethod proves the method form drives the loop against
+// the session's own buffer — the same wedge fires through s.RunWatchdog as
+// through the loop directly, with no raw buffer handed to the consumer.
+func TestSessionRunWatchdogMethod(t *testing.T) {
+	s := &Session{Buffer: NewBuffer(0)}
+	s.Buffer.Append([]byte("x"))
+	tr := NewTracker(TrackerOpts{
+		PTYQuietLimit:      50 * time.Millisecond,
+		SpinnerFreezeLimit: 1 * time.Hour,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	err := s.RunWatchdog(ctx, tr, WatchdogOpts{Tick: 20 * time.Millisecond})
+	if err == nil {
+		t.Fatal("Session.RunWatchdog with stale buffer = nil, want PTY-quiet wedge")
+	}
+	if !strings.Contains(err.Error(), "PTY quiet") {
+		t.Errorf("error = %q, want it to contain 'PTY quiet'", err.Error())
+	}
+}
+
 // TestRunWatchdogDefaultTickApplied verifies the zero-value
 // WatchdogOpts.Tick falls through to DefaultWatchdogTick. Indirect
 // proof: with the 1s default tick and a buffer that goes stale at
