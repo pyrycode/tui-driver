@@ -112,7 +112,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	tuidriver.EnsureClaudeEnv(cmd)
 
 	session, err := tuidriver.Spawn(cmd, tuidriver.SpawnOpts{
-		Mirror:        os.Stderr,
+		MirrorStderr:  true,
 		ShutdownGrace: shutdownGrace,
 	})
 	if err != nil {
@@ -123,16 +123,13 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 		_ = session.Close()
 		cancelCause(errors.New("shutdown"))
 	}()
-	rb := session.Buffer
-	ptmx := session.PTY
-
 	var wg sync.WaitGroup
 
 	// Watchdog: 1 Hz inactivity + spinner-freeze enforcement.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := tuidriver.RunWatchdog(rootCtx, rb, tr, tuidriver.WatchdogOpts{}); err != nil {
+		if err := session.RunWatchdog(rootCtx, tr, tuidriver.WatchdogOpts{}); err != nil {
 			logger.Printf("%v", err)
 			cancelCause(err)
 		}
@@ -141,19 +138,19 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	// --- linear state machine ---
 
 	if err := tuidriver.WaitUntil(rootCtx, func() bool {
-		return tuidriver.IsIdle(rb.Snapshot())
+		return tuidriver.IsIdle(session.Snapshot())
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
 	tr.RecordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
-	if tuidriver.HasTrustModal(rb.Snapshot()) {
+	if tuidriver.HasTrustModal(session.Snapshot()) {
 		switch trustFolderPolicy {
 		case "fail":
 			return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike. Or pass `-trust-folder accept` to auto-trust")
 		case "accept":
-			if _, err := ptmx.Write([]byte("1\r")); err != nil {
+			if err := session.AcceptTrust(); err != nil {
 				return fmt.Errorf("write trust-accept keystroke: %w", err)
 			}
 			tr.RecordTransition("trust-folder-accepted")
@@ -162,7 +159,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			// HasTrustModal must be false (modal text is gone) AND isIdle
 			// must be true (❯ visible + no spinner).
 			if err := tuidriver.WaitUntil(rootCtx, func() bool {
-				snap := rb.Snapshot()
+				snap := session.Snapshot()
 				return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
@@ -225,7 +222,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 			// pre-refactor fast-path skip-through (gotEndTurn &&
 			// !thinkingObserved) when ParseSpinner misses (the documented
 			// class-C case; spike-one-turn finding #8).
-			v, _, ok := tuidriver.ParseSpinner(rb.Snapshot())
+			v, _, ok := tuidriver.ParseSpinner(session.Snapshot())
 			if !ok {
 				continue
 			}

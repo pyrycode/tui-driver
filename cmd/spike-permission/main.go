@@ -365,7 +365,7 @@ func runSession(
 	tuidriver.EnsureClaudeEnv(cmd)
 
 	session, err := tuidriver.Spawn(cmd, tuidriver.SpawnOpts{
-		Mirror:        os.Stderr,
+		MirrorStderr:  true,
 		ShutdownGrace: shutdownGrace,
 	})
 	if err != nil {
@@ -376,8 +376,6 @@ func runSession(
 		_ = session.Close()
 		cancelCause(errors.New("shutdown"))
 	}()
-	rb := session.Buffer
-	ptmx := session.PTY
 
 	var wg sync.WaitGroup
 
@@ -390,7 +388,7 @@ func runSession(
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := tuidriver.RunWatchdog(ctx, rb, tr, tuidriver.WatchdogOpts{}); err != nil {
+		if err := session.RunWatchdog(ctx, tr, tuidriver.WatchdogOpts{}); err != nil {
 			logger.Printf("%v", err)
 			cancelCause(err)
 		}
@@ -399,25 +397,25 @@ func runSession(
 	// Wait for idle (❯ glyph + no spinner). Same predicate as the other
 	// spikes.
 	if err := tuidriver.WaitUntil(ctx, func() bool {
-		return tuidriver.IsIdle(rb.Snapshot())
+		return tuidriver.IsIdle(session.Snapshot())
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
 	tr.RecordTransition(fmt.Sprintf("session=%s idle-detected", tag))
 	logger.Printf("idle-detected tag=%s", tag)
 
-	if tuidriver.HasTrustModal(rb.Snapshot()) {
+	if tuidriver.HasTrustModal(session.Snapshot()) {
 		switch trustFolderPolicy {
 		case "fail":
 			return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike. Or pass `-trust-folder accept` to auto-trust")
 		case "accept":
-			if _, err := ptmx.Write([]byte("1\r")); err != nil {
+			if err := session.AcceptTrust(); err != nil {
 				return fmt.Errorf("write trust-accept keystroke: %w", err)
 			}
 			tr.RecordTransition(fmt.Sprintf("session=%s trust-folder-accepted", tag))
 			logger.Printf("trust-folder-accepted tag=%s bytes=31 0d", tag)
 			if err := tuidriver.WaitUntil(ctx, func() bool {
-				snap := rb.Snapshot()
+				snap := session.Snapshot()
 				return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
@@ -429,7 +427,7 @@ func runSession(
 
 	// Diagnostic: does the chosen modal predicate produce a false positive
 	// at idle (before any prompt)? The README documents the baseline.
-	idleHasModal := hasModal(rb.Snapshot(), pred)
+	idleHasModal := hasModal(session.Snapshot(), pred)
 	logger.Printf("idle-predicate-check tag=%s predicate=%s has_modal=%v",
 		tag, pred.String(), idleHasModal)
 
@@ -464,15 +462,15 @@ func runSession(
 		probeN := startProbeN + i
 		switch p.kind {
 		case kindObserve:
-			if err := runObserve(ctx, logger, probeN, p.prompt, pred, session, rb, &eventCh, tr, openTailerHook); err != nil {
+			if err := runObserve(ctx, logger, probeN, p.prompt, pred, session, &eventCh, tr, openTailerHook); err != nil {
 				return fmt.Errorf("probe %d: %w", probeN, err)
 			}
 		case kindAutoRespond:
-			if err := runAutoRespond(ctx, logger, probeN, p.prompt, approveKey, approveHex, pred, session, rb, &eventCh, tr, openTailerHook); err != nil {
+			if err := runAutoRespond(ctx, logger, probeN, p.prompt, approveKey, approveHex, pred, session, &eventCh, tr, openTailerHook); err != nil {
 				return fmt.Errorf("probe %d: %w", probeN, err)
 			}
 		case kindEscalate:
-			if err := runEscalate(ctx, logger, probeN, p.prompt, pred, session, rb, &eventCh, tr); err != nil {
+			if err := runEscalate(ctx, logger, probeN, p.prompt, pred, session, &eventCh, tr); err != nil {
 				return fmt.Errorf("probe %d: %w", probeN, err)
 			}
 		default:
@@ -494,7 +492,6 @@ func runObserve(
 	prompt string,
 	pred modalPredicate,
 	session *tuidriver.Session,
-	rb *tuidriver.Buffer,
 	eventChRef *<-chan tuidriver.JSONLEntry,
 	tr *tuidriver.Tracker,
 	postPromptHook func() error,
@@ -520,14 +517,14 @@ func runObserve(
 	eventCh := *eventChRef
 
 	// Wait for the modal to appear.
-	if err := waitForModal(ctx, rb, pred, modalDetectLimit); err != nil {
+	if err := waitForModal(ctx, session, pred, modalDetectLimit); err != nil {
 		return fmt.Errorf("probe %d: %w", probeN, err)
 	}
 	tr.RecordTransition(fmt.Sprintf("probe=%d modal-detected", probeN))
 	logger.Printf("probe=%d modal-detected pattern=%q", probeN, pred.String())
 
 	// Snapshot bytes + persist to tempfile + log truncated extracted text.
-	snap := rb.Snapshot()
+	snap := session.Snapshot()
 	tr.RecordTransition(fmt.Sprintf("probe=%d modal-bytes-snapshot", probeN))
 	logger.Printf("probe=%d modal-bytes-snapshot len=%d", probeN, len(snap))
 
@@ -587,7 +584,6 @@ func runAutoRespond(
 	approveHex string,
 	pred modalPredicate,
 	session *tuidriver.Session,
-	rb *tuidriver.Buffer,
 	eventChRef *<-chan tuidriver.JSONLEntry,
 	tr *tuidriver.Tracker,
 	postPromptHook func() error,
@@ -612,13 +608,13 @@ func runAutoRespond(
 
 	eventCh := *eventChRef
 
-	if err := waitForModal(ctx, rb, pred, modalDetectLimit); err != nil {
+	if err := waitForModal(ctx, session, pred, modalDetectLimit); err != nil {
 		return fmt.Errorf("probe %d: %w", probeN, err)
 	}
 	tr.RecordTransition(fmt.Sprintf("probe=%d modal-detected", probeN))
 	logger.Printf("probe=%d modal-detected pattern=%q", probeN, pred.String())
 
-	text := extractModalText(rb.Snapshot())
+	text := extractModalText(session.Snapshot())
 	logger.Printf("probe=%d modal-text-extracted text=%q", probeN, truncateForLog(text, 200))
 
 	if err := sendKeystroke(session, approveKey); err != nil {
@@ -688,11 +684,11 @@ func runAutoRespond(
 		if !gotEndTurn {
 			return false
 		}
-		stripped := tuidriver.StripANSI(rb.Snapshot())
+		stripped := tuidriver.StripANSI(session.Snapshot())
 		if !bytes.Contains(stripped, tuidriver.IdleGlyph) {
 			return false
 		}
-		return rb.QuietFor() >= ptyQuietWindow
+		return session.QuietFor() >= ptyQuietWindow
 	}
 
 	for !check() {
@@ -747,7 +743,6 @@ func runEscalate(
 	prompt string,
 	pred modalPredicate,
 	session *tuidriver.Session,
-	rb *tuidriver.Buffer,
 	eventChRef *<-chan tuidriver.JSONLEntry,
 	tr *tuidriver.Tracker,
 ) error {
@@ -776,13 +771,13 @@ drain:
 	tr.RecordTransition(fmt.Sprintf("probe=%d prompt-written", probeN))
 	logger.Printf("probe=%d prompt-written", probeN)
 
-	if err := waitForModal(ctx, rb, pred, modalDetectLimit); err != nil {
+	if err := waitForModal(ctx, session, pred, modalDetectLimit); err != nil {
 		return fmt.Errorf("probe %d: %w", probeN, err)
 	}
 	tr.RecordTransition(fmt.Sprintf("probe=%d modal-detected", probeN))
 	logger.Printf("probe=%d modal-detected pattern=%q", probeN, pred.String())
 
-	snap := rb.Snapshot()
+	snap := session.Snapshot()
 	snapPath := fmt.Sprintf("/tmp/spike-permission-probe%d-bytes-%d.bin", probeN, time.Now().UnixNano())
 	if err := writeTempSnapshot(snapPath, snap); err != nil {
 		logger.Printf("warning: probe=%d snapshot-write-err err=%v", probeN, err)
@@ -810,7 +805,7 @@ drain:
 	case <-time.After(escalationWindow):
 	}
 
-	stillOpen := hasModal(rb.Snapshot(), pred)
+	stillOpen := hasModal(session.Snapshot(), pred)
 	tr.RecordTransition(fmt.Sprintf("probe=%d modal-still-open", probeN))
 	logger.Printf("probe=%d modal-still-open=%v", probeN, stillOpen)
 
@@ -819,12 +814,12 @@ drain:
 
 // waitForModal polls hasModal at statePollInterval until true or limit
 // elapses. Returns the watchdog-shaped error on timeout.
-func waitForModal(ctx context.Context, rb *tuidriver.Buffer, pred modalPredicate, limit time.Duration) error {
+func waitForModal(ctx context.Context, session *tuidriver.Session, pred modalPredicate, limit time.Duration) error {
 	deadline := time.Now().Add(limit)
 	ticker := time.NewTicker(statePollInterval)
 	defer ticker.Stop()
 	for {
-		if hasModal(rb.Snapshot(), pred) {
+		if hasModal(session.Snapshot(), pred) {
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -1000,8 +995,7 @@ func extractToolName(snap []byte) string {
 // "\x1b[B\r"). Renamed from spike-cancel's sendCancel because this spike
 // uses the same writer for the approve keystroke too.
 func sendKeystroke(session *tuidriver.Session, keystroke []byte) error {
-	_, err := session.Write(keystroke)
-	return err
+	return session.SendKeys(string(keystroke))
 }
 
 // writeTempSnapshot writes snap bytes to path with mode 0600 (defensive

@@ -96,7 +96,7 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	tuidriver.EnsureClaudeEnv(cmd)
 
 	session, err := tuidriver.Spawn(cmd, tuidriver.SpawnOpts{
-		Mirror:        os.Stderr,
+		MirrorStderr:  true,
 		ShutdownGrace: shutdownGrace,
 	})
 	if err != nil {
@@ -107,8 +107,6 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 		_ = session.Close()
 		cancelCause(errors.New("shutdown"))
 	}()
-	rb := session.Buffer
-	ptmx := session.PTY
 
 	var wg sync.WaitGroup
 
@@ -116,32 +114,32 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := tuidriver.RunWatchdog(rootCtx, rb, tr, tuidriver.WatchdogOpts{}); err != nil {
+		if err := session.RunWatchdog(rootCtx, tr, tuidriver.WatchdogOpts{}); err != nil {
 			logger.Printf("%v", err)
 			cancelCause(err)
 		}
 	}()
 
 	// Wait for idle.
-	if err := tuidriver.WaitUntil(rootCtx, func() bool { return tuidriver.IsIdle(rb.Snapshot()) }); err != nil {
+	if err := tuidriver.WaitUntil(rootCtx, func() bool { return tuidriver.IsIdle(session.Snapshot()) }); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
 	tr.RecordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
 	// Trust-folder dialog handling. Same shape as spike-one-turn.
-	if tuidriver.HasTrustModal(rb.Snapshot()) {
+	if tuidriver.HasTrustModal(session.Snapshot()) {
 		switch trustFolderPolicy {
 		case "fail":
 			return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike. Or pass `-trust-folder accept` to auto-trust")
 		case "accept":
-			if _, err := ptmx.Write([]byte("1\r")); err != nil {
+			if err := session.AcceptTrust(); err != nil {
 				return fmt.Errorf("write trust-accept keystroke: %w", err)
 			}
 			tr.RecordTransition("trust-folder-accepted")
 			logger.Printf("trust-folder-accepted bytes=31 0d")
 			if err := tuidriver.WaitUntil(rootCtx, func() bool {
-				snap := rb.Snapshot()
+				snap := session.Snapshot()
 				return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
@@ -154,7 +152,7 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	// Send the trigger keystroke (no Enter — we want the picker to OPEN,
 	// not commit a command). Claude's TUI uses the keystroke to begin
 	// pre-fix matching against available commands and renders the picker.
-	if _, err := ptmx.Write([]byte(trigger)); err != nil {
+	if err := session.SendKeys(trigger); err != nil {
 		return fmt.Errorf("write trigger: %w", err)
 	}
 	tr.RecordTransition("trigger-sent")
@@ -178,20 +176,25 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 		keys := strings.Split(postTriggerKeys, ",")
 		for _, k := range keys {
 			k = strings.TrimSpace(k)
+			var arrow tuidriver.ArrowKey
 			var keyBytes []byte
 			switch k {
 			case "down":
+				arrow = tuidriver.ArrowDown
 				keyBytes = []byte{0x1b, 0x5b, 0x42} // \x1b[B
 			case "up":
+				arrow = tuidriver.ArrowUp
 				keyBytes = []byte{0x1b, 0x5b, 0x41} // \x1b[A
 			case "left":
+				arrow = tuidriver.ArrowLeft
 				keyBytes = []byte{0x1b, 0x5b, 0x44} // \x1b[D
 			case "right":
+				arrow = tuidriver.ArrowRight
 				keyBytes = []byte{0x1b, 0x5b, 0x43} // \x1b[C
 			default:
 				return fmt.Errorf("unknown post-trigger key %q (want down/up/left/right)", k)
 			}
-			if _, err := ptmx.Write(keyBytes); err != nil {
+			if err := session.Navigate(arrow); err != nil {
 				return fmt.Errorf("write %q: %w", k, err)
 			}
 			tr.RecordTransition("post-trigger-key-" + k)
@@ -207,7 +210,7 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 
 	// Snapshot. Dump raw bytes to /tmp for byte-level inspection;
 	// emit structural observations to the state log.
-	snap := rb.Snapshot()
+	snap := session.Snapshot()
 	stripped := tuidriver.StripOSC(tuidriver.StripANSI(snap))
 	dumpPath := fmt.Sprintf("/tmp/spike-multiselect-bytes-%d.bin", time.Now().UnixNano())
 	if err := os.WriteFile(dumpPath, snap, 0o644); err != nil {
@@ -341,7 +344,7 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	}
 
 	// Send ESC to dismiss the picker — no commitment to running anything.
-	if _, err := ptmx.Write([]byte{0x1b}); err != nil {
+	if err := session.SendEsc(); err != nil {
 		return fmt.Errorf("write esc: %w", err)
 	}
 	tr.RecordTransition("picker-dismissed")
@@ -351,7 +354,7 @@ func run(trigger string, trustFolderPolicy string, postTriggerKeys string, settl
 	// the dismiss keystroke works and how long it takes).
 	dismissDeadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(dismissDeadline) {
-		if tuidriver.IsIdle(rb.Snapshot()) {
+		if tuidriver.IsIdle(session.Snapshot()) {
 			logger.Printf("idle-detected-post-dismiss elapsed=%s", time.Since(dismissDeadline.Add(-3*time.Second)).Round(time.Millisecond))
 			break
 		}
