@@ -516,7 +516,7 @@ func TestMergeEvents_BannerCoexistsWithIdleAndModal(t *testing.T) {
 }
 
 func TestEvents_TailJSONLErrorBubbles(t *testing.T) {
-	s := &Session{Buffer: NewBuffer(0)}
+	s := &Session{buffer: NewBuffer(0)}
 	missing := filepath.Join(t.TempDir(), "nonexistent", "x.jsonl")
 	ch, err := s.Events(context.Background(), missing, 0)
 	if err == nil {

@@ -10,7 +10,7 @@ import (
 // delegate to the rolling buffer — the read seam that replaces the exported
 // Buffer field.
 func TestSessionBufferDelegators(t *testing.T) {
-	s := &Session{Buffer: NewBuffer(0)}
+	s := &Session{buffer: NewBuffer(0)}
 
 	if got := s.Snapshot(); len(got) != 0 {
 		t.Errorf("Snapshot on empty = %q, want empty", got)
@@ -22,7 +22,7 @@ func TestSessionBufferDelegators(t *testing.T) {
 		t.Errorf("QuietFor before any append = %v, want 0", d)
 	}
 
-	s.Buffer.Append([]byte("hello"))
+	s.buffer.Append([]byte("hello"))
 
 	if got := s.Snapshot(); !bytes.Equal(got, []byte("hello")) {
 		t.Errorf("Snapshot = %q, want %q", got, "hello")

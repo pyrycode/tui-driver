@@ -191,15 +191,15 @@ func TestDeliverPrompt_ClearError(t *testing.T) {
 
 func TestPromptDidCommit(t *testing.T) {
 	t.Run("spinner visible returns true", func(t *testing.T) {
-		s := &Session{Buffer: NewBuffer(0)}
-		s.Buffer.Append(SpinnerGlyph) // ✻ → IsThinking true
+		s := &Session{buffer: NewBuffer(0)}
+		s.buffer.Append(SpinnerGlyph) // ✻ → IsThinking true
 		if !s.promptDidCommit(context.Background(), "", time.Second) {
 			t.Error("promptDidCommit = false, want true (spinner visible)")
 		}
 	})
 
 	t.Run("jsonl file present returns true", func(t *testing.T) {
-		s := &Session{Buffer: NewBuffer(0)} // no spinner
+		s := &Session{buffer: NewBuffer(0)} // no spinner
 		jsonl := filepath.Join(t.TempDir(), "session.jsonl")
 		if err := os.WriteFile(jsonl, []byte("{}"), 0o600); err != nil {
 			t.Fatal(err)
@@ -210,7 +210,7 @@ func TestPromptDidCommit(t *testing.T) {
 	})
 
 	t.Run("no signal times out to false", func(t *testing.T) {
-		s := &Session{Buffer: NewBuffer(0)}
+		s := &Session{buffer: NewBuffer(0)}
 		missing := filepath.Join(t.TempDir(), "absent.jsonl")
 		start := time.Now()
 		if s.promptDidCommit(context.Background(), missing, 120*time.Millisecond) {
@@ -222,7 +222,7 @@ func TestPromptDidCommit(t *testing.T) {
 	})
 
 	t.Run("ctx cancel returns false promptly", func(t *testing.T) {
-		s := &Session{Buffer: NewBuffer(0)}
+		s := &Session{buffer: NewBuffer(0)}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		if s.promptDidCommit(ctx, "", 5*time.Second) {

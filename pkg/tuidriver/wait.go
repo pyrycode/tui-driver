@@ -18,7 +18,7 @@ const DefaultPollInterval = 50 * time.Millisecond
 // Use as the standard "wait for a TUI state transition" primitive:
 //
 //	err := tuidriver.WaitUntil(ctx, func() bool {
-//	    return tuidriver.IsIdle(session.Buffer.Snapshot())
+//	    return tuidriver.IsIdle(session.Snapshot())
 //	})
 //
 // For custom poll intervals, the caller can write the loop directly —

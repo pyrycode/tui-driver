@@ -25,34 +25,19 @@ func TestSpawnAndBufferReceivesOutput(t *testing.T) {
 	if err := s.Wait(); err != nil {
 		t.Fatalf("Wait: %v", err)
 	}
-	got := string(s.Buffer.Snapshot())
+	got := string(s.Snapshot())
 	if !strings.Contains(got, "hello") {
 		t.Errorf("Buffer.Snapshot = %q, want it to contain %q", got, "hello")
 	}
 }
 
-func TestSpawnMirrorReceivesOutput(t *testing.T) {
+func TestSpawnWriteRawSendsToPTY(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("PTY tests skipped on Windows")
 	}
-	var mirror bytes.Buffer
-	cmd := exec.Command("echo", "mirrored")
-	s, err := Spawn(cmd, SpawnOpts{Mirror: &mirror})
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
-	defer s.Close()
-	_ = s.Wait()
-	if !strings.Contains(mirror.String(), "mirrored") {
-		t.Errorf("Mirror = %q, want it to contain %q", mirror.String(), "mirrored")
-	}
-}
-
-func TestSpawnWriteSendsToPTY(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("PTY tests skipped on Windows")
-	}
-	// `cat` echoes input. Send "ping\n", expect it back in the buffer.
+	// `cat` echoes input. Send "ping\n" via the internal write funnel, expect
+	// it back in the buffer. (The public Write seam is gone; writeRaw is the
+	// single path all typed keystroke methods funnel through.)
 	cmd := exec.Command("cat")
 	s, err := Spawn(cmd, SpawnOpts{})
 	if err != nil {
@@ -60,18 +45,18 @@ func TestSpawnWriteSendsToPTY(t *testing.T) {
 	}
 	defer s.Close()
 
-	if _, err := s.Write([]byte("ping\n")); err != nil {
-		t.Fatalf("Write: %v", err)
+	if err := s.writeRaw([]byte("ping\n")); err != nil {
+		t.Fatalf("writeRaw: %v", err)
 	}
 	// Wait for cat to echo it back.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if bytes.Contains(s.Buffer.Snapshot(), []byte("ping")) {
+		if bytes.Contains(s.Snapshot(), []byte("ping")) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Errorf("Buffer never received echoed input; snap=%q", s.Buffer.Snapshot())
+	t.Errorf("Buffer never received echoed input; snap=%q", s.Snapshot())
 }
 
 func TestBracketedPasteWrapping(t *testing.T) {
@@ -130,12 +115,12 @@ func TestSessionWritePromptSendsBracketedPaste(t *testing.T) {
 	expected := []byte("\x1b[200~ping\x1b[201~")
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if bytes.Contains(s.Buffer.Snapshot(), expected) {
+		if bytes.Contains(s.Snapshot(), expected) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Errorf("Buffer never received bracketed-paste sequence; snap=%q", s.Buffer.Snapshot())
+	t.Errorf("Buffer never received bracketed-paste sequence; snap=%q", s.Snapshot())
 }
 
 func TestSessionClearInputLineSendsCtrlU(t *testing.T) {
@@ -157,13 +142,13 @@ func TestSessionClearInputLineSendsCtrlU(t *testing.T) {
 
 	readyDeadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(readyDeadline) {
-		if bytes.Contains(s.Buffer.Snapshot(), []byte("READY")) {
+		if bytes.Contains(s.Snapshot(), []byte("READY")) {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if !bytes.Contains(s.Buffer.Snapshot(), []byte("READY")) {
-		t.Fatalf("stty/cat never reached READY; snap=%q", s.Buffer.Snapshot())
+	if !bytes.Contains(s.Snapshot(), []byte("READY")) {
+		t.Fatalf("stty/cat never reached READY; snap=%q", s.Snapshot())
 	}
 
 	if err := s.ClearInputLine(); err != nil {
@@ -172,14 +157,14 @@ func TestSessionClearInputLineSendsCtrlU(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		// Trim the READY sentinel and look for 0x15 in the remainder.
-		snap := s.Buffer.Snapshot()
+		snap := s.Snapshot()
 		idx := bytes.Index(snap, []byte("READY"))
 		if idx >= 0 && bytes.Contains(snap[idx+len("READY"):], []byte{0x15}) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Errorf("Buffer never received Ctrl-U after READY; snap=%q", s.Buffer.Snapshot())
+	t.Errorf("Buffer never received Ctrl-U after READY; snap=%q", s.Snapshot())
 }
 
 func TestSessionTypePromptSendsBytesThenCommit(t *testing.T) {
@@ -200,13 +185,13 @@ func TestSessionTypePromptSendsBytesThenCommit(t *testing.T) {
 	// the body landed and that either CR or LF followed.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		snap := s.Buffer.Snapshot()
+		snap := s.Snapshot()
 		if bytes.Contains(snap, []byte("ping\r")) || bytes.Contains(snap, []byte("ping\n")) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Errorf("Buffer never received typed prompt + commit; snap=%q", s.Buffer.Snapshot())
+	t.Errorf("Buffer never received typed prompt + commit; snap=%q", s.Snapshot())
 }
 
 func TestSessionTypePromptInterByteTiming(t *testing.T) {
@@ -337,14 +322,14 @@ func TestSpawnSetsBufferDefault(t *testing.T) {
 		t.Fatalf("Spawn: %v", err)
 	}
 	defer s.Close()
-	if s.Buffer == nil {
-		t.Fatal("Buffer is nil")
+	if s.buffer == nil {
+		t.Fatal("buffer is nil")
 	}
 	// We can't directly inspect cap, but we know NewBuffer(0) =
 	// DefaultBufferCap. Append > cap bytes, snap should equal cap.
 	big := bytes.Repeat([]byte("x"), DefaultBufferCap+100)
-	s.Buffer.Append(big)
-	if got := len(s.Buffer.Snapshot()); got != DefaultBufferCap {
+	s.buffer.Append(big)
+	if got := len(s.Snapshot()); got != DefaultBufferCap {
 		t.Errorf("buffer cap appears to be %d, want %d", got, DefaultBufferCap)
 	}
 }

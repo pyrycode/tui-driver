@@ -37,15 +37,6 @@ var sleepFn = time.Sleep
 
 // SpawnOpts configures Spawn.
 type SpawnOpts struct {
-	// Mirror, if non-nil, receives a copy of every PTY byte.
-	//
-	// Deprecated: this raw io.Writer tap is being removed. It lets a consumer
-	// reach the PTY byte stream, which is exactly the substrate seam this
-	// package is sealing. Use RecordTo for a recording and MirrorStderr for a
-	// live view. Mirror is kept only for the transitional step and will be
-	// deleted; new code must not use it.
-	Mirror io.Writer
-
 	// RecordTo, if non-empty, is a filesystem path the session opens (0600,
 	// O_EXCL) and writes an asciinema v2 .cast recording of every PTY byte to.
 	// tui-driver owns the file end to end: it opens it, writes the header,
@@ -83,14 +74,16 @@ type SpawnOpts struct {
 //
 // Construct with Spawn. The zero value is not usable.
 type Session struct {
-	// Buffer is the rolling buffer the reader goroutine appends PTY
-	// bytes into. Consumers Snapshot() it to inspect TUI state.
-	Buffer *Buffer
+	// buffer is the rolling buffer the reader goroutine appends PTY bytes
+	// into. Unexported: consumers read TUI state through Snapshot / QuietFor /
+	// LastAppendAt, never the writable buffer handle.
+	buffer *Buffer
 
-	// PTY is the PTY master side. Consumers can call pty.Setsize on it
-	// directly for custom dimensions, or read it for raw streaming.
-	// Prefer Buffer.Snapshot for state detection.
-	PTY *os.File
+	// pty is the PTY master side, owned end to end by the Session.
+	// Unexported: the public Write seam is gone, so consumers drive input via
+	// the typed keystroke methods (AcceptTrust, Answer, SendEsc, Navigate,
+	// SendKeys) and DeliverPrompt, never the raw FD.
+	pty *os.File
 
 	cmd           *exec.Cmd
 	exited        chan struct{} // closed by the cmd.Wait goroutine
@@ -134,8 +127,8 @@ func Spawn(cmd *exec.Cmd, opts SpawnOpts) (*Session, error) {
 	}
 
 	s := &Session{
-		Buffer:        NewBuffer(opts.BufferCap),
-		PTY:           ptmx,
+		buffer:        NewBuffer(opts.BufferCap),
+		pty:           ptmx,
 		cmd:           cmd,
 		exited:        make(chan struct{}),
 		readerDone:    make(chan struct{}),
@@ -160,7 +153,7 @@ func Spawn(cmd *exec.Cmd, opts SpawnOpts) (*Session, error) {
 			n, rerr := ptmx.Read(buf)
 			if n > 0 {
 				chunk := buf[:n]
-				s.Buffer.Append(chunk)
+				s.buffer.Append(chunk)
 				if mirror != nil {
 					_, _ = mirror.Write(chunk)
 				}
@@ -203,11 +196,6 @@ func buildMirror(opts SpawnOpts) (io.Writer, io.Closer, error) {
 	if opts.MirrorStderr {
 		sinks = append(sinks, os.Stderr)
 	}
-	// Transitional: the deprecated Mirror seam still composes until the
-	// breaking step removes it.
-	if opts.Mirror != nil {
-		sinks = append(sinks, opts.Mirror)
-	}
 
 	switch len(sinks) {
 	case 0:
@@ -217,13 +205,6 @@ func buildMirror(opts SpawnOpts) (io.Writer, io.Closer, error) {
 	default:
 		return io.MultiWriter(sinks...), recCloser, nil
 	}
-}
-
-// Write sends bytes to the PTY. Returns the underlying ptmx.Write result.
-// Safe to call concurrently with the reader goroutine — *os.File's Write
-// is goroutine-safe on POSIX systems.
-func (s *Session) Write(p []byte) (int, error) {
-	return s.PTY.Write(p)
 }
 
 // WritePrompt sends text to the PTY wrapped in bracketed-paste escape
@@ -251,7 +232,7 @@ func (s *Session) Write(p []byte) (int, error) {
 // approval) should still use Write, not WritePrompt — paste-wrapping a
 // single token has no upside.
 func (s *Session) WritePrompt(text string) error {
-	_, err := s.PTY.Write(bracketedPaste(text))
+	_, err := s.pty.Write(bracketedPaste(text))
 	return err
 }
 
@@ -286,13 +267,13 @@ func bracketedPaste(text string) []byte {
 // Returns the first non-nil error from the underlying PTY write.
 func (s *Session) TypePrompt(text string) error {
 	for i := 0; i < len(text); i++ {
-		if _, err := s.PTY.Write([]byte{text[i]}); err != nil {
+		if _, err := s.pty.Write([]byte{text[i]}); err != nil {
 			return err
 		}
 		sleepFn(PromptInterByteDelay)
 	}
 	sleepFn(PromptCommitSettle)
-	if _, err := s.PTY.Write([]byte("\r")); err != nil {
+	if _, err := s.pty.Write([]byte("\r")); err != nil {
 		return err
 	}
 	return nil
@@ -309,7 +290,7 @@ func (s *Session) TypePrompt(text string) error {
 //
 // Returns the first non-nil error from the underlying PTY write.
 func (s *Session) ClearInputLine() error {
-	if _, err := s.PTY.Write([]byte{0x15}); err != nil {
+	if _, err := s.pty.Write([]byte{0x15}); err != nil {
 		return err
 	}
 	sleepFn(ClearLineSettle)
@@ -320,27 +301,27 @@ func (s *Session) ClearInputLine() error {
 // latest TUI rendering. Feed it to the state-detection predicates (IsIdle,
 // IsThinking, DetectModalClass, HasTrustModal, …). This is the read seam:
 // consumers inspect TUI state through it and never hold the writable buffer.
-func (s *Session) Snapshot() []byte { return s.Buffer.Snapshot() }
+func (s *Session) Snapshot() []byte { return s.buffer.Snapshot() }
 
 // QuietFor returns the time since the last PTY byte was appended — the
 // PTY-heartbeat signal the watchdog's quiet arm reads. Returns 0 before the
 // first byte arrives.
-func (s *Session) QuietFor() time.Duration { return s.Buffer.QuietFor() }
+func (s *Session) QuietFor() time.Duration { return s.buffer.QuietFor() }
 
 // LastAppendAt returns the timestamp of the most recent PTY append, or the zero
 // value if nothing has arrived yet.
-func (s *Session) LastAppendAt() time.Time { return s.Buffer.LastAppendAt() }
+func (s *Session) LastAppendAt() time.Time { return s.buffer.LastAppendAt() }
 
 // Wait blocks until both the underlying process has exited AND the PTY
 // reader goroutine has drained the final bytes from the PTY master FD.
 // Returns the exit error (or nil for clean exit). Safe to call from
 // multiple goroutines and before/after Close.
 //
-// After Wait returns, any bytes the reader wrote into Buffer or into
-// SpawnOpts.Mirror before the subprocess exited are guaranteed visible
-// to the caller (happens-before via the readerDone channel close). This
-// is the synchronisation point for inspecting Buffer.Snapshot() or any
-// Mirror writer without racing the reader.
+// After Wait returns, any bytes the reader wrote into the rolling buffer or
+// into the RecordTo recording before the subprocess exited are guaranteed
+// visible to the caller (happens-before via the readerDone channel close).
+// This is the synchronisation point for inspecting Snapshot() without racing
+// the reader.
 func (s *Session) Wait() error {
 	<-s.exited
 	<-s.readerDone
@@ -369,7 +350,7 @@ func (s *Session) Close() error {
 				<-s.exited
 			}
 		}
-		_ = s.PTY.Close()
+		_ = s.pty.Close()
 		<-s.readerDone
 		// Close the recording file only after the reader goroutine — the sole
 		// writer to it — has joined, so the close cannot race a mirror write.

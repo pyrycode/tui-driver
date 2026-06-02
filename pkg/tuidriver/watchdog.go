@@ -64,24 +64,14 @@ type WatchdogOpts struct {
 // dereference, matching the library's "construct or you get a
 // nil-deref" posture.
 func (s *Session) RunWatchdog(ctx context.Context, tr *Tracker, opts WatchdogOpts) error {
-	return runWatchdogLoop(ctx, s.Buffer, tr, opts)
+	return runWatchdogLoop(ctx, s.buffer, tr, opts)
 }
 
-// RunWatchdog is the free-function form, retained transitionally for consumers
-// that hold a *Buffer directly.
-//
-// Deprecated: use Session.RunWatchdog, which reaches the session's buffer
-// internally so consumers never touch the raw buffer. This free function is
-// removed in the breaking step.
-func RunWatchdog(ctx context.Context, buf *Buffer, tr *Tracker, opts WatchdogOpts) error {
-	return runWatchdogLoop(ctx, buf, tr, opts)
-}
-
-// runWatchdogLoop is the unexported loop body shared by Session.RunWatchdog and
-// the transitional free function, and the seam watchdog_test.go drives with a
-// raw *Buffer. The per-tick work list (Snapshot → ParseSpinner →
-// ObserveSpinner → CheckWatchdog) is the cross-spike-validated calibration; see
-// the RunWatchdog doc for why it is intentionally not configurable.
+// runWatchdogLoop is the unexported loop body behind Session.RunWatchdog and
+// the seam watchdog_test.go drives with a raw *Buffer. The per-tick work list
+// (Snapshot → ParseSpinner → ObserveSpinner → CheckWatchdog) is the
+// cross-spike-validated calibration; see the RunWatchdog doc for why it is
+// intentionally not configurable.
 func runWatchdogLoop(ctx context.Context, buf *Buffer, tr *Tracker, opts WatchdogOpts) error {
 	tick := opts.Tick
 	if tick <= 0 {

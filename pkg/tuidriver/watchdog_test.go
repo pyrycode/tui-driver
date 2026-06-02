@@ -17,7 +17,7 @@ func TestRunWatchdogContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- RunWatchdog(ctx, buf, tr, WatchdogOpts{Tick: 20 * time.Millisecond})
+		done <- runWatchdogLoop(ctx, buf, tr, WatchdogOpts{Tick: 20 * time.Millisecond})
 	}()
 
 	// Park briefly so RunWatchdog has set up its ticker and is parked in
@@ -51,7 +51,7 @@ func TestRunWatchdogPTYQuietWedge(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	err := RunWatchdog(ctx, buf, tr, WatchdogOpts{Tick: 20 * time.Millisecond})
+	err := runWatchdogLoop(ctx, buf, tr, WatchdogOpts{Tick: 20 * time.Millisecond})
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -105,7 +105,7 @@ func TestRunWatchdogSpinnerFreezeWedge(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	err := RunWatchdog(ctx, buf, tr, WatchdogOpts{Tick: 20 * time.Millisecond})
+	err := runWatchdogLoop(ctx, buf, tr, WatchdogOpts{Tick: 20 * time.Millisecond})
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -127,8 +127,8 @@ func TestRunWatchdogSpinnerFreezeWedge(t *testing.T) {
 // the session's own buffer — the same wedge fires through s.RunWatchdog as
 // through the loop directly, with no raw buffer handed to the consumer.
 func TestSessionRunWatchdogMethod(t *testing.T) {
-	s := &Session{Buffer: NewBuffer(0)}
-	s.Buffer.Append([]byte("x"))
+	s := &Session{buffer: NewBuffer(0)}
+	s.buffer.Append([]byte("x"))
 	tr := NewTracker(TrackerOpts{
 		PTYQuietLimit:      50 * time.Millisecond,
 		SpinnerFreezeLimit: 1 * time.Hour,
@@ -162,7 +162,7 @@ func TestRunWatchdogDefaultTickApplied(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	err := RunWatchdog(ctx, buf, tr, WatchdogOpts{}) // default tick
+	err := runWatchdogLoop(ctx, buf, tr, WatchdogOpts{}) // default tick
 	elapsed := time.Since(start)
 
 	// ctx times out before the first 1s tick — RunWatchdog returns nil.

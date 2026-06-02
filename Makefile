@@ -6,6 +6,7 @@
 
 BIN_DIR    := ./bin
 REPORT     := ./e2e-report.json
+GO         ?= go
 
 SPIKES     := spike-one-turn spike-multi-turn spike-cancel spike-permission spike-multiselect spike-ask-user spike-long-prompt
 PROBES     := probe-first-prompt-hang
@@ -23,7 +24,19 @@ BIN_PATHS  := $(addprefix $(BIN_DIR)/,$(ALL_BINS))
 MODEL      ?=
 EFFORT     ?=
 
-.PHONY: e2e build-bin clean-bin clean-report rerecord-snapshots
+.PHONY: e2e build-bin clean-bin clean-report rerecord-snapshots check vet test
+
+# `make check` is the fast, claude-free gate run on every PR (see
+# .github/workflows/check.yml). `make e2e` remains the live-claude harness and
+# is operator/CI-driven separately. vet + race test compile every package —
+# library, spikes, runner — so a breaking API change surfaces here.
+check: vet test
+
+vet:
+	$(GO) vet ./...
+
+test:
+	$(GO) test -race ./...
 
 e2e: build-bin
 	$(if $(MODEL),TUIDRIVER_CLAUDE_MODEL=$(MODEL)) $(if $(EFFORT),TUIDRIVER_CLAUDE_EFFORT=$(EFFORT)) $(BIN_DIR)/$(RUNNER) -bin-dir $(BIN_DIR) -report $(REPORT)

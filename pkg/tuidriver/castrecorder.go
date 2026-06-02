@@ -8,8 +8,9 @@ import (
 )
 
 // CastRecorder mirrors a PTY byte stream to an asciinema v2 recording. It is
-// an io.Writer: pass it as SpawnOpts.Mirror and the reader goroutine frames
-// every PTY read as one asciinema "o" (output) event, producing a .cast file
+// an io.Writer used internally by SpawnOpts.RecordTo: the reader goroutine
+// frames every PTY read as one asciinema "o" (output) event, producing a .cast
+// file
 // that can be replayed (asciinema play) or parsed offline.
 //
 // The wire format is line-delimited JSON:
@@ -56,14 +57,14 @@ type castHeader struct {
 	Height  int `json:"height"`
 }
 
-// Compile-time assertion that *CastRecorder satisfies io.Writer so it can be
-// passed directly as SpawnOpts.Mirror.
+// Compile-time assertion that *CastRecorder satisfies io.Writer so the reader
+// goroutine can tee PTY bytes to it.
 var _ io.Writer = (*CastRecorder)(nil)
 
 // NewCastRecorder returns a recorder that writes an asciinema v2 cast to w
 // using cols/rows as the recorded terminal dimensions. It does not write
-// anything and does not start the clock — call WriteHeader once, then pass
-// the recorder as SpawnOpts.Mirror.
+// anything and does not start the clock — call WriteHeader once, then tee PTY
+// bytes to it. Used internally by SpawnOpts.RecordTo.
 func NewCastRecorder(w io.Writer, cols, rows int) *CastRecorder {
 	return &CastRecorder{w: w, cols: cols, rows: rows}
 }

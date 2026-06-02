@@ -37,8 +37,8 @@ func TestWaitReady(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := &Session{Buffer: NewBuffer(0)}
-			s.Buffer.Append(tt.snap)
+			s := &Session{buffer: NewBuffer(0)}
+			s.buffer.Append(tt.snap)
 			got, err := s.WaitReady(context.Background())
 			if err != nil {
 				t.Fatalf("WaitReady: %v", err)
@@ -51,7 +51,7 @@ func TestWaitReady(t *testing.T) {
 }
 
 func TestWaitReadyContextCancelled(t *testing.T) {
-	s := &Session{Buffer: NewBuffer(0)} // never idle
+	s := &Session{buffer: NewBuffer(0)} // never idle
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	got, err := s.WaitReady(ctx)

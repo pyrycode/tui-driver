@@ -33,7 +33,7 @@ func (k ArrowKey) bytes() []byte {
 // purpose: with the public Write seam gone, a consumer cannot inject arbitrary
 // bytes — only the named intents below and the constrained SendKeys hatch.
 func (s *Session) writeRaw(p []byte) error {
-	_, err := s.PTY.Write(p)
+	_, err := s.pty.Write(p)
 	return err
 }
 
