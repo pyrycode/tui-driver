@@ -21,6 +21,9 @@ tui-driver
 # Capture logs (e.g. code-review's `make e2e` capture); never commit
 *.log
 
+# asciinema session recordings (SpawnOpts.RecordTo); may contain secrets
+*.cast
+
 # Test
 *.test
 *.out

@@ -6,7 +6,8 @@
 // What it does:
 //
 //	spawn claude with a fresh --session-id
-//	→ mirror PTY bytes to /tmp/probe-<ts>/pty.log (timestamp-prefixed per write)
+//	→ record PTY bytes to /tmp/probe-<ts>/pty.cast (asciinema v2; per-event
+//	  elapsed timestamps, `asciinema play`-able)
 //	→ wait for idle, send "ready?\r"
 //	→ open JSONL, tail ALL event types (no assistant-only filter)
 //	→ log every JSONL line to /tmp/probe-<ts>/jsonl.log (timestamp-prefixed)
@@ -23,7 +24,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -74,15 +74,9 @@ func run(trustFolderPolicy string) error {
 		return fmt.Errorf("mkdir outDir: %w", err)
 	}
 
-	ptyLogPath := filepath.Join(outDir, "pty.log")
+	ptyCastPath := filepath.Join(outDir, "pty.cast")
 	jsonlLogPath := filepath.Join(outDir, "jsonl.log")
 	markersPath := filepath.Join(outDir, "markers.log")
-
-	ptyLog, err := os.Create(ptyLogPath)
-	if err != nil {
-		return fmt.Errorf("create pty.log: %w", err)
-	}
-	defer ptyLog.Close()
 
 	jsonlLog, err := os.Create(jsonlLogPath)
 	if err != nil {
@@ -142,13 +136,8 @@ func run(trustFolderPolicy string) error {
 	cmd := exec.Command("claude", "--session-id", sessionID)
 	tuidriver.EnsureClaudeEnv(cmd)
 
-	// Timestamped PTY writer: prefixes each Write with "[+t.tttts] " then dumps
-	// the bytes verbatim. Reader goroutine inside Spawn calls Write once per
-	// 4 KiB chunk, so this granularity matches the read cadence.
-	ptyTSWriter := &timestampedWriter{base: ptyLog, startedAt: startedAt}
-
 	session, err := tuidriver.Spawn(cmd, tuidriver.SpawnOpts{
-		Mirror: ptyTSWriter,
+		RecordTo: ptyCastPath,
 	})
 	if err != nil {
 		return fmt.Errorf("Spawn: %w", err)
@@ -157,8 +146,6 @@ func run(trustFolderPolicy string) error {
 		recordMarker("shutdown-signalled")
 		_ = session.Close()
 	}()
-	rb := session.Buffer
-	ptmx := session.PTY
 
 	// First-PTY-byte marker via a tiny goroutine that polls the buffer.
 	var firstByteOnce sync.Once
@@ -170,7 +157,7 @@ func run(trustFolderPolicy string) error {
 			case <-rootCtx.Done():
 				return
 			case <-t.C:
-				if rb.LastAppendAt().IsZero() {
+				if session.LastAppendAt().IsZero() {
 					continue
 				}
 				firstByteOnce.Do(func() { recordMarker("first-pty-byte") })
@@ -181,23 +168,23 @@ func run(trustFolderPolicy string) error {
 
 	// Wait idle.
 	if err := tuidriver.WaitUntil(rootCtx, func() bool {
-		return tuidriver.IsIdle(rb.Snapshot())
+		return tuidriver.IsIdle(session.Snapshot())
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
 	recordMarker("idle-detected")
 
 	// Trust modal handling.
-	if tuidriver.HasTrustModal(rb.Snapshot()) {
+	if tuidriver.HasTrustModal(session.Snapshot()) {
 		if trustFolderPolicy == "fail" {
 			return fmt.Errorf("trust-folder modal — pass -trust-folder=accept")
 		}
-		if _, err := ptmx.Write([]byte("1\r")); err != nil {
+		if err := session.AcceptTrust(); err != nil {
 			return fmt.Errorf("write trust-accept: %w", err)
 		}
 		recordMarker("trust-folder-accepted")
 		if err := tuidriver.WaitUntil(rootCtx, func() bool {
-			snap := rb.Snapshot()
+			snap := session.Snapshot()
 			return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
 		}); err != nil {
 			return fmt.Errorf("wait idle post-trust: %w", err)
@@ -206,7 +193,7 @@ func run(trustFolderPolicy string) error {
 	}
 
 	// Send the prompt.
-	if _, err := ptmx.Write([]byte(promptText)); err != nil {
+	if err := session.SendKeys(promptText); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
 	}
 	recordMarker("prompt-written")
@@ -314,22 +301,5 @@ func run(trustFolderPolicy string) error {
 	}
 
 	return nil
-}
-
-// timestampedWriter prefixes each Write with [+t.tttts] then writes the raw
-// bytes verbatim. Newlines inside the chunk are not separated — claude's TUI
-// uses CSI sequences and bare CRs, so byte-stream layout matters.
-type timestampedWriter struct {
-	base      io.Writer
-	startedAt time.Time
-	mu        sync.Mutex
-}
-
-func (w *timestampedWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	dt := time.Since(w.startedAt).Seconds()
-	fmt.Fprintf(w.base, "[+%9.3fs] ", dt)
-	return w.base.Write(p)
 }
 

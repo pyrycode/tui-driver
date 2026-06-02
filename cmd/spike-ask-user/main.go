@@ -117,7 +117,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 	tuidriver.EnsureClaudeEnv(cmd)
 
 	session, err := tuidriver.Spawn(cmd, tuidriver.SpawnOpts{
-		Mirror:        os.Stderr,
+		MirrorStderr:  true,
 		ShutdownGrace: shutdownGrace,
 	})
 	if err != nil {
@@ -128,38 +128,35 @@ func run(prompt, trustFolderPolicy, answer string) error {
 		_ = session.Close()
 		cancelCause(errors.New("shutdown"))
 	}()
-	rb := session.Buffer
-	ptmx := session.PTY
-
 	var wg sync.WaitGroup
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := tuidriver.RunWatchdog(rootCtx, rb, tr, tuidriver.WatchdogOpts{}); err != nil {
+		if err := session.RunWatchdog(rootCtx, tr, tuidriver.WatchdogOpts{}); err != nil {
 			logger.Printf("%v", err)
 			cancelCause(err)
 		}
 	}()
 
-	if err := tuidriver.WaitUntil(rootCtx, func() bool { return tuidriver.IsIdle(rb.Snapshot()) }); err != nil {
+	if err := tuidriver.WaitUntil(rootCtx, func() bool { return tuidriver.IsIdle(session.Snapshot()) }); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
 	tr.RecordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
-	if tuidriver.HasTrustModal(rb.Snapshot()) {
+	if tuidriver.HasTrustModal(session.Snapshot()) {
 		switch trustFolderPolicy {
 		case "fail":
 			return fmt.Errorf("claude shows the trust-folder dialog — pass `-trust-folder accept`")
 		case "accept":
-			if _, err := ptmx.Write([]byte("1\r")); err != nil {
+			if err := session.AcceptTrust(); err != nil {
 				return fmt.Errorf("write trust-accept: %w", err)
 			}
 			tr.RecordTransition("trust-folder-accepted")
 			logger.Printf("trust-folder-accepted")
 			if err := tuidriver.WaitUntil(rootCtx, func() bool {
-				snap := rb.Snapshot()
+				snap := session.Snapshot()
 				return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait idle post-trust: %w", err)
@@ -203,7 +200,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 	// We anchor on a non-space-stripped fragment that's robust across both
 	// CSI-cursor-forward and literal-space rendering paths.
 	deadline := time.Now().Add(askUserQuestionLimit)
-	for !hasAskUserModal(rb.Snapshot()) {
+	for !hasAskUserModal(session.Snapshot()) {
 		select {
 		case <-rootCtx.Done():
 			return context.Cause(rootCtx)
@@ -224,7 +221,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 	}
 
 	// Snapshot PTY for byte-level inspection.
-	snap := rb.Snapshot()
+	snap := session.Snapshot()
 	dumpPath := fmt.Sprintf("/tmp/spike-ask-user-bytes-%d.bin", time.Now().UnixNano())
 	if err := os.WriteFile(dumpPath, snap, 0o644); err != nil {
 		logger.Printf("warning: write snapshot: %v", err)
@@ -254,7 +251,7 @@ func run(prompt, trustFolderPolicy, answer string) error {
 		// Assume digit + CR — same shape as permission modal answers.
 		answerBytes = []byte(answer + "\r")
 	}
-	if _, err := ptmx.Write(answerBytes); err != nil {
+	if err := session.SendKeys(string(answerBytes)); err != nil {
 		return fmt.Errorf("write answer: %w", err)
 	}
 	tr.RecordTransition("answer-sent")

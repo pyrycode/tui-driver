@@ -207,7 +207,7 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 	tuidriver.EnsureClaudeEnv(cmd)
 
 	session, err := tuidriver.Spawn(cmd, tuidriver.SpawnOpts{
-		Mirror:        os.Stderr,
+		MirrorStderr:  true,
 		ShutdownGrace: shutdownGrace,
 	})
 	if err != nil {
@@ -218,8 +218,6 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 		_ = session.Close()
 		cancelCause(errors.New("shutdown"))
 	}()
-	rb := session.Buffer
-	ptmx := session.PTY
 
 	var wg sync.WaitGroup
 
@@ -227,7 +225,7 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := tuidriver.RunWatchdog(rootCtx, rb, tr, tuidriver.WatchdogOpts{}); err != nil {
+		if err := session.RunWatchdog(rootCtx, tr, tuidriver.WatchdogOpts{}); err != nil {
 			logger.Printf("%v", err)
 			cancelCause(err)
 		}
@@ -236,25 +234,25 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 	// --- linear state machine (session-level) ---
 
 	if err := tuidriver.WaitUntil(rootCtx, func() bool {
-		return tuidriver.IsIdle(rb.Snapshot())
+		return tuidriver.IsIdle(session.Snapshot())
 	}); err != nil {
 		return fmt.Errorf("wait idle: %w", err)
 	}
 	tr.RecordTransition("idle-detected")
 	logger.Printf("idle-detected")
 
-	if tuidriver.HasTrustModal(rb.Snapshot()) {
+	if tuidriver.HasTrustModal(session.Snapshot()) {
 		switch trustFolderPolicy {
 		case "fail":
 			return fmt.Errorf("claude shows the trust-folder dialog — this cwd hasn't been trusted yet. Run `claude` interactively in this directory once, accept trust, exit, then re-run the spike. Or pass `-trust-folder accept` to auto-trust")
 		case "accept":
-			if _, err := ptmx.Write([]byte("1\r")); err != nil {
+			if err := session.AcceptTrust(); err != nil {
 				return fmt.Errorf("write trust-accept keystroke: %w", err)
 			}
 			tr.RecordTransition("trust-folder-accepted")
 			logger.Printf("trust-folder-accepted bytes=31 0d")
 			if err := tuidriver.WaitUntil(rootCtx, func() bool {
-				snap := rb.Snapshot()
+				snap := session.Snapshot()
 				return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
 			}); err != nil {
 				return fmt.Errorf("wait for idle post-trust-accept: %w", err)
@@ -292,7 +290,7 @@ func run(sessionIDFlag string, cancelKey []byte, cancelHex string, trustFolderPo
 		if probeN == 1 {
 			hook = probe1Hook
 		}
-		if err := runProbe(rootCtx, logger, probeN, p.kind, p.prompt, cancelKey, cancelHex, session, rb, &eventCh, tr, hook); err != nil {
+		if err := runProbe(rootCtx, logger, probeN, p.kind, p.prompt, cancelKey, cancelHex, session, &eventCh, tr, hook); err != nil {
 			return fmt.Errorf("probe %d: %w", probeN, err)
 		}
 	}
@@ -323,7 +321,6 @@ func runProbe(
 	cancelKey []byte,
 	cancelHex string,
 	session *tuidriver.Session,
-	rb *tuidriver.Buffer,
 	eventChRef *<-chan tuidriver.JSONLEntry,
 	tr *tuidriver.Tracker,
 	postPromptHook func() error,
@@ -371,9 +368,9 @@ func runProbe(
 	eventCh := *eventChRef
 
 	if kind == kindRecovery {
-		return runRecovery(ctx, logger, probeN, rb, eventCh, tr)
+		return runRecovery(ctx, logger, probeN, session, eventCh, tr)
 	}
-	return runCancel(ctx, logger, probeN, kind, cancelKey, cancelHex, session, rb, eventCh, tr)
+	return runCancel(ctx, logger, probeN, kind, cancelKey, cancelHex, session, eventCh, tr)
 }
 
 // runCancel implements the cancel-probe behavior (Probes 1+2). It waits
@@ -388,17 +385,16 @@ func runCancel(
 	cancelKey []byte,
 	cancelHex string,
 	session *tuidriver.Session,
-	rb *tuidriver.Buffer,
 	eventCh <-chan tuidriver.JSONLEntry,
 	tr *tuidriver.Tracker,
 ) error {
-	if err := waitForKickoff(ctx, logger, probeN, kind, rb, eventCh, tr); err != nil {
+	if err := waitForKickoff(ctx, logger, probeN, kind, session, eventCh, tr); err != nil {
 		return err
 	}
 
 	// Snapshot whether the spinner glyph is currently visible. Used to
 	// decide which ❯-reappeared predicate to apply (see waitReappeared).
-	preCancelHadSpinner := hasSpinnerGlyph(rb.Snapshot())
+	preCancelHadSpinner := hasSpinnerGlyph(session.Snapshot())
 
 	if err := sendCancel(session, cancelKey); err != nil {
 		return fmt.Errorf("send cancel: %w", err)
@@ -407,7 +403,7 @@ func runCancel(
 	tr.RecordTransition(fmt.Sprintf("probe=%d cancel-sent", probeN))
 	logger.Printf("probe=%d cancel-sent keystroke=%s", probeN, cancelHex)
 
-	if err := waitReappeared(ctx, logger, probeN, preCancelHadSpinner, cancelSentAt, rb, eventCh); err != nil {
+	if err := waitReappeared(ctx, logger, probeN, preCancelHadSpinner, cancelSentAt, session, eventCh); err != nil {
 		return err
 	}
 	tr.RecordTransition(fmt.Sprintf("probe=%d ❯-reappeared", probeN))
@@ -432,7 +428,7 @@ func waitForKickoff(
 	logger *log.Logger,
 	probeN int,
 	kind ProbeKind,
-	rb *tuidriver.Buffer,
+	session *tuidriver.Session,
 	eventCh <-chan tuidriver.JSONLEntry,
 	tr *tuidriver.Tracker,
 ) error {
@@ -443,7 +439,7 @@ func waitForKickoff(
 	switch kind {
 	case kindThinking:
 		for {
-			if hasSpinnerGlyph(rb.Snapshot()) {
+			if hasSpinnerGlyph(session.Snapshot()) {
 				tr.RecordTransition(fmt.Sprintf("probe=%d spinner-or-tool-visible", probeN))
 				logger.Printf("probe=%d spinner-or-tool-visible kind=spinner-glyph", probeN)
 				return nil
@@ -534,7 +530,7 @@ func waitReappeared(
 	probeN int,
 	preCancelHadSpinner bool,
 	cancelSentAt time.Time,
-	rb *tuidriver.Buffer,
+	session *tuidriver.Session,
 	eventCh <-chan tuidriver.JSONLEntry,
 ) error {
 	_ = preCancelHadSpinner
@@ -543,11 +539,11 @@ func waitReappeared(
 	defer ticker.Stop()
 
 	stable := func() bool {
-		stripped := tuidriver.StripANSI(rb.Snapshot())
+		stripped := tuidriver.StripANSI(session.Snapshot())
 		if !bytes.Contains(stripped, tuidriver.IdleGlyph) {
 			return false
 		}
-		return rb.QuietFor() >= ptyQuietWindow
+		return session.QuietFor() >= ptyQuietWindow
 	}
 
 	for {
@@ -632,7 +628,7 @@ func runRecovery(
 	ctx context.Context,
 	logger *log.Logger,
 	probeN int,
-	rb *tuidriver.Buffer,
+	session *tuidriver.Session,
 	eventCh <-chan tuidriver.JSONLEntry,
 	tr *tuidriver.Tracker,
 ) error {
@@ -644,7 +640,7 @@ func runRecovery(
 		ticker := time.NewTicker(statePollInterval)
 		defer ticker.Stop()
 		for {
-			if !tuidriver.IsIdle(rb.Snapshot()) {
+			if !tuidriver.IsIdle(session.Snapshot()) {
 				logger.Printf("probe=%d ❯-disappeared", probeN)
 				return
 			}
@@ -672,11 +668,11 @@ func runRecovery(
 		if !gotEndTurn {
 			return false
 		}
-		stripped := tuidriver.StripANSI(rb.Snapshot())
+		stripped := tuidriver.StripANSI(session.Snapshot())
 		if !bytes.Contains(stripped, tuidriver.IdleGlyph) {
 			return false
 		}
-		return rb.QuietFor() >= ptyQuietWindow
+		return session.QuietFor() >= ptyQuietWindow
 	}
 
 	for !check() {
@@ -726,8 +722,7 @@ func runRecovery(
 // the same buffered write as the prompt body after a tool-use wind-down)
 // does not apply here — there is no `\r`.
 func sendCancel(session *tuidriver.Session, keystroke []byte) error {
-	_, err := session.Write(keystroke)
-	return err
+	return session.SendKeys(string(keystroke))
 }
 
 // hasSpinnerGlyph reports whether the ✻ glyph is present in the rolling

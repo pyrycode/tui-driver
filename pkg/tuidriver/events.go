@@ -145,7 +145,7 @@ func (s *Session) Events(ctx context.Context, jsonlPath string, startOffset int6
 		return nil, err
 	}
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, s.Buffer.Snapshot, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, s.buffer.Snapshot, jsonlCh, out, DefaultPollInterval)
 	return out, nil
 }
 

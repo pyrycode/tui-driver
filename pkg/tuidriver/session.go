@@ -1,6 +1,7 @@
 package tuidriver
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -36,10 +37,25 @@ var sleepFn = time.Sleep
 
 // SpawnOpts configures Spawn.
 type SpawnOpts struct {
-	// Mirror, if non-nil, receives a copy of every PTY byte. Typical
-	// uses: os.Stderr for spike binaries (lets the operator watch
-	// claude's TUI live). Production drivers pass nil.
-	Mirror io.Writer
+	// RecordTo, if non-empty, is a filesystem path the session opens (0600,
+	// O_EXCL) and writes an asciinema v2 .cast recording of every PTY byte to.
+	// tui-driver owns the file end to end: it opens it, writes the header,
+	// frames each PTY read as one cast event, and closes it on Close. The
+	// consumer owns only the path lifecycle — directory creation, pruning, and
+	// any post-Close rename. No io.Writer ever crosses the package boundary, so
+	// the byte tap cannot be reused as a substrate seam.
+	//
+	// SECURITY: a .cast holds every byte the terminal showed — the prompt,
+	// claude's output, and all tool output, which can include file contents and
+	// secrets. The file is owner-only, but unencrypted by design so it stays
+	// `asciinema play`-able. Point RecordTo at a non-synced, non-backed-up
+	// location.
+	RecordTo string
+
+	// MirrorStderr, when true, tees every PTY byte to os.Stderr — the spike
+	// "live view" so an operator can watch claude's TUI. Production drivers
+	// leave it false. Composes with RecordTo: both sinks receive the bytes.
+	MirrorStderr bool
 
 	// BufferCap is the rolling-buffer capacity in bytes. 0 → DefaultBufferCap.
 	BufferCap int
@@ -58,14 +74,16 @@ type SpawnOpts struct {
 //
 // Construct with Spawn. The zero value is not usable.
 type Session struct {
-	// Buffer is the rolling buffer the reader goroutine appends PTY
-	// bytes into. Consumers Snapshot() it to inspect TUI state.
-	Buffer *Buffer
+	// buffer is the rolling buffer the reader goroutine appends PTY bytes
+	// into. Unexported: consumers read TUI state through Snapshot / QuietFor /
+	// LastAppendAt, never the writable buffer handle.
+	buffer *Buffer
 
-	// PTY is the PTY master side. Consumers can call pty.Setsize on it
-	// directly for custom dimensions, or read it for raw streaming.
-	// Prefer Buffer.Snapshot for state detection.
-	PTY *os.File
+	// pty is the PTY master side, owned end to end by the Session.
+	// Unexported: the public Write seam is gone, so consumers drive input via
+	// the typed keystroke methods (AcceptTrust, Answer, SendEsc, Navigate,
+	// SendKeys) and DeliverPrompt, never the raw FD.
+	pty *os.File
 
 	cmd           *exec.Cmd
 	exited        chan struct{} // closed by the cmd.Wait goroutine
@@ -73,6 +91,12 @@ type Session struct {
 	readerDone    chan struct{}
 	shutdownGrace time.Duration
 	shutdownOnce  sync.Once
+
+	// recCloser is the recording file opened for SpawnOpts.RecordTo, or nil
+	// when no recording was requested. Closed by Close after the reader
+	// goroutine — the sole writer — has joined, so the close cannot race a
+	// mirror write.
+	recCloser io.Closer
 }
 
 // Spawn launches cmd inside a PTY and starts a reader goroutine that
@@ -82,8 +106,18 @@ type Session struct {
 // Returns a *Session on success. Caller MUST defer Close to release the
 // PTY and reap the subprocess.
 func Spawn(cmd *exec.Cmd, opts SpawnOpts) (*Session, error) {
+	// Build the optional mirror sink BEFORE starting the process, so a
+	// recording-open failure aborts cleanly with nothing spawned.
+	mirror, recCloser, err := buildMirror(opts)
+	if err != nil {
+		return nil, err
+	}
+
 	ptmx, err := StartPTY(cmd)
 	if err != nil {
+		if recCloser != nil {
+			_ = recCloser.Close()
+		}
 		return nil, err
 	}
 
@@ -93,12 +127,13 @@ func Spawn(cmd *exec.Cmd, opts SpawnOpts) (*Session, error) {
 	}
 
 	s := &Session{
-		Buffer:        NewBuffer(opts.BufferCap),
-		PTY:           ptmx,
+		buffer:        NewBuffer(opts.BufferCap),
+		pty:           ptmx,
 		cmd:           cmd,
 		exited:        make(chan struct{}),
 		readerDone:    make(chan struct{}),
 		shutdownGrace: grace,
+		recCloser:     recCloser,
 	}
 
 	// cmd.Wait observer — populates exitErr then closes exited. The
@@ -110,7 +145,7 @@ func Spawn(cmd *exec.Cmd, opts SpawnOpts) (*Session, error) {
 	}()
 
 	// PTY reader goroutine — drains the master FD into Buffer, optionally
-	// mirroring to opts.Mirror.
+	// teeing each chunk to the mirror sink (recording and/or stderr).
 	go func() {
 		defer close(s.readerDone)
 		buf := make([]byte, 4096)
@@ -118,9 +153,9 @@ func Spawn(cmd *exec.Cmd, opts SpawnOpts) (*Session, error) {
 			n, rerr := ptmx.Read(buf)
 			if n > 0 {
 				chunk := buf[:n]
-				s.Buffer.Append(chunk)
-				if opts.Mirror != nil {
-					_, _ = opts.Mirror.Write(chunk)
+				s.buffer.Append(chunk)
+				if mirror != nil {
+					_, _ = mirror.Write(chunk)
 				}
 			}
 			if rerr != nil {
@@ -132,11 +167,44 @@ func Spawn(cmd *exec.Cmd, opts SpawnOpts) (*Session, error) {
 	return s, nil
 }
 
-// Write sends bytes to the PTY. Returns the underlying ptmx.Write result.
-// Safe to call concurrently with the reader goroutine — *os.File's Write
-// is goroutine-safe on POSIX systems.
-func (s *Session) Write(p []byte) (int, error) {
-	return s.PTY.Write(p)
+// buildMirror assembles the optional PTY-mirror sink from opts. Returns the
+// io.Writer the reader goroutine tees every chunk to (nil when no sink is
+// configured) and the io.Closer for any file the session opened (nil unless
+// RecordTo opened one). The recorder and stderr sinks are combined with
+// io.MultiWriter when both are present.
+//
+// The returned writer never escapes the package: it lives only inside the
+// reader goroutine. A consumer configures sinks by value (a path, a bool), so
+// the raw byte tap cannot be reached or reused.
+func buildMirror(opts SpawnOpts) (io.Writer, io.Closer, error) {
+	var sinks []io.Writer
+	var recCloser io.Closer
+
+	if opts.RecordTo != "" {
+		f, err := os.OpenFile(opts.RecordTo, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return nil, nil, fmt.Errorf("tuidriver: open recording %s: %w", opts.RecordTo, err)
+		}
+		rec := NewCastRecorder(f, int(DefaultPtyCols), int(DefaultPtyRows))
+		if herr := rec.WriteHeader(); herr != nil {
+			_ = f.Close()
+			return nil, nil, fmt.Errorf("tuidriver: recording header: %w", herr)
+		}
+		sinks = append(sinks, rec)
+		recCloser = f
+	}
+	if opts.MirrorStderr {
+		sinks = append(sinks, os.Stderr)
+	}
+
+	switch len(sinks) {
+	case 0:
+		return nil, recCloser, nil
+	case 1:
+		return sinks[0], recCloser, nil
+	default:
+		return io.MultiWriter(sinks...), recCloser, nil
+	}
 }
 
 // WritePrompt sends text to the PTY wrapped in bracketed-paste escape
@@ -164,7 +232,7 @@ func (s *Session) Write(p []byte) (int, error) {
 // approval) should still use Write, not WritePrompt — paste-wrapping a
 // single token has no upside.
 func (s *Session) WritePrompt(text string) error {
-	_, err := s.PTY.Write(bracketedPaste(text))
+	_, err := s.pty.Write(bracketedPaste(text))
 	return err
 }
 
@@ -199,13 +267,13 @@ func bracketedPaste(text string) []byte {
 // Returns the first non-nil error from the underlying PTY write.
 func (s *Session) TypePrompt(text string) error {
 	for i := 0; i < len(text); i++ {
-		if _, err := s.PTY.Write([]byte{text[i]}); err != nil {
+		if _, err := s.pty.Write([]byte{text[i]}); err != nil {
 			return err
 		}
 		sleepFn(PromptInterByteDelay)
 	}
 	sleepFn(PromptCommitSettle)
-	if _, err := s.PTY.Write([]byte("\r")); err != nil {
+	if _, err := s.pty.Write([]byte("\r")); err != nil {
 		return err
 	}
 	return nil
@@ -222,23 +290,38 @@ func (s *Session) TypePrompt(text string) error {
 //
 // Returns the first non-nil error from the underlying PTY write.
 func (s *Session) ClearInputLine() error {
-	if _, err := s.PTY.Write([]byte{0x15}); err != nil {
+	if _, err := s.pty.Write([]byte{0x15}); err != nil {
 		return err
 	}
 	sleepFn(ClearLineSettle)
 	return nil
 }
 
+// Snapshot returns a copy of the rolling PTY buffer's current contents — the
+// latest TUI rendering. Feed it to the state-detection predicates (IsIdle,
+// IsThinking, DetectModalClass, HasTrustModal, …). This is the read seam:
+// consumers inspect TUI state through it and never hold the writable buffer.
+func (s *Session) Snapshot() []byte { return s.buffer.Snapshot() }
+
+// QuietFor returns the time since the last PTY byte was appended — the
+// PTY-heartbeat signal the watchdog's quiet arm reads. Returns 0 before the
+// first byte arrives.
+func (s *Session) QuietFor() time.Duration { return s.buffer.QuietFor() }
+
+// LastAppendAt returns the timestamp of the most recent PTY append, or the zero
+// value if nothing has arrived yet.
+func (s *Session) LastAppendAt() time.Time { return s.buffer.LastAppendAt() }
+
 // Wait blocks until both the underlying process has exited AND the PTY
 // reader goroutine has drained the final bytes from the PTY master FD.
 // Returns the exit error (or nil for clean exit). Safe to call from
 // multiple goroutines and before/after Close.
 //
-// After Wait returns, any bytes the reader wrote into Buffer or into
-// SpawnOpts.Mirror before the subprocess exited are guaranteed visible
-// to the caller (happens-before via the readerDone channel close). This
-// is the synchronisation point for inspecting Buffer.Snapshot() or any
-// Mirror writer without racing the reader.
+// After Wait returns, any bytes the reader wrote into the rolling buffer or
+// into the RecordTo recording before the subprocess exited are guaranteed
+// visible to the caller (happens-before via the readerDone channel close).
+// This is the synchronisation point for inspecting Snapshot() without racing
+// the reader.
 func (s *Session) Wait() error {
 	<-s.exited
 	<-s.readerDone
@@ -252,6 +335,7 @@ func (s *Session) Wait() error {
 //  3. If still alive, SIGKILL and wait for the exit.
 //  4. Close the PTY file.
 //  5. Wait for the reader goroutine to finish (PTY close unblocks it).
+//  6. Close the recording file, if one was opened for SpawnOpts.RecordTo.
 //
 // Idempotent — subsequent calls return the same error without re-killing.
 // Returns the process's exit status (the same value Wait would return).
@@ -266,8 +350,13 @@ func (s *Session) Close() error {
 				<-s.exited
 			}
 		}
-		_ = s.PTY.Close()
+		_ = s.pty.Close()
 		<-s.readerDone
+		// Close the recording file only after the reader goroutine — the sole
+		// writer to it — has joined, so the close cannot race a mirror write.
+		if s.recCloser != nil {
+			_ = s.recCloser.Close()
+		}
 	})
 	return s.exitErr
 }

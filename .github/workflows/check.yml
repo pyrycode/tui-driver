@@ -1,0 +1,26 @@
+name: check
+
+# Fast, claude-free PR gate: vet + race test compile every package (library,
+# spikes, runner), so a breaking API change or a race surfaces before merge.
+# The live-claude `make e2e` harness runs separately (operator / scheduled),
+# never on the PR path — it needs a real claude session and metered spend.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: make check
+        run: make check
