@@ -41,6 +41,31 @@ func TestHasPastedChip(t *testing.T) {
 	}
 }
 
+func TestShouldTypePrompt(t *testing.T) {
+	overCap := strings.Repeat("x", typePromptMaxLen+1)
+	tests := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{"short single-line", "What is 2+2?", true},
+		{"empty", "", true},
+		{"exactly at the length cap", strings.Repeat("x", typePromptMaxLen), true},
+		{"runner-comparison prompt", "Reply with the single word OK and nothing else.", true},
+		{"sigterm prompt", "Use the Bash tool to run `sleep 30`. Do nothing else.", true},
+		{"multi-line", "line one\nline two", false},
+		{"single trailing newline", "ok\n", false},
+		{"over the length cap", overCap, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldTypePrompt(tt.text); got != tt.want {
+				t.Errorf("shouldTypePrompt(%q) = %v, want %v", tt.text, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDeliverPrompt_CommitSuccess(t *testing.T) {
 	var writes, clears int
 	logger, logs := captureLogger()

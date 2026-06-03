@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -68,10 +69,11 @@ type DeliverResult struct {
 //
 // It absorbs three concerns that previously lived in the consumer:
 //
-//   - Method selection. Today it always delivers via bracketed paste
-//     (WritePrompt). The deferred short-prompt fix — choosing TypePrompt for
-//     short single-line prompts — slots into the one marked line below, behind
-//     a length/shape check, with zero change to any consumer.
+//   - Method selection. Short single-line prompts are delivered with TypePrompt
+//     (byte-spaced body + isolated \r), which stays under claude's paste-
+//     detection heuristic; long or multi-line prompts use WritePrompt (bracketed
+//     paste), whose "[Pasted text]" chip drives the corrupted-paste recovery
+//     below. See shouldTypePrompt.
 //   - Commit confirmation. After each delivery it polls for a commit signal
 //     (the thinking spinner is visible, or the per-session JSONL has appeared)
 //     up to CommitTimeout.
@@ -90,8 +92,15 @@ type DeliverResult struct {
 // cancellation during the commit poll ends the current attempt early and is
 // not itself an error here; the caller observes ctx via the subsequent wait.
 func (s *Session) DeliverPrompt(ctx context.Context, opts DeliverOpts) (DeliverResult, error) {
+	// Method selection: short single-line prompts trip claude's paste-detection
+	// heuristic when bracketed-pasted, so type them byte-by-byte instead. The
+	// chosen write seam is reused for re-deliveries within the loop.
+	write := s.WritePrompt
+	if shouldTypePrompt(opts.Prompt) {
+		write = s.TypePrompt
+	}
 	return deliverPrompt(opts, deliverDeps{
-		write: s.WritePrompt,
+		write: write,
 		clear: s.ClearInputLine,
 		didCommit: func(timeout time.Duration) bool {
 			return s.promptDidCommit(ctx, opts.JSONLPath, timeout)
@@ -133,8 +142,9 @@ func deliverPrompt(opts DeliverOpts, deps deliverDeps) (DeliverResult, error) {
 				return res, fmt.Errorf("tuidriver: clear input line: %w", err)
 			}
 		}
-		// Method selection. The deferred TypePrompt-for-short-prompts fix slots
-		// in HERE — pure tui-driver change, no consumer edit.
+		// deps.write is the method DeliverPrompt selected for this prompt's
+		// shape (TypePrompt for short single-line prompts, WritePrompt
+		// otherwise); re-deliveries reuse the same method.
 		if err := deps.write(opts.Prompt); err != nil {
 			return res, fmt.Errorf("tuidriver: write prompt: %w", err)
 		}
@@ -195,4 +205,23 @@ func (s *Session) promptDidCommit(ctx context.Context, jsonlPath string, timeout
 // ANSI-escaped chip still hits. Total over a possibly-empty snapshot.
 func hasPastedChip(snap []byte) bool {
 	return bytes.Contains(StripANSI(snap), []byte(pastedTextChip))
+}
+
+// typePromptMaxLen is the byte length at or below which a single-line prompt is
+// delivered with TypePrompt rather than a bracketed paste. At
+// PromptInterByteDelay (10ms/byte) a 256-byte prompt types in ~2.6s; longer
+// prompts fall back to the paste path. The single-line shape (no '\n') is the
+// load-bearing condition — multi-line prompts always paste.
+const typePromptMaxLen = 256
+
+// shouldTypePrompt reports whether text is a short, single-line prompt that
+// should be delivered with TypePrompt (byte-spaced body + isolated \r) instead
+// of a bracketed paste. claude's terminal paste-detection heuristic mis-
+// classifies a fast bulk write of such a prompt, absorbing the trailing \r so
+// the turn never commits — and because a short prompt renders inline with no
+// "[Pasted text]" chip, the chip-based recovery in deliverPrompt cannot catch
+// it. Typing the bytes keeps the stream under the paste threshold and commits
+// reliably (the #71 / PR #77 fix).
+func shouldTypePrompt(text string) bool {
+	return len(text) <= typePromptMaxLen && !strings.Contains(text, "\n")
 }
