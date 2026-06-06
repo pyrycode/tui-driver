@@ -1,5 +1,5 @@
 // Spike: drive one interactive `claude` turn end-to-end through a PTY using a
-// multi-KB multi-line prompt sent via Session.WritePrompt.
+// multi-KB multi-line prompt delivered via Session.DeliverPrompt.
 //
 // Regression rig for the bracketed-paste path shipped in PR #43. Three drift
 // vectors this binary catches:
@@ -11,8 +11,14 @@
 //
 // Sequence mirrors cmd/spike-one-turn/main.go. The two intentional deviations:
 //   - The prompt body is loaded from the embedded fixture testdata/long-prompt.txt.
-//   - The prompt is sent via session.WritePrompt, NOT raw ptmx.Write — that
-//     is the whole point of the regression rig.
+//   - The prompt is delivered via session.DeliverPrompt (the production path),
+//     not the bare WritePrompt primitive. For a long prompt DeliverPrompt uses
+//     the same bracketed paste, so the wire-shape + multi-KB drift vectors above
+//     are still exercised, but it adds chip-gated commit confirmation and
+//     re-delivery recovery. On claude 2.1.158 a bare paste's submit-Enter is
+//     intermittently swallowed (the "[Pasted text]" chip stays in the input box,
+//     claude idles, the session JSONL never appears) — the long-prompt analog of
+//     the short-prompt stall (#134). The recovery makes the spike reliable (#111).
 //
 // Plus a substring assertion: the assistant's end-of-turn text (trimmed) must
 // contain "ALPHA_42-GAMMA_88-OMEGA_13", confirming that all three token
@@ -169,11 +175,21 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 		}
 	}
 
-	if err := session.WritePrompt(promptBody); err != nil {
-		return fmt.Errorf("write prompt: %w", err)
+	// Deliver via DeliverPrompt (the production path) rather than the raw
+	// WritePrompt primitive. For this long/multi-line prompt it still uses a
+	// bracketed paste, but adds chip-gated commit confirmation and re-delivery
+	// recovery — without which the submit-Enter is intermittently swallowed on
+	// claude 2.1.158 and the turn never commits (#111). JSONLPath lets the
+	// per-session JSONL appearing count as a commit signal alongside the spinner.
+	res, err := session.DeliverPrompt(rootCtx, tuidriver.DeliverOpts{
+		Prompt:    promptBody,
+		JSONLPath: jsonlPath,
+	})
+	if err != nil {
+		return fmt.Errorf("deliver prompt: %w", err)
 	}
-	tr.RecordTransition("prompt-written")
-	logger.Printf("prompt-written")
+	tr.RecordTransition("prompt-delivered")
+	logger.Printf("prompt-delivered committed=%v attempts=%d", res.Committed, res.Attempts)
 
 	// Wait for the deterministic session JSONL to exist. Interactive claude
 	// under --session-id defers JSONL creation until first input is received

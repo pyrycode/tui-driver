@@ -228,6 +228,17 @@ func buildChecks(runVersionLock func(ctx context.Context) (string, map[string]an
 			Binary:        "spike-multi-turn",
 			Args:          commonArgs,
 			SuccessMarker: successSuccess,
+			// Per-check timeout override. spike-multi-turn drives 5 sequential
+			// prompts (incl. a parallel-tool-call probe and a 1+2+...+100
+			// reasoning probe) whose wall time is bounded only by claude's
+			// streaming speed, not by anything the harness controls. Observed
+			// 39-49s on claude 2.1.158, but the distribution is wide (the ticket
+			// saw ~40s / ~60s / >420s on 2.1.150), so the 60s default cap sits
+			// inside it and yields intermittent timeout verdicts unrelated to the
+			// PR under test. 180s clears the observed spread with margin; the
+			// spike's own 60s PTY-quiescence watchdog still bounds a true hang.
+			// Same pattern as spike-cancel (#69). Ticket #111.
+			Timeout: 180 * time.Second,
 		},
 		{
 			Name:          "spike-cancel",
