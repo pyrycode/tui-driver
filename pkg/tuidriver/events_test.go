@@ -37,6 +37,13 @@ func (s *testSnap) Set(b []byte) {
 	s.b = b
 }
 
+// neverQuiet is a quietFor closure that reports the PTY is never quiet
+// (0 elapsed since the last byte). With it, the stall arm's condition
+// (b) — quietFor() > ptyQuietLimit — can never hold, so the existing
+// merge-loop tests exercise the idle/thinking/modal/banner/JSONL axes
+// unchanged: no stall event ever fires.
+func neverQuiet() time.Duration { return 0 }
+
 // mustReceiveEvent blocks for at most timeout waiting for an Event on
 // ch. Fails the test if no value arrives or if the channel closes
 // early. Mirrors the mustReceive helper in jsonl_test.go.
@@ -74,7 +81,7 @@ func TestMergeEvents_PtyIdleAndThinkingTransitions(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Phase 1: ❯ alone → PtyIdle.
 	snap.Set([]byte("\xe2\x9d\xaf input"))
@@ -116,7 +123,7 @@ func TestMergeEvents_ModalShowAndHide(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Phase 1: enter Permission modal. ❯ is present (modal still renders
 	// the input line) but idle/thinking emissions are suppressed while a
@@ -178,7 +185,7 @@ func TestMergeEvents_JsonlEntryAndSyntheticEndOfTurn(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry, 4)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Non-assistant entry: emits one JsonlEntry, no EndOfTurn.
 	userEntry := JSONLEntry{
@@ -265,7 +272,7 @@ func TestMergeEvents_InterleavedArrivalOrder(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry, 4)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// 1. PTY: enter idle.
 	snap.Set([]byte("\xe2\x9d\xaf input"))
@@ -307,7 +314,7 @@ func TestMergeEvents_CleanShutdown(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Park briefly so the merge goroutine has set up its ticker and is
 	// blocked in the select — the close-on-cancel timing test exercises
@@ -333,7 +340,7 @@ func TestMergeEvents_JsonlChClosureClosesOutput(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Park briefly so the merge goroutine is in its select loop, then
 	// close jsonlCh — that should drive the loop to exit and close out.
@@ -355,7 +362,7 @@ func TestMergeEvents_McpFailureBannerTransitions(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Phase 1: empty snap, no banner → no event within two ticks.
 	select {
@@ -411,7 +418,7 @@ func TestMergeEvents_NetworkFailureTransitions(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Phase 1: empty snap → no event.
 	select {
@@ -460,7 +467,7 @@ func TestMergeEvents_BannerCoexistsWithIdleAndModal(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Phase 1: idle glyph AND banner in one snapshot. Expect two events
 	// in the same tick: PtyIdle and McpFailureShown. Internal emission
@@ -518,7 +525,10 @@ func TestMergeEvents_BannerCoexistsWithIdleAndModal(t *testing.T) {
 func TestEvents_TailJSONLErrorBubbles(t *testing.T) {
 	s := &Session{buffer: NewBuffer(0)}
 	missing := filepath.Join(t.TempDir(), "nonexistent", "x.jsonl")
-	ch, err := s.Events(context.Background(), missing, 0)
+	// The TailJSONL open/seek error fires before tr is dereferenced, so a
+	// zero-opts tracker suffices to satisfy the new required parameter.
+	tr := NewTracker(TrackerOpts{})
+	ch, err := s.Events(context.Background(), missing, 0, tr)
 	if err == nil {
 		t.Fatalf("Events(missing) err = nil, want error")
 	}
@@ -531,4 +541,194 @@ func TestEvents_TailJSONLErrorBubbles(t *testing.T) {
 	if !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("err = %v, want errors.Is(_, fs.ErrNotExist)", err)
 	}
+}
+
+// stallSnap is a mid-turn snapshot: no ❯ (so IsIdle is false → stall
+// condition (a) holds) and no ✻/modal/banner anchors (so no other merge
+// axis fires). It isolates the stall arm from the idle/thinking/modal/
+// banner emissions.
+var stallSnap = []byte("working")
+
+func TestMergeEvents_StallRisingEdgeFiresOnceAndDoesNotRepeat(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	snap := &testSnap{}
+	jsonlCh := make(chan JSONLEntry)
+	out := make(chan Event, defaultEventBuffer)
+	const limit = 10 * time.Millisecond
+	// The PTY has been quiet well beyond the limit on every tick.
+	quietFor := func() time.Duration { return 5 * limit }
+	go mergeEvents(ctx, snap.Snapshot, quietFor, limit, jsonlCh, out, DefaultPollInterval)
+
+	// (a) not idle, (b) quietFor > limit, (c) no JSONL ever → stall.
+	snap.Set(stallSnap)
+	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindStallDetected {
+		t.Fatalf("Kind = %v, want EventKindStallDetected", ev.Kind)
+	}
+	if ev.Source != EventSourcePty {
+		t.Errorf("Source = %v, want EventSourcePty", ev.Source)
+	}
+	if ev.Time.IsZero() {
+		t.Errorf("Time is zero, want non-zero wall-clock")
+	}
+
+	// Rising-edge: the condition still holds on every later tick, but the
+	// event must not repeat while the stall persists.
+	select {
+	case extra, ok := <-out:
+		if !ok {
+			t.Fatalf("channel closed unexpectedly while stall persisted")
+		}
+		t.Fatalf("stall repeated: got %+v, want at most one EventKindStallDetected", extra)
+	case <-time.After(5 * DefaultPollInterval):
+	}
+
+	cancel()
+	assertEventChClosed(t, out, 500*time.Millisecond)
+}
+
+func TestMergeEvents_StallSuppressedAtIdle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	snap := &testSnap{}
+	jsonlCh := make(chan JSONLEntry)
+	out := make(chan Event, defaultEventBuffer)
+	const limit = 10 * time.Millisecond
+	quietFor := func() time.Duration { return 5 * limit }
+	go mergeEvents(ctx, snap.Snapshot, quietFor, limit, jsonlCh, out, DefaultPollInterval)
+
+	// Idle snapshot (❯, no ✻): (a) !idle is false even though the PTY is
+	// quiet beyond the limit and no JSONL has arrived. The idle edge
+	// fires once; the stall must never fire.
+	snap.Set([]byte("\xe2\x9d\xaf input"))
+	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyIdle {
+		t.Fatalf("Kind = %v, want EventKindPtyIdle", ev.Kind)
+	}
+	select {
+	case extra, ok := <-out:
+		if !ok {
+			t.Fatalf("channel closed unexpectedly")
+		}
+		t.Fatalf("unexpected event %+v while idle, want no stall", extra)
+	case <-time.After(5 * DefaultPollInterval):
+	}
+
+	cancel()
+	assertEventChClosed(t, out, 500*time.Millisecond)
+}
+
+func TestMergeEvents_StallSuppressedByRecentPty(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	snap := &testSnap{}
+	jsonlCh := make(chan JSONLEntry)
+	out := make(chan Event, defaultEventBuffer)
+	const limit = 50 * time.Millisecond
+	// PTY bytes arrived recently — quiet window stays below the limit, so
+	// (b) never holds.
+	quietFor := func() time.Duration { return limit / 10 }
+	go mergeEvents(ctx, snap.Snapshot, quietFor, limit, jsonlCh, out, DefaultPollInterval)
+
+	snap.Set(stallSnap)
+	select {
+	case ev, ok := <-out:
+		if !ok {
+			t.Fatalf("channel closed unexpectedly")
+		}
+		t.Fatalf("unexpected event %+v with recent PTY bytes, want no stall", ev)
+	case <-time.After(5 * DefaultPollInterval):
+	}
+
+	cancel()
+	assertEventChClosed(t, out, 500*time.Millisecond)
+}
+
+func TestMergeEvents_StallSuppressedByRecentJsonlThenFires(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	snap := &testSnap{}
+	jsonlCh := make(chan JSONLEntry, 1)
+	out := make(chan Event, defaultEventBuffer)
+	const limit = 200 * time.Millisecond
+	// The PTY is quiet beyond the limit throughout; only JSONL progress
+	// gates the stall in this scenario.
+	quietFor := func() time.Duration { return 10 * limit }
+	go mergeEvents(ctx, snap.Snapshot, quietFor, limit, jsonlCh, out, DefaultPollInterval)
+
+	// (a) and (b) hold immediately. Record a JSONL arrival so (c) — no
+	// JSONL within the window — is suppressed.
+	snap.Set(stallSnap)
+	jsonlCh <- JSONLEntry{Type: "assistant"}
+	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindJsonlEntry {
+		t.Fatalf("Kind = %v, want EventKindJsonlEntry", ev.Kind)
+	}
+
+	// Comfortably inside the window after the JSONL entry: stall suppressed.
+	select {
+	case extra, ok := <-out:
+		if !ok {
+			t.Fatalf("channel closed unexpectedly")
+		}
+		t.Fatalf("stall fired within the JSONL window: got %+v", extra)
+	case <-time.After(limit / 2):
+	}
+
+	// Once the window elapses with no further JSONL, the stall fires.
+	ev = mustReceiveEvent(t, out, 2*limit)
+	if ev.Kind != EventKindStallDetected {
+		t.Fatalf("Kind = %v, want EventKindStallDetected after window elapsed", ev.Kind)
+	}
+
+	cancel()
+	assertEventChClosed(t, out, 500*time.Millisecond)
+}
+
+func TestMergeEvents_StallReusesPtyQuietLimit(t *testing.T) {
+	// quietFor reports a fixed quiet window on every tick. The stall
+	// fires only when the configured ptyQuietLimit is below that window,
+	// proving detection keys off the passed-in limit — not a hardcoded
+	// constant (AC4).
+	const quiet = 30 * time.Millisecond
+	quietFor := func() time.Duration { return quiet }
+
+	t.Run("limit below quiet window fires", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		snap := &testSnap{}
+		jsonlCh := make(chan JSONLEntry)
+		out := make(chan Event, defaultEventBuffer)
+		go mergeEvents(ctx, snap.Snapshot, quietFor, quiet/3, jsonlCh, out, DefaultPollInterval)
+
+		snap.Set(stallSnap)
+		ev := mustReceiveEvent(t, out, 500*time.Millisecond)
+		if ev.Kind != EventKindStallDetected {
+			t.Fatalf("Kind = %v, want EventKindStallDetected (limit < quiet window)", ev.Kind)
+		}
+		cancel()
+		assertEventChClosed(t, out, 500*time.Millisecond)
+	})
+
+	t.Run("limit above quiet window suppresses", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		snap := &testSnap{}
+		jsonlCh := make(chan JSONLEntry)
+		out := make(chan Event, defaultEventBuffer)
+		go mergeEvents(ctx, snap.Snapshot, quietFor, 10*quiet, jsonlCh, out, DefaultPollInterval)
+
+		snap.Set(stallSnap)
+		select {
+		case ev, ok := <-out:
+			if !ok {
+				t.Fatalf("channel closed unexpectedly")
+			}
+			t.Fatalf("unexpected event %+v: quiet window below limit must not fire", ev)
+		case <-time.After(5 * DefaultPollInterval):
+		}
+		cancel()
+		assertEventChClosed(t, out, 500*time.Millisecond)
+	})
 }

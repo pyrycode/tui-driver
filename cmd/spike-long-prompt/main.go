@@ -205,7 +205,7 @@ func run(sessionIDFlag string, trustFolderPolicy string) error {
 	}
 	logger.Printf("session-jsonl-opened path=%s offset=0", jsonlPath)
 
-	events, err := session.Events(rootCtx, jsonlPath, 0)
+	events, err := session.Events(rootCtx, jsonlPath, 0, tr)
 	if err != nil {
 		return fmt.Errorf("open events stream: %w", err)
 	}
