@@ -85,6 +85,8 @@ In `cmd/spike-multi-turn/` and `cmd/spike-cancel/` the events channel is **sessi
 
 Shutdown is a `defer` with a `sync.Once`-guarded body: SIGTERM → 3 s grace race against `cmd.Wait()` → SIGKILL → close PTY → cancel context → `wg.Wait()`. Same sequence in all three spike binaries.
 
+**Reader-goroutine taps (library `Session`).** The PTY reader goroutine appends each chunk to the rolling buffer, and optionally tees it to (a) the `RecordTo`/`MirrorStderr` mirror sink and (b) since [#136](../codebase/136.md) the opt-in **raw-output stream** `(*Session).MirrorOutput() <-chan []byte` — a third tap taken from the *live* PTY read (before the parse-oriented buffer), delivering opaque per-chunk copies for a local `pyry attach` head to byte-mirror `claude`'s terminal. The reader is its sole sender + sole closer. Its send is **non-blocking drop-newest** (cap `defaultMirrorOutputBuffer = 256`), deliberately diverging from the `Events()`/`TailJSONL` block-on-full precedent: those run on *dedicated* goroutines, but this send is in the *shared* reader, where blocking would freeze state detection and deadlock `Close`'s `<-readerDone`. `defer close(mirrorOut)` is registered after `defer close(readerDone)` (LIFO → closes first), so a `Wait()`-then-drain always sees the stream closed. The paired production raw-input path is `(*Session).AttachInput([]byte) error` (over the internal `writeRaw`, distinct from the spike-only `SendKeys`). Full contract + SECURITY notes: [features/attach-mirror-surface.md](../features/attach-mirror-surface.md).
+
 ## Key signals
 
 - **Idle:** `❯` glyph (UTF-8 `\xe2\x9d\xaf`) present in the ANSI-stripped rolling buffer AND the spinner regex does NOT match.
@@ -119,3 +121,4 @@ See [features/e2e-harness.md](../features/e2e-harness.md) for the operator runbo
 - [ADR-0002 — Pattern matching over emulation](../decisions/0002-pattern-matching-over-emulation.md)
 - [JSONL layout](jsonl-layout.md)
 - [e2e harness feature doc](../features/e2e-harness.md)
+- [Local-attach mirror surface feature doc](../features/attach-mirror-surface.md)
