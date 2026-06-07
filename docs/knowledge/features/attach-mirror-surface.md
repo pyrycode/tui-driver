@@ -118,6 +118,7 @@ if err := sess.AttachInput(rawKeystrokes); err != nil {
 
 ## Related
 
+- [Session.Resize](session-resize.md) — the sibling sealed-surface seam that completes the attach surface with **geometry** (`(*Session).Resize(rows, cols)` sizes the hosted PTY). Same additive-no-raw-seam shape; together `MirrorOutput` (out) + `AttachInput` (in) + `Resize` (geometry) are everything a local `pyry attach` head needs from the sealed `Session`. Introduced by [#138](../codebase/138.md).
 - [CastRecorder](cast-recorder.md) — the lossless, file-owned sibling sink; composes with `MirrorOutput`.
 - [System overview § Concurrency model](../architecture/system-overview.md#concurrency-model) — the reader goroutine and its taps; the `Events()` block-on-full precedent this diverges from.
 - [#136 — per-ticket notes](../codebase/136.md) — implementation summary, patterns, and lessons.
