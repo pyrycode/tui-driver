@@ -77,6 +77,15 @@ const (
 	// carries the same JSONLEntry as the preceding event. Per-entry
 	// semantics (no msg_id grouping) — see IsEndTurn.
 	EventKindJsonlEndOfTurn
+
+	// EventKindStallDetected is the safe-degrade marker: on a poll tick
+	// the session is mid-turn (not idle), the PTY has been quiet beyond
+	// the watchdog's PTYQuietLimit, AND no JSONL entry has arrived
+	// within that same window. Rising-edge: fires once on entry into the
+	// stalled condition, not every tick (consistent with the idle /
+	// thinking / banner edges). No payload fields — the kind is the
+	// signal; consumers wanting the quiet duration call Session.QuietFor.
+	EventKindStallDetected
 )
 
 // EventSource tags an Event with its origin. Redundant with Kind for
@@ -103,6 +112,8 @@ const (
 //   - EventKindJsonlEntry, EventKindJsonlEndOfTurn: Entry carries the
 //     parsed entry. Both events for one end-of-turn carry the same
 //     entry.
+//   - EventKindStallDetected: no payload fields. The kind is the
+//     signal; consumers wanting the quiet duration call Session.QuietFor.
 //
 // Time is the wall-clock instant the merge loop detected the event —
 // the poll tick for PTY events, the channel-receive instant for JSONL
@@ -117,8 +128,8 @@ type Event struct {
 }
 
 // Events spawns a merge goroutine that emits PTY-state transitions
-// (idle / thinking / modal / mcp-failure / network-failure) and
-// per-entry JSONL events on a single unified channel in arrival
+// (idle / thinking / modal / mcp-failure / network-failure / stall)
+// and per-entry JSONL events on a single unified channel in arrival
 // order. Internally tails the JSONL file at jsonlPath from
 // startOffset (composes with WaitForSessionJSONL +
 // SessionJSONLPath); errors from the synchronous open/seek phase are
@@ -136,34 +147,54 @@ type Event struct {
 // events fire regardless of modal state because the banners coexist
 // with modal/idle/thinking UI in the lower status area.
 //
+// tr is required (non-nil). The stall arm reuses tr's configured
+// PTYQuietLimit — the same value Tracker.CheckWatchdog reads — so a
+// single PTY-quiet timeout governs both the fatal watchdog and this
+// non-fatal degrade marker (no second cadence, no duplicate timeout).
+// EventKindStallDetected fires on the rising edge of the three-condition
+// predicate (not idle AND PTY quiet beyond PTYQuietLimit AND no JSONL
+// within that same window); it does not repeat while the stall persists.
+// A nil tr panics on first dereference, consistent with RunWatchdog.
+//
 // Calling Events twice on one *Session spawns two independent merge
 // loops; both work but each polls the same buffer at the same
 // cadence — typical consumers call it once per session.
-func (s *Session) Events(ctx context.Context, jsonlPath string, startOffset int64) (<-chan Event, error) {
+func (s *Session) Events(ctx context.Context, jsonlPath string, startOffset int64, tr *Tracker) (<-chan Event, error) {
 	jsonlCh, err := TailJSONL(ctx, jsonlPath, startOffset)
 	if err != nil {
 		return nil, err
 	}
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, s.buffer.Snapshot, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, s.buffer.Snapshot, s.buffer.QuietFor, tr.ptyQuietLimit, jsonlCh, out, DefaultPollInterval)
 	return out, nil
 }
 
 // mergeEvents owns the unified merge loop. Polls snapshot at
 // pollInterval for PTY-state transitions (idle / thinking / modal /
-// mcp-failure / network-failure), drains entries from jsonlCh, and
-// writes typed Event values to out in arrival order. Closes out on
+// mcp-failure / network-failure / stall), drains entries from jsonlCh,
+// and writes typed Event values to out in arrival order. Closes out on
 // every return path.
+//
+// quietFor + ptyQuietLimit drive the stall arm: a tick fires
+// EventKindStallDetected when the session is not idle, quietFor()
+// exceeds ptyQuietLimit, AND no JSONL entry has arrived within that
+// same window (now − lastJsonlAt > ptyQuietLimit). lastJsonlAt is
+// goroutine-local, refreshed by every JSONL arrival; its zero value
+// (no JSONL yet) makes the no-progress condition hold, but the arm
+// still cannot fire until the PTY itself goes quiet for the full limit.
 //
 // The loop starts transition-blind (prev state all-zero); the first
 // tick emits whichever rising edges hold relative to that — a buffer
 // already idle at subscription fires EventKindPtyIdle on tick one. A
 // buffer already showing a modal fires EventKindPtyModalShown. The
-// mcp-failure and network-failure axes follow the same rising-edge
-// rule and are not suppressed by modal state.
+// mcp-failure, network-failure, and stall axes follow the same
+// rising-edge rule; mcp-failure and network-failure are not suppressed
+// by modal state.
 func mergeEvents(
 	ctx context.Context,
 	snapshot func() []byte,
+	quietFor func() time.Duration,
+	ptyQuietLimit time.Duration,
 	jsonlCh <-chan JSONLEntry,
 	out chan<- Event,
 	pollInterval time.Duration,
@@ -173,6 +204,10 @@ func mergeEvents(
 	defer ticker.Stop()
 
 	var prev ptyState
+	// lastJsonlAt is the receive instant of the most recent JSONL entry
+	// — the reference point for the stall arm's "no JSONL progress"
+	// condition. Zero until the first arrival (treated as "no progress").
+	var lastJsonlAt time.Time
 
 	// send delivers ev with backpressure-aware ctx-abort. Returns
 	// false on ctx cancellation; the caller returns from the loop.
@@ -194,6 +229,9 @@ func mergeEvents(
 				return
 			}
 			now := time.Now()
+			// Any JSONL entry is "progress" — structured output means
+			// claude is responding, per the safe-degrade ladder.
+			lastJsonlAt = now
 			if !send(Event{
 				Kind:   EventKindJsonlEntry,
 				Source: EventSourceJsonl,
@@ -215,6 +253,13 @@ func mergeEvents(
 		case <-ticker.C:
 			cur := classify(snapshot())
 			now := time.Now()
+			// Stall predicate (ADR 025 safe-degrade): mid-turn AND PTY
+			// quiet beyond the limit AND no JSONL progress within that
+			// same window. Computed here (not in classify, which sees
+			// only the snapshot, never the quiet timings).
+			cur.stalled = !cur.idle &&
+				quietFor() > ptyQuietLimit &&
+				now.Sub(lastJsonlAt) > ptyQuietLimit
 			// Modal axis dominates: emit modal transitions first
 			// (Hidden before Shown on a class→class change), then
 			// idle/thinking only when no modal is active.
@@ -298,6 +343,18 @@ func mergeEvents(
 					return
 				}
 			}
+			// Stall is a rising-edge degrade marker: fires once on entry
+			// into the stalled condition and re-arms only after it clears
+			// (a PTY byte, a JSONL entry, or a return to idle).
+			if cur.stalled && !prev.stalled {
+				if !send(Event{
+					Kind:   EventKindStallDetected,
+					Source: EventSourcePty,
+					Time:   now,
+				}) {
+					return
+				}
+			}
 			prev = cur
 		}
 	}
@@ -311,6 +368,11 @@ type ptyState struct {
 	modal          ModalClass
 	mcpFailure     bool
 	networkFailure bool
+	// stalled is the ADR 025 safe-degrade marker. Unlike the other
+	// axes it is NOT set by classify (which sees only the snapshot) —
+	// the merge loop computes it from the quiet-timing inputs after
+	// classify returns. See mergeEvents' ticker arm.
+	stalled bool
 }
 
 // classify reduces snap to the independent PTY-state axes the merge
