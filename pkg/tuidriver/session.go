@@ -35,6 +35,17 @@ const ClearLineSettle = 50 * time.Millisecond
 // dependence. Package-private — not a public knob.
 var sleepFn = time.Sleep
 
+// defaultMirrorOutputBuffer is the capacity of the raw-output mirror stream
+// (SpawnOpts.MirrorOutput / Session.MirrorOutput). Larger than Events'
+// defaultEventBuffer (32) on purpose: the slow-consumer policy here is
+// non-blocking drop-newest, so buffer depth maps to dropped-frame frequency,
+// not to producer-stall duration — a different tradeoff from the lossless
+// Events channel. 256 chunks (≤ ~1 MB at the 4 KB read size) absorb
+// multi-frame repaint bursts before any chunk is dropped. Internal, not a
+// public knob (same posture as defaultEventBuffer); retune on evidence from
+// the downstream attach spike.
+const defaultMirrorOutputBuffer = 256
+
 // SpawnOpts configures Spawn.
 type SpawnOpts struct {
 	// RecordTo, if non-empty, is a filesystem path the session opens (0600,
@@ -56,6 +67,28 @@ type SpawnOpts struct {
 	// "live view" so an operator can watch claude's TUI. Production drivers
 	// leave it false. Composes with RecordTo: both sinks receive the bytes.
 	MirrorStderr bool
+
+	// MirrorOutput, when true, makes Spawn open a live stream of the hosted
+	// process's raw PTY output bytes, retrievable via Session.MirrorOutput.
+	// Each PTY read chunk is copied and delivered verbatim on that channel as
+	// an opaque byte slice — the production surface for byte-mirroring claude's
+	// terminal to a local attach head. Default false → zero behaviour change;
+	// the reader hot loop is identical for every non-attach session. Composes
+	// with RecordTo / MirrorStderr (all sinks see the same bytes).
+	//
+	// OPAQUE BYTES — DO NOT PARSE: the chunks are for forwarding to a terminal
+	// verbatim. The consumer must never inspect, match, or branch on their
+	// content; all screen knowledge (anchors, spinners, modal text) stays
+	// inside tui-driver. The delivery shape (a channel of []byte, not an
+	// io.Reader over the rolling buffer) is deliberately hostile to tokenising.
+	//
+	// SECURITY: the stream carries every byte claude's terminal renders — the
+	// prompt, claude's output, and all tool output, which can include file
+	// contents and secrets (the same content RecordTo flags above). The
+	// consumer owns the confidentiality of whatever transport it forwards these
+	// bytes to (local TTY, socket, or a network link to a remote head). Do not
+	// pipe them over an untrusted channel.
+	MirrorOutput bool
 
 	// BufferCap is the rolling-buffer capacity in bytes. 0 → DefaultBufferCap.
 	BufferCap int
@@ -97,6 +130,13 @@ type Session struct {
 	// goroutine — the sole writer — has joined, so the close cannot race a
 	// mirror write.
 	recCloser io.Closer
+
+	// mirrorOut is the raw-output stream returned by MirrorOutput, allocated
+	// in Spawn only when SpawnOpts.MirrorOutput is set (nil otherwise). The
+	// reader goroutine is its sole sender and sole closer, so no send-on-closed
+	// is possible. Set once before any goroutine starts and only read after, so
+	// the hot-loop nil check and the accessor need no lock.
+	mirrorOut chan []byte
 }
 
 // Spawn launches cmd inside a PTY and starts a reader goroutine that
@@ -135,6 +175,9 @@ func Spawn(cmd *exec.Cmd, opts SpawnOpts) (*Session, error) {
 		shutdownGrace: grace,
 		recCloser:     recCloser,
 	}
+	if opts.MirrorOutput {
+		s.mirrorOut = make(chan []byte, defaultMirrorOutputBuffer)
+	}
 
 	// cmd.Wait observer — populates exitErr then closes exited. The
 	// close-broadcast pattern lets Wait() and Close() (and any other
@@ -145,9 +188,16 @@ func Spawn(cmd *exec.Cmd, opts SpawnOpts) (*Session, error) {
 	}()
 
 	// PTY reader goroutine — drains the master FD into Buffer, optionally
-	// teeing each chunk to the mirror sink (recording and/or stderr).
+	// teeing each chunk to the mirror sink (recording and/or stderr) and to the
+	// raw-output stream. Sole sender and sole closer of mirrorOut.
 	go func() {
 		defer close(s.readerDone)
+		// LIFO: registered after readerDone so mirrorOut closes *first*. A
+		// consumer that calls Wait (which blocks on readerDone) and then drains
+		// therefore always observes the stream already closed.
+		if s.mirrorOut != nil {
+			defer close(s.mirrorOut)
+		}
 		buf := make([]byte, 4096)
 		for {
 			n, rerr := ptmx.Read(buf)
@@ -156,6 +206,23 @@ func Spawn(cmd *exec.Cmd, opts SpawnOpts) (*Session, error) {
 				s.buffer.Append(chunk)
 				if mirror != nil {
 					_, _ = mirror.Write(chunk)
+				}
+				if s.mirrorOut != nil {
+					// chunk aliases the reused buf; the async consumer needs its
+					// own backing array.
+					cp := make([]byte, n)
+					copy(cp, chunk)
+					select {
+					case s.mirrorOut <- cp:
+					default:
+						// Drop-newest: the consumer is slower than the PTY. A
+						// dropped chunk is a transient screen glitch that claude's
+						// next full repaint heals; dropping (not blocking) keeps
+						// the shared reader off a full channel so state detection
+						// never freezes and Close never wedges. NEVER log cp — it
+						// carries claude's full screen content (file contents,
+						// secrets); a debug log would leak it.
+					}
 				}
 			}
 			if rerr != nil {
@@ -311,6 +378,27 @@ func (s *Session) QuietFor() time.Duration { return s.buffer.QuietFor() }
 // LastAppendAt returns the timestamp of the most recent PTY append, or the zero
 // value if nothing has arrived yet.
 func (s *Session) LastAppendAt() time.Time { return s.buffer.LastAppendAt() }
+
+// MirrorOutput returns the live receive-only stream of the hosted process's
+// raw PTY output bytes. Each received []byte is an independent copy of one PTY
+// read chunk, delivered verbatim — the production surface for byte-mirroring
+// claude's terminal to a local attach head. This is a tap on the live PTY read,
+// not a reader over the rolling buffer.
+//
+// OPAQUE BYTES — DO NOT PARSE: forward the chunks verbatim and never look
+// inside them. The consumer must not inspect, match, or branch on their
+// content; all screen knowledge (anchors, spinners, modal text) stays inside
+// tui-driver. See SpawnOpts.MirrorOutput for the full opaque-bytes-no-parse and
+// SECURITY contract (the bytes can include file contents and secrets).
+//
+// Returns nil when SpawnOpts.MirrorOutput was false — ranging a nil channel
+// blocks forever, so only call this when you enabled the stream. The reader
+// goroutine closes the channel on shutdown (Close, or natural process exit); a
+// consumer that calls Wait and then drains always observes it already closed.
+// Slow-consumer policy: under backpressure chunks are dropped (drop-newest, a
+// fixed-capacity buffer) rather than blocking the session — the mirror is
+// best-effort and a dropped chunk heals on claude's next full repaint.
+func (s *Session) MirrorOutput() <-chan []byte { return s.mirrorOut }
 
 // Wait blocks until both the underlying process has exited AND the PTY
 // reader goroutine has drained the final bytes from the PTY master FD.
