@@ -73,3 +73,22 @@ func (s *Session) Navigate(k ArrowKey) error {
 func (s *Session) SendKeys(keys string) error {
 	return s.writeRaw([]byte(keys))
 }
+
+// AttachInput writes p verbatim to the hosted process's PTY — the production
+// raw-input path for a local attach head forwarding an attached terminal's raw
+// keystrokes back into the session. Pairs with SpawnOpts.MirrorOutput for the
+// output direction. Returns the first non-nil PTY write error (e.g. the
+// closed-file error after Close). No panic.
+//
+// OPAQUE BYTES — DO NOT PARSE: p is the attached terminal's raw keystrokes,
+// forwarded to the PTY untouched, not a parsed command. Unlike SendKeys (the
+// spike-only escape hatch, "not intended for production drivers"), AttachInput
+// carries a production attach contract.
+//
+// SECURITY: input governs claude's agency — the bytes are interpreted by
+// claude's TUI under claude's own permission model. Authenticating *who* may
+// attach is the consumer's responsibility (ADR 025 mobile-head auth), not
+// tui-driver's.
+func (s *Session) AttachInput(p []byte) error {
+	return s.writeRaw(p)
+}
