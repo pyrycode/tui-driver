@@ -1,6 +1,7 @@
 package tuidriver
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -131,4 +132,24 @@ func StartPTY(cmd *exec.Cmd) (*os.File, error) {
 	}
 	_ = pty.Setsize(ptmx, &pty.Winsize{Rows: DefaultPtyRows, Cols: DefaultPtyCols})
 	return ptmx, nil
+}
+
+// Resize sets the hosted PTY's window size to rows×cols (TIOCSWINSZ on the held
+// master FD), which the kernel turns into SIGWINCH on the hosted process so its
+// TUI redraws. It is the sanctioned replacement for the sealed Session.PTY
+// accessor, letting a consumer that holds only a *Session size a live session's
+// PTY instead of the fixed DefaultPtyRows×DefaultPtyCols.
+//
+// rows/cols are passed through verbatim — not clamped, defaulted, or
+// interpreted. Resize is callable the instant Spawn returns, so a size known up
+// front can be set before the child's first render; a session that never calls
+// Resize keeps StartPTY's 40×120 default unchanged.
+//
+// Returns a non-nil error if the size cannot be applied (e.g. after Close, where
+// the closed master FD yields EBADF); never panics.
+func (s *Session) Resize(rows, cols uint16) error {
+	if err := pty.Setsize(s.pty, &pty.Winsize{Rows: rows, Cols: cols}); err != nil {
+		return fmt.Errorf("tuidriver: resize to %dx%d: %w", rows, cols, err)
+	}
+	return nil
 }
