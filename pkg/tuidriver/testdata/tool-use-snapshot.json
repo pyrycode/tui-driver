@@ -1,0 +1,8 @@
+{
+  "id": "toolu_01BashListTmpExampleAAAAAA",
+  "name": "Bash",
+  "input": {
+    "command": "ls /tmp",
+    "description": "List files in /tmp"
+  }
+}
