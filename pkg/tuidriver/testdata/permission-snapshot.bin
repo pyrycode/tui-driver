@@ -1,0 +1,11 @@
+]0;✳ List files in /tmp directory[39m⏺[1C[1mListing 1 directory…(ctrl+o to expand)[22m
+[2C⎿  $ ls /tmp
+─────────────────────────────────────────────────────────────────────────────────────────
+[1mBash command[22m
+ls[1C/tmp
+[1mList[1Cfiles[1Cin[1C/tmp[22m
+[33mDo[1Cyou[1Cwant[1Cto[1Cproceed?[39m
+[36m❯[1C1.[1CYes[39m
+[2C2.[1CYes,[1Callow[1Creading[1Cfrom[1Ctmp/[1Cfrom[1Cthis[1Cproject
+[2C3.[1CNo
+[2m(Esc[1Cto[1Ccancel[1C·[1CTab[1Cto[1Camend)[22m
