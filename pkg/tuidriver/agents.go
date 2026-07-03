@@ -23,6 +23,11 @@ type Agent struct {
 
 // ParseAgentList extracts /agents modal contents into structured form.
 //
+// Dormant on the pinned claude: claude 2.1.199 removed the `/agents` wizard
+// (see ModalClassAgents), so this parses the pre-2.1.199 modal only. Retained
+// for pre-2.1.199-claude compatibility and exercised host-independently by
+// agents-snapshot.bin (TestParseAgentListRealFixture). See #182.
+//
 // Layout observed (loop 6 F-1):
 //
 //	Agents  Running   Library                  ← tab bar
