@@ -14,13 +14,24 @@ import (
 //   - ask-user-question  (loop 5 E-1)                — AskUserQuestion tool modal
 //   - mcp                (loop 6 F-1)                — `/mcp` status display
 //   - agents             (loop 6 F-1)                — `/agents` subagent list
+//     (removed in claude 2.1.199 — matches pre-2.1.199 builds only; see ModalClassAgents)
 //   - model-select       (2026-05-18 evening probes) — `/model` model picker
 //   - permissions-config (2026-05-18 evening probes) — `/permissions` settings
 type ModalClass string
 
 const (
-	ModalClassUnknown           ModalClass = ""
-	ModalClassMCP               ModalClass = "mcp"
+	ModalClassUnknown ModalClass = ""
+	ModalClassMCP     ModalClass = "mcp"
+	// ModalClassAgents matches claude's pre-2.1.199 tabbed `/agents` modal.
+	// claude 2.1.199 removed the `/agents` wizard: `/agents` now prints a
+	// one-line "The /agents wizard has been removed…" notice that carries
+	// neither the "Agents" header nor a Running/Library tab, so
+	// DetectModalClass returns ModalClassUnknown for it (verified live against
+	// 2.1.199 while working #178). This class and its anchors therefore match
+	// pre-2.1.199 builds only (≤2.1.158 still render the real modal). Retained
+	// deliberately — not dead code — per claude-version.lock's tolerated-drift
+	// policy and the #129/#178 retain precedent; kept exercised host-
+	// independently by agents-snapshot.bin. See #182.
 	ModalClassAgents            ModalClass = "agents"
 	ModalClassSlashPicker       ModalClass = "slash-picker"
 	ModalClassAskUserQuestion   ModalClass = "ask-user-question"
@@ -45,6 +56,7 @@ const (
 //	                      (claude 2.1.158 renders the empty-state instead of
 //	                      the modal under --strict-mcp-config — see #128)
 //	agents              → "Agents" header + "Running" or "Library" tab
+//	                      (pre-2.1.199 only — see ModalClassAgents)
 //	slash-picker        → ≥1 line whose stripped content starts with `/<letter>`
 //	ask-user-question   → "Entertoselect" or "Enter to select"
 //	trust-folder        → "Quicksafetycheck"
