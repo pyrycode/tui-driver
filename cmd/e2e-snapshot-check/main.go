@@ -20,7 +20,6 @@
 // Stdout protocol (one line per fixture, in fixture-table order):
 //
 //	SNAPSHOT mcp match|diff|recorded
-//	SNAPSHOT agents match|diff|recorded
 //
 // Stderr carries operator-facing diagnostics (mirrored spike-multiselect
 // output, per-fixture "drift in <path>" lines on diff, plus a
@@ -57,7 +56,7 @@ var dumpPathRe = regexp.MustCompile(`picker-snapshot path=(\S+)`)
 var modalClassRe = regexp.MustCompile(`modal-class detected=(\S*)`)
 
 type fixture struct {
-	name    string // "mcp" | "agents"
+	name    string // "mcp"
 	trigger string // raw bytes for -trigger flag
 	settle  time.Duration
 }
@@ -71,7 +70,6 @@ func main() {
 
 	fixtures := []fixture{
 		{name: "mcp", trigger: "/mcp\r", settle: 5 * time.Second},
-		{name: "agents", trigger: "/agents\r", settle: 0},
 	}
 
 	allOK := true

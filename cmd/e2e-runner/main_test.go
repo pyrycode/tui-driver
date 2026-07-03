@@ -15,24 +15,20 @@ func TestParseSnapshotResults(t *testing.T) {
 		want   map[string]any
 	}{
 		{
-			name: "all match",
-			stdout: "SNAPSHOT mcp match\n" +
-				"SNAPSHOT agents match\n",
+			name:   "single match",
+			stdout: "SNAPSHOT mcp match\n",
 			want: map[string]any{
 				"snapshots": []map[string]any{
 					{"file": "pkg/tuidriver/testdata/mcp-snapshot.json", "result": "match"},
-					{"file": "pkg/tuidriver/testdata/agents-snapshot.json", "result": "match"},
 				},
 			},
 		},
 		{
-			name: "mixed match and diff",
-			stdout: "SNAPSHOT mcp diff\n" +
-				"SNAPSHOT agents match\n",
+			name:   "single diff",
+			stdout: "SNAPSHOT mcp diff\n",
 			want: map[string]any{
 				"snapshots": []map[string]any{
 					{"file": "pkg/tuidriver/testdata/mcp-snapshot.json", "result": "diff"},
-					{"file": "pkg/tuidriver/testdata/agents-snapshot.json", "result": "match"},
 				},
 			},
 		},
@@ -47,26 +43,15 @@ func TestParseSnapshotResults(t *testing.T) {
 			want:   nil,
 		},
 		{
-			name: "noisy stdout with SNAPSHOT lines interspersed",
+			name: "mcp line amid noise",
 			stdout: "2026-05-19 14:00:00 starting\n" +
 				"intermediate log\n" +
 				"SNAPSHOT mcp diff\n" +
 				"final log line\n" +
-				"SNAPSHOT agents match\n" +
 				"done\n",
 			want: map[string]any{
 				"snapshots": []map[string]any{
 					{"file": "pkg/tuidriver/testdata/mcp-snapshot.json", "result": "diff"},
-					{"file": "pkg/tuidriver/testdata/agents-snapshot.json", "result": "match"},
-				},
-			},
-		},
-		{
-			name:   "partial output (timeout mid-run)",
-			stdout: "SNAPSHOT mcp match\n",
-			want: map[string]any{
-				"snapshots": []map[string]any{
-					{"file": "pkg/tuidriver/testdata/mcp-snapshot.json", "result": "match"},
 				},
 			},
 		},

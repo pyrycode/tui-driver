@@ -41,7 +41,7 @@ test:
 e2e: build-bin
 	$(if $(MODEL),TUIDRIVER_CLAUDE_MODEL=$(MODEL)) $(if $(EFFORT),TUIDRIVER_CLAUDE_EFFORT=$(EFFORT)) $(BIN_DIR)/$(RUNNER) -bin-dir $(BIN_DIR) -report $(REPORT)
 
-# Re-record the two snapshot-drift JSON fixtures under pkg/tuidriver/testdata/.
+# Re-record the mcp snapshot-drift JSON fixture under pkg/tuidriver/testdata/.
 # Operator-driven, NOT invoked by `make e2e`. Review with `git diff` before commit;
 # bump claude-version.lock `version=` to match `claude --version` in the same commit.
 rerecord-snapshots: build-bin
