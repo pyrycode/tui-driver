@@ -262,6 +262,66 @@ func TestEnsureClaudeEnvStrictMcpModelEffortAllAppendNoDuplicates(t *testing.T) 
 	}
 }
 
+func TestEnsureClaudeEnvScrubsNestingVars(t *testing.T) {
+	cmd := &exec.Cmd{Env: []string{
+		"CLAUDECODE=1",
+		"CLAUDE_CODE_CHILD_SESSION=1",
+		"CLAUDE_CODE_SESSION_ID=abc-123",
+		"CLAUDE_CODE_ENTRYPOINT=sdk-ts",
+		"PATH=/usr/bin",
+	}}
+	EnsureClaudeEnv(cmd)
+	for _, key := range []string{
+		"CLAUDECODE",
+		"CLAUDE_CODE_CHILD_SESSION",
+		"CLAUDE_CODE_SESSION_ID",
+		"CLAUDE_CODE_ENTRYPOINT",
+	} {
+		if hasEnvKey(cmd.Env, key) {
+			t.Errorf("nesting var %q not scrubbed: %v", key, cmd.Env)
+		}
+	}
+	if !hasEnvKey(cmd.Env, "PATH") {
+		t.Errorf("unrelated var PATH was dropped: %v", cmd.Env)
+	}
+	if !contains(cmd.Env, ClaudeTermEnv) {
+		t.Errorf("Env = %v, missing %q", cmd.Env, ClaudeTermEnv)
+	}
+}
+
+func TestEnsureClaudeEnvPreservesOAuthToken(t *testing.T) {
+	cmd := &exec.Cmd{Env: []string{
+		"CLAUDECODE=1",
+		"CLAUDE_CODE_OAUTH_TOKEN=sk-secret",
+	}}
+	EnsureClaudeEnv(cmd)
+	if hasEnvKey(cmd.Env, "CLAUDECODE") {
+		t.Errorf("CLAUDECODE not scrubbed: %v", cmd.Env)
+	}
+	if !contains(cmd.Env, "CLAUDE_CODE_OAUTH_TOKEN=sk-secret") {
+		t.Errorf("OAuth token dropped: %v", cmd.Env)
+	}
+}
+
+func TestEnsureClaudeEnvScrubsNestingVarsFromOsEnviron(t *testing.T) {
+	t.Setenv("CLAUDECODE", "1")
+	cmd := &exec.Cmd{} // nil Env seeds from os.Environ.
+	EnsureClaudeEnv(cmd)
+	if hasEnvKey(cmd.Env, "CLAUDECODE") {
+		// Do NOT print cmd.Env — it is the real os.Environ and may hold secrets.
+		t.Error("CLAUDECODE from os.Environ not scrubbed")
+	}
+}
+
+func hasEnvKey(env []string, key string) bool {
+	for _, kv := range env {
+		if kv == key || strings.HasPrefix(kv, key+"=") {
+			return true
+		}
+	}
+	return false
+}
+
 func contains(haystack []string, needle string) bool {
 	for _, s := range haystack {
 		if s == needle {

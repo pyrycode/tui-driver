@@ -51,19 +51,62 @@ const ClaudeEffortEnv = "TUIDRIVER_CLAUDE_EFFORT"
 const claudeModelFlag = "--model"
 const claudeEffortFlag = "--effort"
 
+// claudeNestingEnvVars are the environment markers Claude Code sets on a
+// child process it spawns. When claude sees them it treats itself as a
+// nested child session and skips writing its standalone session transcript,
+// the JSONL the runner waits on. Since 2.1.199 that skip makes any spike
+// launched from inside a Claude Code session hang at the first-prompt
+// deadline. EnsureClaudeEnv removes them so the driven claude always starts
+// as a clean top-level session. CLAUDE_CODE_OAUTH_TOKEN is deliberately not
+// listed: it carries auth and must survive.
+var claudeNestingEnvVars = []string{
+	"CLAUDECODE",
+	"CLAUDE_CODE_CHILD_SESSION",
+	"CLAUDE_CODE_SESSION_ID",
+	"CLAUDE_CODE_ENTRYPOINT",
+}
+
+func isClaudeNestingVar(key string) bool {
+	for _, v := range claudeNestingEnvVars {
+		if key == v {
+			return true
+		}
+	}
+	return false
+}
+
 // EnsureClaudeEnv prepares cmd for driving claude. It ensures cmd.Env
 // contains TERM=xterm-256color (seeding from os.Environ when nil; replacing
-// any pre-existing TERM=...; idempotent on repeat calls). When the
-// StrictMcpConfigEnv env var is set to "1", it additionally appends
-// --strict-mcp-config to cmd.Args unless that flag is already present;
-// other values (including empty/unset) are a no-op for the args side.
-// When ClaudeModelEnv / ClaudeEffortEnv are set to a non-empty value, it
-// appends --model <value> / --effort <value> to cmd.Args unless the
-// respective flag is already present. Returns cmd for chaining.
+// any pre-existing TERM=...; idempotent on repeat calls). It strips the
+// Claude Code nesting markers (see claudeNestingEnvVars) so the child
+// persists its session transcript even when the parent is itself a Claude
+// Code session. When the StrictMcpConfigEnv env var is set to "1", it
+// additionally appends --strict-mcp-config to cmd.Args unless that flag is
+// already present; other values (including empty/unset) are a no-op for the
+// args side. When ClaudeModelEnv / ClaudeEffortEnv are set to a non-empty
+// value, it appends --model <value> / --effort <value> to cmd.Args unless
+// the respective flag is already present. Returns cmd for chaining.
 func EnsureClaudeEnv(cmd *exec.Cmd) *exec.Cmd {
 	if cmd.Env == nil {
 		cmd.Env = os.Environ()
 	}
+	// Strip Claude Code nesting markers so the driven claude launches as a
+	// clean top-level session and persists its transcript. Without this a
+	// spike run from inside a Claude Code session inherits them, acts as a
+	// nested child, skips the transcript, and hangs the runner at the
+	// first-prompt deadline on 2.1.199+.
+	scrubbed := make([]string, 0, len(cmd.Env))
+	for _, kv := range cmd.Env {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		if !isClaudeNestingVar(key) {
+			scrubbed = append(scrubbed, kv)
+		}
+	}
+	cmd.Env = scrubbed
+
 	termSet := false
 	for i, kv := range cmd.Env {
 		if strings.HasPrefix(kv, "TERM=") {
