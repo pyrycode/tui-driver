@@ -3,6 +3,7 @@ package tuidriver
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -124,5 +125,123 @@ func TestRenderMCPSnapshotRegression(t *testing.T) {
 		if strings.Contains(rendered, dontWant) {
 			t.Errorf("rendered output still contains truncation %q", dontWant)
 		}
+	}
+}
+
+func TestNewGridZeroDimsParity(t *testing.T) {
+	// Zero dims must fall through to the package defaults exactly like Render
+	// does — NewGrid delegates the fallthrough rather than reimplementing it.
+	snap := []byte("alpha\r\nbeta\r\ngamma")
+	got := NewGrid(snap, 0, 0).Rows()
+	want := NewGrid(snap, DefaultGridCols, DefaultGridRows).Rows()
+	if !slices.Equal(got, want) {
+		t.Errorf("NewGrid zero-dims Rows() = %q, differ from explicit defaults %q", got, want)
+	}
+}
+
+func TestGridRowsShape(t *testing.T) {
+	// Content on row 0, blank row 1, content on row 2. Interior empties are
+	// preserved; trailing empties are already dropped by Render.
+	grid := NewGrid([]byte("top\r\n\r\nbottom"), 0, 0)
+	got := grid.Rows()
+	want := []string{"top", "", "bottom"}
+	if !slices.Equal(got, want) {
+		t.Errorf("Rows() = %q, want %q", got, want)
+	}
+}
+
+func TestNewGridEmptyRenderZeroRows(t *testing.T) {
+	// An empty screen has zero rendered rows — NOT [""], which is what a naive
+	// strings.Split("", "\n") would yield.
+	cases := map[string][]byte{
+		"empty snapshot":       []byte(""),
+		"whitespace-only snap": []byte("   \r\n   "),
+	}
+	for name, snap := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := NewGrid(snap, 0, 0).Rows(); len(got) != 0 {
+				t.Errorf("Rows() = %q (len %d), want zero rows", got, len(got))
+			}
+		})
+	}
+}
+
+func TestGridContainsInLastRowsRegionDistinction(t *testing.T) {
+	// The headline slice: screen-region semantics vs. raw-history substring.
+	const modal = "Do you trust the files in this folder?"
+	// Snapshot A renders the modal into the grid's bottom region.
+	snapA := []byte("header line\r\ncontext line\r\n" + modal)
+	// Snapshot B is A plus content rendered *below* the modal, pushing it
+	// above the last-k window — i.e. it has "scrolled up" off the bottom.
+	snapB := []byte("header line\r\ncontext line\r\n" + modal + "\r\nfooter one\r\nfooter two")
+
+	const k = 2
+
+	if got := NewGrid(snapA, 0, 0).ContainsInLastRows(modal, k); !got {
+		t.Errorf("snapshot A: ContainsInLastRows(%q, %d) = false, want true (modal is in the bottom region)", modal, k)
+	}
+	if got := NewGrid(snapB, 0, 0).ContainsInLastRows(modal, k); got {
+		t.Errorf("snapshot B: ContainsInLastRows(%q, %d) = true, want false (modal scrolled above the last-%d window)", modal, k, k)
+	}
+
+	// The whole point: a raw substring match over the full snapshot bytes
+	// finds the modal in BOTH cases — only the grid region predicate distinguishes.
+	if !strings.Contains(string(snapA), modal) || !strings.Contains(string(snapB), modal) {
+		t.Fatalf("test premise broken: raw snapshot bytes must contain %q in both A and B", modal)
+	}
+}
+
+func TestGridContainsInLastRowsBoundaries(t *testing.T) {
+	// 3-row grid: top row "alpha", middle "beta", bottom "gamma".
+	grid := NewGrid([]byte("alpha\r\nbeta\r\ngamma"), 0, 0)
+	rowCount := len(grid.Rows())
+	if rowCount != 3 {
+		t.Fatalf("fixture rendered %d rows, want 3", rowCount)
+	}
+
+	tests := []struct {
+		name string
+		sub  string
+		n    int
+		want bool
+	}{
+		{"n zero returns false", "gamma", 0, false},
+		{"n negative returns false", "gamma", -1, false},
+		{"exact row count reaches the top row", "alpha", rowCount, true},
+		{"n far exceeds row count clamps to all rows", "alpha", rowCount + 100, true},
+		{"top row is above the last-1 window", "alpha", 1, false},
+		{"bottom row is within the last-1 window", "gamma", 1, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := grid.ContainsInLastRows(tt.sub, tt.n); got != tt.want {
+				t.Errorf("ContainsInLastRows(%q, %d) = %v, want %v", tt.sub, tt.n, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGridRowHasPrefix(t *testing.T) {
+	grid := NewGrid([]byte("alpha one\r\nbeta two"), 0, 0)
+	n := len(grid.Rows())
+
+	tests := []struct {
+		name   string
+		i      int
+		prefix string
+		want   bool
+	}{
+		{"in-range matching prefix", 0, "alpha", true},
+		{"in-range non-matching prefix", 0, "beta", false},
+		{"second row matching prefix", 1, "beta", true},
+		{"negative index does not panic", -1, "alpha", false},
+		{"index at length does not panic", n, "beta", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := grid.RowHasPrefix(tt.i, tt.prefix); got != tt.want {
+				t.Errorf("RowHasPrefix(%d, %q) = %v, want %v", tt.i, tt.prefix, got, tt.want)
+			}
+		})
 	}
 }
