@@ -2,6 +2,7 @@ package tuidriver
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -50,6 +51,9 @@ func TestWaitReady(t *testing.T) {
 	}
 }
 
+// TestWaitReadyContextCancelled is the AC #3 "process alive, cancelled" guard:
+// a directly-constructed Session has a nil exited channel, so the exit arm is
+// inert and WaitReady still returns the ctx cause when it never reaches idle.
 func TestWaitReadyContextCancelled(t *testing.T) {
 	s := &Session{buffer: NewBuffer(0)} // never idle
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -60,5 +64,58 @@ func TestWaitReadyContextCancelled(t *testing.T) {
 	}
 	if (got != Readiness{}) {
 		t.Errorf("WaitReady = %+v on error, want zero Readiness", got)
+	}
+}
+
+// TestWaitReadyProcessExited: a session whose process has exited (exited
+// closed, exitErr set) and that never reaches idle must return promptly with a
+// *ProcessExitedError carrying the exit cause — not poll until the ctx timeout.
+func TestWaitReadyProcessExited(t *testing.T) {
+	exitErr := errors.New("exit status 1")
+	exited := make(chan struct{})
+	close(exited)
+	s := &Session{buffer: NewBuffer(0), exited: exited, exitErr: exitErr} // never idle
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	got, err := s.WaitReady(ctx)
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("WaitReady took %v, want prompt return well within ctx timeout", elapsed)
+	}
+
+	var pee *ProcessExitedError
+	if !errors.As(err, &pee) {
+		t.Fatalf("WaitReady err = %v, want *ProcessExitedError", err)
+	}
+	if !errors.Is(err, exitErr) {
+		t.Errorf("WaitReady err does not wrap exitErr %v", exitErr)
+	}
+	if pee.Err != exitErr {
+		t.Errorf("ProcessExitedError.Err = %v, want %v", pee.Err, exitErr)
+	}
+	if (got != Readiness{}) {
+		t.Errorf("WaitReady = %+v on error, want zero Readiness", got)
+	}
+}
+
+// TestWaitReadyProcessExitedCleanExit: a clean exit-before-ready (exitErr nil)
+// still surfaces a *ProcessExitedError, with a nil cause.
+func TestWaitReadyProcessExitedCleanExit(t *testing.T) {
+	exited := make(chan struct{})
+	close(exited)
+	s := &Session{buffer: NewBuffer(0), exited: exited} // never idle, exitErr nil
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := s.WaitReady(ctx)
+	var pee *ProcessExitedError
+	if !errors.As(err, &pee) {
+		t.Fatalf("WaitReady err = %v, want *ProcessExitedError", err)
+	}
+	if pee.Err != nil {
+		t.Errorf("ProcessExitedError.Err = %v, want nil on clean exit", pee.Err)
 	}
 }
