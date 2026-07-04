@@ -41,3 +41,35 @@ func WaitUntil(ctx context.Context, predicate func() bool) error {
 		}
 	}
 }
+
+// waitUntilOrExit behaves like WaitUntil but also returns promptly with a
+// *ProcessExitedError if the session's process exits before predicate becomes
+// true — so WaitReady fails fast on a dead session instead of polling until
+// the context timeout. It watches s.exited (closed by the cmd.Wait observer,
+// which sets s.exitErr first, so reading exitErr after the receive is
+// race-free) alongside the poll ticker and ctx.
+//
+// A directly-constructed Session has a nil exited channel; receiving on nil
+// blocks forever, so the exit arm is inert and the loop degrades to exactly
+// WaitUntil's behavior — the correct "process still running / no exit
+// awareness" path. An already-satisfied predicate short-circuits to nil even
+// if the process has also exited.
+func (s *Session) waitUntilOrExit(ctx context.Context, predicate func() bool) error {
+	if predicate() {
+		return nil
+	}
+	ticker := time.NewTicker(DefaultPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-s.exited:
+			return &ProcessExitedError{Err: s.exitErr}
+		case <-ticker.C:
+			if predicate() {
+				return nil
+			}
+		}
+	}
+}
