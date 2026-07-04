@@ -64,6 +64,12 @@ func TestIsThinkingPositive(t *testing.T) {
 		{"class B — verb + ellipsis", []byte("\xe2\x9c\xbb Channeling…")},
 		{"class C — verb + tokens", []byte("\xe2\x9c\xbb Actualizing… (2s · ↓1 tokens)")},
 		{"CSI-wrapped", []byte("\x1b[38;5;174m\xe2\x9c\xbb\x1b[39m Thinking for 1s")},
+		// claude 2.1.199 renders the live thinking spinner with a new glyph
+		// ✳ (U+2733) instead of ✻ (U+273B), e.g.
+		// `✳ Shenaniganing… (113 tokens · thought for 53s)`. Verified from a
+		// real PTY recording of a wedged agent run (tui-driver #152, 2026-07-04).
+		{"2.1.199 ✳ glyph", []byte("\xe2\x9c\xb3 Shenaniganing… (113 tokens · thought for 53s)")},
+		{"2.1.199 ✳ CSI-wrapped", []byte("\x1b[38;2;153;153;153m\xe2\x9c\xb3\x1b[39m Distilling… (5s)")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
