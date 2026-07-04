@@ -89,8 +89,9 @@ type DeliverResult struct {
 // negative costs one fall-through to the watchdog, never a corrupted turn.
 //
 // Returns an error only on a PTY write failure (write or clear). Context
-// cancellation during the commit poll ends the current attempt early and is
-// not itself an error here; the caller observes ctx via the subsequent wait.
+// cancellation during the commit poll ends the current attempt early and stops
+// before any further re-delivery; it is not itself an error here, and the
+// caller observes ctx via the subsequent wait.
 func (s *Session) DeliverPrompt(ctx context.Context, opts DeliverOpts) (DeliverResult, error) {
 	// Method selection: short single-line prompts trip claude's paste-detection
 	// heuristic when bracketed-pasted, so type them byte-by-byte instead. The
@@ -99,7 +100,7 @@ func (s *Session) DeliverPrompt(ctx context.Context, opts DeliverOpts) (DeliverR
 	if shouldTypePrompt(opts.Prompt) {
 		write = s.TypePrompt
 	}
-	return deliverPrompt(opts, deliverDeps{
+	return deliverPrompt(ctx, opts, deliverDeps{
 		write: write,
 		clear: s.ClearInputLine,
 		didCommit: func(timeout time.Duration) bool {
@@ -120,7 +121,7 @@ type deliverDeps struct {
 	hasChip   func() bool
 }
 
-func deliverPrompt(opts DeliverOpts, deps deliverDeps) (DeliverResult, error) {
+func deliverPrompt(ctx context.Context, opts DeliverOpts, deps deliverDeps) (DeliverResult, error) {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -150,6 +151,14 @@ func deliverPrompt(opts DeliverOpts, deps deliverDeps) (DeliverResult, error) {
 		}
 		if deps.didCommit(commitTimeout) {
 			res.Committed = true
+			return res, nil
+		}
+		if ctx.Err() != nil {
+			// The commit poll ended because ctx was cancelled, not because of a
+			// genuine timeout. Stop here: do not consult hasChip and do not begin
+			// a fresh re-delivery. Committed stays false; the caller re-observes
+			// ctx via the downstream JSONL wait.
+			logger.Debug("tuidriver: context cancelled between delivery attempts; not re-delivering")
 			return res, nil
 		}
 		if !deps.hasChip() {

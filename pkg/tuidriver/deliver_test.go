@@ -75,7 +75,7 @@ func TestDeliverPrompt_CommitSuccess(t *testing.T) {
 		didCommit: func(time.Duration) bool { return true },
 		hasChip:   func() bool { t.Fatal("hasChip should not be consulted after a commit"); return false },
 	}
-	res, err := deliverPrompt(DeliverOpts{Prompt: "p", Logger: logger}, deps)
+	res, err := deliverPrompt(context.Background(), DeliverOpts{Prompt: "p", Logger: logger}, deps)
 	if err != nil {
 		t.Fatalf("deliverPrompt: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestDeliverPrompt_CommitSlowNoChip(t *testing.T) {
 		didCommit: func(time.Duration) bool { return false },
 		hasChip:   func() bool { return false },
 	}
-	res, err := deliverPrompt(DeliverOpts{Prompt: "p", Logger: logger}, deps)
+	res, err := deliverPrompt(context.Background(), DeliverOpts{Prompt: "p", Logger: logger}, deps)
 	if err != nil {
 		t.Fatalf("deliverPrompt: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestDeliverPrompt_ChipPresentReDeliver(t *testing.T) {
 		didCommit: func(time.Duration) bool { return false },
 		hasChip:   func() bool { return true },
 	}
-	res, err := deliverPrompt(DeliverOpts{Prompt: "p", MaxAttempts: 3, Logger: logger}, deps)
+	res, err := deliverPrompt(context.Background(), DeliverOpts{Prompt: "p", MaxAttempts: 3, Logger: logger}, deps)
 	if err != nil {
 		t.Fatalf("deliverPrompt: %v", err)
 	}
@@ -157,6 +157,42 @@ func TestDeliverPrompt_ChipPresentReDeliver(t *testing.T) {
 	}
 }
 
+// TestDeliverPrompt_CtxCancelledMidLoop: ctx is cancelled during the commit
+// poll (didCommit returns false, mirroring promptDidCommit on cancel). Even with
+// the pasted-text chip still present — the TestDeliverPrompt_ChipPresentReDeliver
+// path that would otherwise re-deliver — the loop must stop after the in-flight
+// attempt: no further clear/write, at most the one write already issued (#160).
+func TestDeliverPrompt_CtxCancelledMidLoop(t *testing.T) {
+	var writes, clears int
+	logger, logs := captureLogger()
+	ctx, cancel := context.WithCancel(context.Background())
+	deps := deliverDeps{
+		write:     func(string) error { writes++; return nil },
+		clear:     func() error { clears++; return nil },
+		didCommit: func(time.Duration) bool { cancel(); return false },
+		hasChip:   func() bool { return true },
+	}
+	res, err := deliverPrompt(ctx, DeliverOpts{Prompt: "p", MaxAttempts: 3, Logger: logger}, deps)
+	if err != nil {
+		t.Fatalf("deliverPrompt: %v", err)
+	}
+	if res.Committed {
+		t.Error("Committed = true, want false (cancelled, not committed)")
+	}
+	if res.Attempts != 1 {
+		t.Errorf("Attempts = %d, want 1 (no re-delivery after cancel)", res.Attempts)
+	}
+	if writes != 1 || clears != 0 {
+		t.Errorf("writes=%d clears=%d, want 1/0 (no re-delivery after cancel)", writes, clears)
+	}
+	if strings.Contains(logs.String(), "pasted-text chip present); re-delivering") {
+		t.Errorf("unexpected re-deliver marker after cancel: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "context cancelled between delivery attempts") {
+		t.Errorf("missing cancel marker: %s", logs.String())
+	}
+}
+
 // TestDeliverPrompt_ChipThenCommit: chip present on attempt 1, then the
 // re-delivery commits on attempt 2.
 func TestDeliverPrompt_ChipThenCommit(t *testing.T) {
@@ -171,7 +207,7 @@ func TestDeliverPrompt_ChipThenCommit(t *testing.T) {
 		hasChip: func() bool { return true },
 	}
 	logger, _ := captureLogger()
-	res, err := deliverPrompt(DeliverOpts{Prompt: "p", Logger: logger}, deps)
+	res, err := deliverPrompt(context.Background(), DeliverOpts{Prompt: "p", Logger: logger}, deps)
 	if err != nil {
 		t.Fatalf("deliverPrompt: %v", err)
 	}
@@ -194,7 +230,7 @@ func TestDeliverPrompt_WriteError(t *testing.T) {
 		hasChip:   func() bool { return false },
 	}
 	logger, _ := captureLogger()
-	_, err := deliverPrompt(DeliverOpts{Prompt: "p", Logger: logger}, deps)
+	_, err := deliverPrompt(context.Background(), DeliverOpts{Prompt: "p", Logger: logger}, deps)
 	if err == nil || !strings.Contains(err.Error(), "write prompt") {
 		t.Errorf("err = %v, want it to wrap a write-prompt failure", err)
 	}
@@ -208,7 +244,7 @@ func TestDeliverPrompt_ClearError(t *testing.T) {
 		hasChip:   func() bool { return true }, // forces a retry → clear is called
 	}
 	logger, _ := captureLogger()
-	_, err := deliverPrompt(DeliverOpts{Prompt: "p", MaxAttempts: 3, Logger: logger}, deps)
+	_, err := deliverPrompt(context.Background(), DeliverOpts{Prompt: "p", MaxAttempts: 3, Logger: logger}, deps)
 	if err == nil || !strings.Contains(err.Error(), "clear input line") {
 		t.Errorf("err = %v, want it to wrap a clear-input-line failure", err)
 	}
