@@ -70,6 +70,13 @@ func TestIsThinkingPositive(t *testing.T) {
 		// real PTY recording of a wedged agent run (tui-driver #152, 2026-07-04).
 		{"2.1.199 ✳ glyph", []byte("\xe2\x9c\xb3 Shenaniganing… (113 tokens · thought for 53s)")},
 		{"2.1.199 ✳ CSI-wrapped", []byte("\x1b[38;2;153;153;153m\xe2\x9c\xb3\x1b[39m Distilling… (5s)")},
+		// claude's spinner is an ANIMATION cycling through five sparkle glyphs,
+		// not one: ✻ ✳ ✢ ✶ ✽. A corpus scan of 843 PTY recordings (2026-07-04)
+		// found ✢ (U+2722) the second-most-common frame, with ✶ (U+2736) and ✽
+		// (U+273D) also unrecognised. Each frame alone must read as thinking.
+		{"spinner frame ✢", []byte("\xe2\x9c\xa2 Vibing… (3s)")},
+		{"spinner frame ✶", []byte("\xe2\x9c\xb6 Waddling… (12s · ↓ 40 tokens)")},
+		{"spinner frame ✽", []byte("\xe2\x9c\xbd Sautéing… (1m 4s)")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
