@@ -28,6 +28,15 @@ type Readiness struct {
 	// NetworkFailure is true when a network-unreachable anchor
 	// (FailedToOpenSocket) is present at idle: the claude API is unreachable.
 	NetworkFailure bool
+
+	// UnknownModal is true when a recognized modal class is up at idle that no
+	// other Readiness field already surfaces — any DetectModalClass result
+	// except ModalClassUnknown (the common no-modal idle screen) and the trust
+	// modal (surfaced by TrustModal). It catches a startup dialog the consumer
+	// would otherwise type its first prompt into. Detecting a genuinely novel,
+	// unclassified dialog is out of scope: this axis rides on the existing
+	// class set.
+	UnknownModal bool
 }
 
 // WaitReady waits for claude's TUI to reach idle, then classifies the post-idle
@@ -50,5 +59,19 @@ func (s *Session) WaitReady(ctx context.Context) (Readiness, error) {
 		McpFailure:     HasMcpFailureBanner(snap),
 		FailedMcpCount: FailedMcpCount(snap),
 		NetworkFailure: HasNetworkFailure(snap),
+		UnknownModal:   isUnknownModal(snap),
 	}, nil
+}
+
+// isUnknownModal reports whether snap shows a recognized modal class that no
+// other Readiness field already surfaces. ModalClassUnknown is the common
+// no-modal idle screen, and the trust modal is surfaced by Readiness.TrustModal;
+// both are excluded so the normal ready path and a trust-only screen stay false.
+func isUnknownModal(snap []byte) bool {
+	switch DetectModalClass(snap) {
+	case ModalClassUnknown, ModalClassTrustFolder:
+		return false
+	default:
+		return true
+	}
 }
