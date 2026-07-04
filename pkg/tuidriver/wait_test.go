@@ -74,3 +74,15 @@ func TestWaitUntilNoAllocOnImmediateTrue(t *testing.T) {
 		t.Errorf("immediate-true WaitUntil took %v, want <5ms (no ticker)", d)
 	}
 }
+
+// TestWaitUntilOrExitPredicateTrueBeatsExit pins the entry short-circuit: an
+// already-satisfied predicate returns nil even when the process has also
+// exited (exited closed) — ready wins over a same-instant exit.
+func TestWaitUntilOrExitPredicateTrueBeatsExit(t *testing.T) {
+	exited := make(chan struct{})
+	close(exited)
+	s := &Session{exited: exited, exitErr: errors.New("exit status 1")}
+	if err := s.waitUntilOrExit(context.Background(), func() bool { return true }); err != nil {
+		t.Errorf("waitUntilOrExit(predicate true) = %v, want nil", err)
+	}
+}
