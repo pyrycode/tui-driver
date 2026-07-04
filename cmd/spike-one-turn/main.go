@@ -34,8 +34,22 @@ import (
 )
 
 const (
-	statePollInterval  = 50 * time.Millisecond
-	sessionFileWait    = 10 * time.Second
+	statePollInterval = 50 * time.Millisecond
+
+	// sessionFileWait bounds the poll for claude's session JSONL to appear
+	// after the prompt is sent. Interactive `claude --session-id` defers JSONL
+	// creation until it processes that first input (README finding #9), and
+	// that first-input work — session init + file open — is local-process-
+	// bound, so it slows under concurrent-suite load. A 10s bound raced the
+	// legitimate completion and reddened `make e2e` under load (#185); 30s
+	// tolerates the tail. Value adopted from the sister spike
+	// cmd/probe-first-prompt-hang/main.go:41, which already reasoned to it for
+	// the same deferred-JSONL-creation reason — cited, not re-derived. 30s
+	// stays well inside the e2e-runner's 60s per-check budget
+	// (cmd/e2e-runner/main.go:32), so a genuinely hung claude still surfaces
+	// via the 60s ptyQuietLimit watchdog and the runner timeout, not here.
+	sessionFileWait = 30 * time.Second
+
 	ptyQuietLimit      = 60 * time.Second
 	spinnerFreezeLimit = 30 * time.Second
 	shutdownGrace      = 3 * time.Second

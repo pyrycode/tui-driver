@@ -138,6 +138,7 @@ state-machine waiter exits via the watchdog inactivity deadline.
 |  4  | n/a          | 0.470 ms      | n/a (pre-#7 ordering)  | n/a                      | 60.7 s | FAIL — `watchdog: stuck in state prompt-written for 1m1s` (post-#3 + #4; opened STALE JSONL — see finding #9) |
 |  5  | 303 ms       | 0.079 ms      | 202 ms                 | 2.737 s                  | 3.24 s | **SUCCESS** — `SUCCESS: 4` (post-#7; deterministic --session-id; spinner "Brewing…" rendered briefly but ellipsis-form so #8 still applies) |
 |  6  | 453 ms       | 0.068 ms      | 304 ms                 | 1.565 s                  | 2.32 s | **SUCCESS** — `SUCCESS: 4` (post-#7; operator-supplied `-session-id 9b375373-…`; AC #4 dual-path verification) |
+|  7  | n/a          | n/a           | > 10 s (exceeded bound) | n/a                     | 11.1 s | FAIL then **SUCCESS** — under `make e2e` concurrent-suite load the `prompt → jsonl-opened` wait exceeded the old 10s `sessionFileWait` and the run died with `open session jsonl: … context deadline exceeded` (PR #184 `make e2e`, 11090ms); standalone re-runs were 3/3 pass. Bumping `sessionFileWait` to 30s (matching probe-first-prompt-hang) makes the same wait load-tolerant — see finding #10 (#185) |
 
 Runs 1-4 all failed in distinct shapes — each surfaced a real bug. Runs 5 and 6 are the first end-to-end successes — Run 5 with a generated UUID, Run 6 with an operator-supplied UUID via `-session-id`. The architecture's failure-handling worked correctly in every failing run; nothing wedged silently.
 
@@ -289,6 +290,22 @@ This contrasts with finding #1 (where plain `claude` writes startup envelopes �
 The 202 ms gap between `prompt-written` and `session-jsonl-opened` is the deferral: claude with `--session-id` did not write the JSONL during its startup; the file appeared only after the prompt landed. If the deferral hypothesis were wrong, `os.Stat` would have succeeded immediately after the directory was scanned at startup time, and the gap would have been ≈0. The 202 ms is small but consistent across the spike run (the polling interval is 100 ms — so the true gap is in the [102, 202] ms range, but the sign and the ordering are unambiguous).
 
 The architect's original spec assumed the opposite ordering (poll after idle, before prompt). That ordering would have wedged in `openSessionJSONL` for 10 s and timed out — claude would not start processing input until the spike wrote the prompt, so the JSONL never would have appeared.
+
+### 10. The deferred-JSONL-creation window is load-sensitive — the 10 s wait raced it under concurrent-suite load (#185)
+
+Finding #9 established that interactive `claude --session-id` defers JSONL creation until it processes the first input. That first-input work — session init + file open — is **local-process-bound**, so it slows under CPU/IO contention. Standalone the file opens in ~200 ms (Runs 5/6: 202 ms, 304 ms), but under `make e2e` concurrent-suite load (`PYRY_MAX_CONCURRENT=2` dispatch, and/or QA's baseline + PR `make e2e` overlapping — each a live `claude` competing for cores) that work exceeded the old `sessionFileWait = 10 s` bound. The deadline won the race, `WaitForSessionJSONL` returned `context deadline exceeded`, and the run reddened with `open session jsonl: session jsonl … did not appear: context deadline exceeded` at ~11 s (PR #184's `make e2e`, 11090 ms — Run 7 above). The 3/3-standalone-pass-after-a-single-make-e2e-fail signature is textbook load-sensitive timing, not an assertion failure — the operation *succeeds* given enough wall-clock.
+
+**Fix:** bump `sessionFileWait` to 30 s, matching `cmd/probe-first-prompt-hang/main.go:41`, which already reasoned to 30 s for the same deferred-JSONL-creation reason. 30 s is 3× the observed ~10 s failure threshold and stays well inside the e2e-runner's 60 s per-check budget, so a genuinely hung claude still surfaces via the 60 s `ptyQuietLimit` watchdog / runner timeout — only the legitimate-but-slow case is newly tolerated. `WaitForSessionJSONL` itself (`pkg/tuidriver/jsonl.go`) was not touched; the library is correct, the caller's deadline was too tight.
+
+**Repro recipe.**
+
+1. *Mechanism isolation (deterministic).* Set `sessionFileWait` to a value below the ~200 ms standalone JSONL-open latency (Runs 5/6) — e.g. `1 * time.Millisecond` — rebuild, run once → the deadline fires before the file can appear and it fails immediately after `prompt-written` with `open session jsonl: session jsonl … did not appear: context deadline exceeded`, matching the PR #184 error string and shape. Verified on claude 2.1.199. (A 1 s value is *not* reliably reproducing, since standalone the file opens in ~200 ms.) Revert.
+2. *Load realism (best-effort).* With the deadline at the old 10 s, launch N concurrent copies (fresh UUIDs → distinct JSONL paths, no collision; `-trust-folder=accept` clears the modal) plus CPU pressure until at least one copy hits the 10 s deadline and prints the same error:
+
+   ```sh
+   for i in $(seq 8); do ./bin/spike-one-turn -trust-folder=accept & done; wait
+   # stack `yes >/dev/null &` per core, or raise N, on a fast machine
+   ```
 
 ## Follow-up tickets the spike's findings justified
 
