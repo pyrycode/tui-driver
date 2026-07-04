@@ -36,6 +36,23 @@ var SpinnerGlyph = []byte("\xe2\x9c\xbb")
 // untouched — purely additive.
 var SpinnerGlyphAlt = []byte("\xe2\x9c\xb3")
 
+// spinnerGlyphs is the full animation cycle of claude's thinking spinner:
+// ✻ ✳ ✢ ✶ ✽. The spinner is an animation, not a single glyph — it rotates
+// through these five sparkle frames — so any one of them present in the status
+// region means claude is busy. A corpus scan of 843 PTY recordings (2026-07-04)
+// found the runner had been keying on ✻ (SpinnerGlyph) and ✳ (SpinnerGlyphAlt)
+// only, catching ~2 of the 5 frames; ✢ (U+2722) was in fact the second-most-
+// common frame, with ✶ (U+2736) and ✽ (U+273D) also unrecognised. SpinnerGlyph
+// and SpinnerGlyphAlt stay as named exports; this superset is what busyInRegion
+// iterates. Additive: no existing glyph or its calibration changes.
+var spinnerGlyphs = [][]byte{
+	SpinnerGlyph,           // ✻ U+273B
+	SpinnerGlyphAlt,        // ✳ U+2733
+	[]byte("\xe2\x9c\xa2"), // ✢ U+2722
+	[]byte("\xe2\x9c\xb6"), // ✶ U+2736
+	[]byte("\xe2\x9c\xbd"), // ✽ U+273D
+}
+
 // InterruptHint is claude's on-screen "esc to interrupt" hint — the second,
 // independent busy anchor folded into busyInRegion alongside SpinnerGlyph.
 // It is the more reliable in-flight anchor now that the ✻ spinner's text
@@ -66,19 +83,22 @@ const statusRegionRows = 6
 
 // busyInRegion reports whether a busy anchor is present in the status
 // region — THE single busy predicate for the idle/busy axis. Region-scoping
-// lives in exactly one place so IsIdle and IsThinking stay coherent. Three
-// independent anchors are OR'd here: the spinner glyphs ✻ (SpinnerGlyph) and
-// ✳ (SpinnerGlyphAlt, added by claude 2.1.199), and claude's "esc to interrupt"
-// hint (InterruptHint). They fail independently — claude would have to change
-// every glyph and the hint wording in one release to defeat the check. All key
-// on the grid's space-preserved rendered form; this must never reintroduce a
-// StripANSI whole-buffer substring path — that would both re-corrupt the
+// lives in exactly one place so IsIdle and IsThinking stay coherent. Two kinds
+// of independent anchor are OR'd here: any glyph in claude's spinner animation
+// cycle (spinnerGlyphs: ✻ ✳ ✢ ✶ ✽) and claude's "esc to interrupt" hint
+// (InterruptHint). They fail independently — claude would have to change every
+// spinner frame and the hint wording in one release to defeat the check. All
+// key on the grid's space-preserved rendered form; this must never reintroduce
+// a StripANSI whole-buffer substring path — that would both re-corrupt the
 // multi-word hint's inter-word spaces and re-open the mid-transcript forgery
 // #153 closed.
 func busyInRegion(g *Grid) bool {
-	return g.ContainsInLastRows(string(SpinnerGlyph), statusRegionRows) ||
-		g.ContainsInLastRows(string(SpinnerGlyphAlt), statusRegionRows) ||
-		g.ContainsInLastRows(InterruptHint, statusRegionRows)
+	for _, glyph := range spinnerGlyphs {
+		if g.ContainsInLastRows(string(glyph), statusRegionRows) {
+			return true
+		}
+	}
+	return g.ContainsInLastRows(InterruptHint, statusRegionRows)
 }
 
 // IsIdle reports whether snap shows claude at the input prompt with no
