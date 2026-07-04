@@ -162,6 +162,85 @@ func TestIsThinkingRealisticLayoutPinsRegion(t *testing.T) {
 	}
 }
 
+func TestIsThinkingInterruptHintDrivesBusy(t *testing.T) {
+	// AC #3 — the "esc to interrupt" hint alone, with NO spinner glyph anywhere,
+	// classifies busy through the same region-scoped grid path as the spinner.
+	// This is the second, independent busy anchor: a change to claude's spinner
+	// glyph set can no longer silently flip the busy check to idle mid-turn.
+	snap := gridRows(
+		"transcript line",
+		"assistant working on the turn",
+		"esc to interrupt", // the interrupt hint in the status region, no ✻
+		"╭────────────────╮", // input box top border
+		"❯", // input line redrawn beneath the running turn (-3)
+		"╰────────────────╯", // input box bottom border
+		"  ? for shortcuts", // hint bar (-1)
+	)
+	if !IsThinking(snap) {
+		t.Errorf("IsThinking(interrupt-hint layout) = false, want true")
+	}
+	// ❯ is present (redrawn beneath the running turn) yet the hint alone must
+	// still flip busy — this is the load-bearing assertion: the hint, not the
+	// spinner, is doing the work.
+	if IsIdle(snap) {
+		t.Errorf("IsIdle(interrupt-hint layout) = true, want false")
+	}
+	if strings.Contains(string(snap), string(SpinnerGlyph)) {
+		t.Fatalf("fixture unexpectedly contains ✻ — the second-anchor test is void")
+	}
+}
+
+func TestIsIdleInterruptHintInTranscriptNotThinking(t *testing.T) {
+	// AC #4 — the literal string "esc to interrupt" printed as transcript
+	// content (a hostile prompt or tool result can print it) high above the
+	// overlay must NOT forge "thinking" while a real idle input line sits at
+	// the bottom. Mirrors TestIsIdleSpinnerGlyphInTranscriptNotThinking: the
+	// new anchor is region-scoped, so only a whole-buffer substring path would
+	// forge busy here.
+	snap := gridRows(
+		"a tool result printed the literal words esc to interrupt", // forged hint, high in history
+		"(the line above is transcript body, not the live status)",
+		"transcript line",
+		"transcript line",
+		"transcript line",
+		"transcript line",
+		"transcript line",
+		"transcript line",
+		"❯ ready for the next prompt", // the real idle input line, at the bottom
+		"  ? for shortcuts",
+	)
+	if !IsIdle(snap) {
+		t.Errorf("IsIdle(hint-in-transcript) = false, want true")
+	}
+	if IsThinking(snap) {
+		t.Errorf("IsThinking(hint-in-transcript) = true, want false")
+	}
+	// Contrast: a raw substring match over the same bytes forges thinking; only
+	// region-scoping gets it right.
+	if !strings.Contains(string(snap), InterruptHint) {
+		t.Fatalf("fixture no longer contains %q — the forgery contrast is void", InterruptHint)
+	}
+}
+
+func TestIsThinkingPickerCapturesNotBusy(t *testing.T) {
+	// The full-phrase anchor must not false-positive on benign in-region
+	// content. Both committed slash-picker captures render "…without
+	// interrupting the main conversation" (the /btw description) inside the
+	// 6-row status region — a shortened anchor ("interrupt", "to interrupt")
+	// would flip them to busy. The full phrase "esc to interrupt" does not
+	// occur there, so they stay not-busy. Pins the full-phrase decision against
+	// a future shortening of InterruptHint.
+	for _, name := range []string{"picker-snapshot.bin", "picker-truecolor-snapshot.bin"} {
+		snap, err := os.ReadFile(filepath.Join("testdata", name))
+		if err != nil {
+			t.Fatalf("read fixture %s: %v", name, err)
+		}
+		if IsThinking(snap) {
+			t.Errorf("IsThinking(%s) = true, want false", name)
+		}
+	}
+}
+
 func TestIsIdleRealCaptureUnchanged(t *testing.T) {
 	// AC #4 — a committed real capture that carries a genuine on-screen input
 	// line (❯ at row -3) classifies idle, unchanged from the whole-buffer era.

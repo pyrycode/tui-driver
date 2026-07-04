@@ -25,6 +25,23 @@ var IdleGlyph = []byte("\xe2\x9d\xaf")
 // extractor is incomplete (class C is documented as not matching).
 var SpinnerGlyph = []byte("\xe2\x9c\xbb")
 
+// InterruptHint is claude's on-screen "esc to interrupt" hint — the second,
+// independent busy anchor folded into busyInRegion alongside SpinnerGlyph.
+// It is the more reliable in-flight anchor now that the ✻ spinner's text
+// format has drifted dead (CLAUDE.md § Spinner caveat), so consumers writing
+// their own PTY-quiescence checks should prefer it.
+//
+// A const string, not a []byte var like the glyphs: it has no external
+// []byte consumer, and ContainsInLastRows takes a string. Match it over the
+// Grid's space-preserved rendered form — the multi-word phrase is exactly
+// what a StripANSI whole-buffer scan would corrupt (claude renders the
+// inter-word gaps as CSI cursor-forwards that strip to nothing; the grid
+// repaints them to real spaces). Match the full contiguous phrase, never a
+// shorter substring: benign in-region content ("…without interrupting the
+// main conversation" in the slash-picker) contains "interrupt" and would
+// forge busy on an idle picker.
+const InterruptHint = "esc to interrupt"
+
 // statusRegionRows bounds the idle/busy status region to the bottom N
 // rendered rows of the grid. Sized to include the input line (❯, ~row -3
 // from bottom) and the spinner line redrawn just above it (✻, ~row -5),
@@ -38,11 +55,17 @@ const statusRegionRows = 6
 
 // busyInRegion reports whether a busy anchor is present in the status
 // region — THE single busy predicate for the idle/busy axis. Region-scoping
-// lives in exactly one place so IsIdle and IsThinking stay coherent. #156
-// folds its "esc to interrupt" hint in here as an OR against the grid's
-// space-preserved form; it must not reintroduce a whole-buffer path.
+// lives in exactly one place so IsIdle and IsThinking stay coherent. Two
+// independent anchors are OR'd here: the spinner glyph ✻ (SpinnerGlyph) and
+// claude's "esc to interrupt" hint (InterruptHint). They fail independently —
+// claude would have to change both the glyph and the hint wording in one
+// release to defeat the check. Both key on the grid's space-preserved
+// rendered form; this must never reintroduce a StripANSI whole-buffer
+// substring path — that would both re-corrupt the multi-word hint's
+// inter-word spaces and re-open the mid-transcript forgery #153 closed.
 func busyInRegion(g *Grid) bool {
-	return g.ContainsInLastRows(string(SpinnerGlyph), statusRegionRows)
+	return g.ContainsInLastRows(string(SpinnerGlyph), statusRegionRows) ||
+		g.ContainsInLastRows(InterruptHint, statusRegionRows)
 }
 
 // IsIdle reports whether snap shows claude at the input prompt with no
