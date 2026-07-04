@@ -57,21 +57,28 @@ const (
 //	                      the modal under --strict-mcp-config — see #128)
 //	agents              → "Agents" header + "Running" or "Library" tab
 //	                      (pre-2.1.199 only — see ModalClassAgents)
-//	slash-picker        → ≥1 line whose stripped content starts with `/<letter>`
+//	slash-picker        → an on-screen rendered row that starts with `/<letter>`
+//	                      AND picker highlight chrome (a foreground in
+//	                      pickerHighlightedRGBs) — see isSlashPicker
 //	ask-user-question   → "Entertoselect" or "Enter to select"
 //	trust-folder        → "Quicksafetycheck"
 //	permission          → "Doyouwanttoproceed" or "Do you want to proceed"
 //	model-select        → "Selectmodel" or "Select model" (the `/model` modal)
 //	permissions-config  → "Permissions" header + one of Allow/Ask/Deny tabs
 //
-// slash-picker keys on the structural row anchor (a line that begins
-// `/<letter>` after stripping CSI) rather than on color SGRs. The "? for
-// shortcuts" hint-bar text appears at idle too — it's part of the
-// welcome banner's input-line hint — and historically false-positived
-// any naive picker predicate. The structural anchor avoids that trap:
-// the hint-bar line doesn't begin with `/`. See findPickerRows in
-// picker.go for the row-finding seam; classification is shared with the
-// parser so any future row-shape change updates both call sites at once.
+// slash-picker classification (isSlashPicker in picker.go) combines two
+// signals of different fabric: an on-screen rendered row that begins
+// `/<letter>` (located from #150's Grid, so scrolled-off history is
+// excluded) AND picker highlight chrome (a foreground color in
+// pickerHighlightedRGBs). Both are required. Row location alone
+// false-positived on benign content — the "? for shortcuts" hint bar at
+// idle (guarded by the `/`-prefix, which the hint line lacks) and, more
+// insidiously, a lone absolute path like `/Users/x/file.go` on screen.
+// Requiring chrome rejects the path; requiring an on-screen row rejects
+// off-screen matches. This is a separate path from ParsePicker, which
+// still uses findPickerRows on the raw color-preserving bytes; the two
+// diverge deliberately (ParsePicker runs only after classification
+// confirms a picker), so a grid/color split here does not touch parsing.
 var (
 	anchorMCP                 = []byte("ManageMCPservers")
 	anchorMCPSpaced           = []byte("Manage MCP servers")
@@ -94,22 +101,22 @@ var (
 )
 
 // DetectModalClass classifies the modal/picker currently rendered in snap.
-// Cheap predicate: StripANSI + StripOSC + substring matches (plus the
-// structural slash-picker scan in findPickerRows). Use Render
-// (vt10x-backed) when you need to extract content from the modal, not just
-// classify it.
+// Cheap predicate: StripANSI + StripOSC + substring matches for the specific
+// anchors, then a grid-plus-chrome slash-picker check (isSlashPicker) as the
+// last resort. Use Render (vt10x-backed) when you need to extract content from
+// the modal, not just classify it.
 //
-// Order of checks is significant: more-specific anchors first. The
-// ask-user-question modal's "Enter to select" hint-bar phrase could
-// otherwise be confused with future modals reusing the same hint, so
-// classify it after mcp/agents/slash-picker which have stronger anchors.
+// Order of checks is significant: the specific anchors run first and the
+// slash-picker check runs LAST (#151). The picker's signal is the most
+// permissive (any on-screen `/`-row plus a highlight color), so a real modal
+// that merely has a `/`-path on screen — e.g. a permission prompt showing a
+// file path — must match its own anchor before the picker is even considered.
+// Checking the picker first misclassified such modals and suppressed their
+// auto-answer.
 //
 // Returns ModalClassUnknown when no anchor matches (the common case at
 // idle — no modal currently rendered).
 func DetectModalClass(snap []byte) ModalClass {
-	if len(findPickerRows(snap)) > 0 {
-		return ModalClassSlashPicker
-	}
 	stripped := StripOSC(StripANSI(snap))
 	switch {
 	case bytes.Contains(stripped, anchorMCP) ||
@@ -137,7 +144,13 @@ func DetectModalClass(snap []byte) ModalClass {
 			bytes.Contains(stripped, anchorPermissionsTabAsk) ||
 			bytes.Contains(stripped, anchorPermissionsTabDeny)):
 		return ModalClassPermissionsConfig
-	default:
-		return ModalClassUnknown
 	}
+	// Slash-picker is the last resort: reached only when no specific anchor
+	// matched. It requires an on-screen `/`-row AND picker highlight chrome
+	// (see isSlashPicker), so a real modal carrying a `/`-path wins above and a
+	// lone path at idle never phantom-pickers.
+	if isSlashPicker(snap) {
+		return ModalClassSlashPicker
+	}
+	return ModalClassUnknown
 }

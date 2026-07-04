@@ -156,6 +156,69 @@ func isASCIILetter(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
+// snapHasPickerHighlight reports whether snap paints any foreground in one of
+// claude's picker-highlight shades (pickerHighlightedRGBs). This is the "chrome"
+// signal for slash-picker classification (#151): a real picker always paints its
+// selected row in a highlight color, whereas a benign absolute path or a lone
+// command-shaped line at idle carries no such highlight.
+//
+// It mirrors pickerRowOpenColor's foreground-SGR walk but does NOT stop at the
+// first `/`: it scans the whole snapshot for any highlighted foreground.
+// parseForegroundSGR resolves both indexed (38;5;153) and truecolor
+// (38;2;177;185;249) encodings to a comparable rgb, so this is encoding-agnostic
+// by construction — the two real fixtures carry the highlight in different
+// encodings and both match. One linear, allocation-free pass.
+func snapHasPickerHighlight(snap []byte) bool {
+	i := 0
+	for i < len(snap) {
+		if snap[i] == 0x1b && i+1 < len(snap) && snap[i+1] == '[' {
+			c, consumed, isFg, _ := parseForegroundSGR(snap[i:])
+			if consumed > 0 {
+				if isFg && rgbIsHighlighted(c) {
+					return true
+				}
+				i += consumed
+				continue
+			}
+		}
+		i++
+	}
+	return false
+}
+
+// gridHasPickerRow reports whether any on-screen rendered row begins with a
+// picker row start (`/<letter>` after optional leading whitespace, via
+// pickerRowStartRe). Location only: it reads from #150's Grid, so rows that
+// have scrolled off into raw history don't count. Grid rows are StripANSI'd and
+// carry no color, so highlight chrome is checked separately (see isSlashPicker).
+func gridHasPickerRow(g *Grid) bool {
+	for _, row := range g.Rows() {
+		if pickerRowStartRe.MatchString(row) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSlashPicker reports whether snap renders claude's `/` slash-command picker.
+// It is the last-resort classifier in DetectModalClass (#151), reached only
+// when no specific modal anchor matched. Two independent signals of different
+// fabric, ANDed:
+//
+//  1. Grid-region location — at least one on-screen grid row begins `/<letter>`
+//     (off-screen `/`-lines in raw history are excluded by the rendered grid).
+//  2. Chrome — the snapshot carries a picker highlight color.
+//
+// Requiring both stops a benign on-screen absolute path (/Users/x/file.go) from
+// phantom-pickering, while a genuine single-match filtered picker (one `/`-row
+// painted in the highlight shade) still classifies.
+func isSlashPicker(snap []byte) bool {
+	if !gridHasPickerRow(NewGrid(snap, 0, 0)) {
+		return false
+	}
+	return snapHasPickerHighlight(snap)
+}
+
 // ParsePicker extracts structured items from a raw PTY snapshot of
 // claude's `/` slash-command picker. Returns items in render order
 // (top-to-bottom). Handles both unfiltered and filtered modes (see the
