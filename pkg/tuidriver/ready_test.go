@@ -35,6 +35,13 @@ func TestWaitReady(t *testing.T) {
 			snap: append([]byte("FailedToOpenSocket "), idle...),
 			want: Readiness{Idle: true, NetworkFailure: true},
 		},
+		{
+			// A recognized modal that no other Readiness field surfaces (here a
+			// permission prompt) sets UnknownModal.
+			name: "unrecognized modal at idle",
+			snap: append([]byte("Doyouwanttoproceed"), idle...),
+			want: Readiness{Idle: true, UnknownModal: true},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
