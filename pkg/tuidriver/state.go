@@ -25,6 +25,17 @@ var IdleGlyph = []byte("\xe2\x9d\xaf")
 // extractor is incomplete (class C is documented as not matching).
 var SpinnerGlyph = []byte("\xe2\x9c\xbb")
 
+// SpinnerGlyphAlt is the UTF-8 encoding of ✳ (U+2733) — a second thinking-
+// spinner glyph claude 2.1.199 renders alongside the original ✻ (SpinnerGlyph,
+// U+273B). Both appear live in the same 2.1.199 session: a wedged agent run's
+// PTY recording (tui-driver #152, 2026-07-04) shows ✻ and ✳ in roughly equal
+// counts, the live thinking line using ✳ (`✳ <verb>… (<tokens> · thought for
+// <Ns>)`). claude did not replace ✻, it added ✳, so the busy/idle predicate
+// must recognise both. Kept as a separate glyph rather than folded into the ✻
+// constant so the original predicate and its cross-spike calibration stay
+// untouched — purely additive.
+var SpinnerGlyphAlt = []byte("\xe2\x9c\xb3")
+
 // InterruptHint is claude's on-screen "esc to interrupt" hint — the second,
 // independent busy anchor folded into busyInRegion alongside SpinnerGlyph.
 // It is the more reliable in-flight anchor now that the ✻ spinner's text
@@ -55,16 +66,18 @@ const statusRegionRows = 6
 
 // busyInRegion reports whether a busy anchor is present in the status
 // region — THE single busy predicate for the idle/busy axis. Region-scoping
-// lives in exactly one place so IsIdle and IsThinking stay coherent. Two
-// independent anchors are OR'd here: the spinner glyph ✻ (SpinnerGlyph) and
-// claude's "esc to interrupt" hint (InterruptHint). They fail independently —
-// claude would have to change both the glyph and the hint wording in one
-// release to defeat the check. Both key on the grid's space-preserved
-// rendered form; this must never reintroduce a StripANSI whole-buffer
-// substring path — that would both re-corrupt the multi-word hint's
-// inter-word spaces and re-open the mid-transcript forgery #153 closed.
+// lives in exactly one place so IsIdle and IsThinking stay coherent. Three
+// independent anchors are OR'd here: the spinner glyphs ✻ (SpinnerGlyph) and
+// ✳ (SpinnerGlyphAlt, added by claude 2.1.199), and claude's "esc to interrupt"
+// hint (InterruptHint). They fail independently — claude would have to change
+// every glyph and the hint wording in one release to defeat the check. All key
+// on the grid's space-preserved rendered form; this must never reintroduce a
+// StripANSI whole-buffer substring path — that would both re-corrupt the
+// multi-word hint's inter-word spaces and re-open the mid-transcript forgery
+// #153 closed.
 func busyInRegion(g *Grid) bool {
 	return g.ContainsInLastRows(string(SpinnerGlyph), statusRegionRows) ||
+		g.ContainsInLastRows(string(SpinnerGlyphAlt), statusRegionRows) ||
 		g.ContainsInLastRows(InterruptHint, statusRegionRows)
 }
 
