@@ -1,6 +1,18 @@
 package tuidriver
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// gridRows joins rows with "\r\n" so vt10x renders them as fresh rows. A bare
+// "\n" is line-feed-only through the emulator and renders a staircase, not
+// separate rows (codebase/150.md fixture invariant).
+func gridRows(rows ...string) []byte {
+	return []byte(strings.Join(rows, "\r\n"))
+}
 
 func TestIsIdleBareInputPrompt(t *testing.T) {
 	// ❯ alone → idle.
@@ -68,6 +80,97 @@ func TestIsThinkingNegative(t *testing.T) {
 	}
 	if IsThinking([]byte("idle prompt no spinner")) {
 		t.Errorf("IsThinking(no spinner) = true, want false")
+	}
+}
+
+func TestIsIdleSpinnerGlyphInTranscriptNotThinking(t *testing.T) {
+	// AC #3a — a literal ✻ printed as transcript content (rendered markdown /
+	// tool output) high above the overlay must NOT forge "thinking" while a
+	// real idle input line sits at the bottom. Region-scoping ignores the
+	// stale glyph; whole-buffer substring matching would report thinking.
+	snap := gridRows(
+		"✻ Baked for 2s",                        // literal spinner glyph in transcript output
+		"(the line above is rendered markdown,", // ... well above the status overlay
+		"not the live status spinner)",
+		"transcript line",
+		"transcript line",
+		"transcript line",
+		"transcript line",
+		"transcript line",
+		"❯ ready for the next prompt", // the real idle input line, at the bottom
+		"  ? for shortcuts",
+	)
+	if !IsIdle(snap) {
+		t.Errorf("IsIdle(spinner-in-transcript) = false, want true")
+	}
+	if IsThinking(snap) {
+		t.Errorf("IsThinking(spinner-in-transcript) = true, want false")
+	}
+	// Contrast: a raw substring match over the same bytes forges thinking.
+	if !strings.Contains(string(snap), string(SpinnerGlyph)) {
+		t.Fatalf("fixture no longer contains ✻ — the forgery contrast is void")
+	}
+}
+
+func TestIsIdleScrolledPromptGlyphNotIdle(t *testing.T) {
+	// AC #3b — a stale ❯ from a previous turn's input line, now scrolled up
+	// out of the status region while a turn is running, must NOT forge "idle".
+	// The bottom rows carry mid-turn transcript, no ❯. Whole-buffer substring
+	// matching would report idle and let the consumer write into a live turn.
+	snap := gridRows(
+		"❯ a previous turn's prompt, now scrolled up", // stale ❯ high in history
+		"assistant is still working on that turn",
+		"transcript line",
+		"transcript line",
+		"transcript line",
+		"transcript line",
+		"transcript line",
+		"transcript line",
+		"tool result: still streaming output", // bottom rows: no ❯, no ✻
+		"more streaming output",
+	)
+	if IsIdle(snap) {
+		t.Errorf("IsIdle(scrolled-prompt) = true, want false")
+	}
+	// Contrast: a raw substring match over the same bytes forges idle.
+	if !strings.Contains(string(snap), string(IdleGlyph)) {
+		t.Fatalf("fixture no longer contains ❯ — the forgery contrast is void")
+	}
+}
+
+func TestIsThinkingRealisticLayoutPinsRegion(t *testing.T) {
+	// Pins the lower bound of statusRegionRows. Mirrors a real thinking frame:
+	// the spinner renders adjacent above the redrawn input box, landing at
+	// ~row -5 from the bottom (box border/hint below the ❯ line). The region
+	// must be large enough to reach it — this fails RED if statusRegionRows is
+	// sized too small.
+	snap := gridRows(
+		"transcript line",
+		"transcript line",
+		"assistant working on the turn",
+		"✻ Simmering… (7s)", // spinner, adjacent above the input box (-5)
+		"╭────────────────╮", // input box top border (-4)
+		"❯", // redrawn input line beneath the spinner (-3)
+		"╰────────────────╯", // input box bottom border (-2)
+		"  ? for shortcuts", // hint bar (-1)
+	)
+	if !IsThinking(snap) {
+		t.Errorf("IsThinking(realistic thinking layout) = false, want true")
+	}
+	if IsIdle(snap) {
+		t.Errorf("IsIdle(realistic thinking layout) = true, want false")
+	}
+}
+
+func TestIsIdleRealCaptureUnchanged(t *testing.T) {
+	// AC #4 — a committed real capture that carries a genuine on-screen input
+	// line (❯ at row -3) classifies idle, unchanged from the whole-buffer era.
+	snap, err := os.ReadFile(filepath.Join("testdata", "mcp-empty-snapshot.bin"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	if !IsIdle(snap) {
+		t.Errorf("IsIdle(mcp-empty-snapshot.bin) = false, want true")
 	}
 }
 
