@@ -254,19 +254,59 @@ func TestPromptDidCommit(t *testing.T) {
 	t.Run("spinner visible returns true", func(t *testing.T) {
 		s := &Session{buffer: NewBuffer(0)}
 		s.buffer.Append(SpinnerGlyph) // ✻ → IsThinking true
-		if !s.promptDidCommit(context.Background(), "", time.Second) {
+		if !s.promptDidCommit(context.Background(), "", 0, time.Second) {
 			t.Error("promptDidCommit = false, want true (spinner visible)")
 		}
 	})
 
-	t.Run("jsonl file present returns true", func(t *testing.T) {
+	t.Run("spinner wins over a non-growing jsonl", func(t *testing.T) {
+		// AC 4: the spinner is checked first and short-circuits before the
+		// growth check runs. The JSONL sits at exactly the baseline (no growth
+		// for this turn), yet the thinking spinner still reports committed.
+		s := &Session{buffer: NewBuffer(0)}
+		s.buffer.Append(SpinnerGlyph)
+		jsonl := filepath.Join(t.TempDir(), "session.jsonl")
+		content := []byte("{\"turn\":1}\n")
+		if err := os.WriteFile(jsonl, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if !s.promptDidCommit(context.Background(), jsonl, int64(len(content)), time.Second) {
+			t.Error("promptDidCommit = false, want true (spinner wins over non-growing jsonl)")
+		}
+	})
+
+	t.Run("jsonl grows past baseline returns true", func(t *testing.T) {
+		// AC 3 / turn one: the file first appears with content (or grows from
+		// empty). With baseline 0, any non-empty file exceeds it via the file
+		// signal alone (no spinner).
 		s := &Session{buffer: NewBuffer(0)} // no spinner
 		jsonl := filepath.Join(t.TempDir(), "session.jsonl")
 		if err := os.WriteFile(jsonl, []byte("{}"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if !s.promptDidCommit(context.Background(), jsonl, time.Second) {
-			t.Error("promptDidCommit = false, want true (jsonl exists)")
+		if !s.promptDidCommit(context.Background(), jsonl, 0, time.Second) {
+			t.Error("promptDidCommit = false, want true (jsonl grew past baseline 0)")
+		}
+	})
+
+	t.Run("pre-existing jsonl that does not grow returns false", func(t *testing.T) {
+		// AC 1, 2, 5 / turn two: a stale JSONL from a prior turn sits at the
+		// baseline and does not grow during this delivery, with no spinner —
+		// so no commit signal fires and the poll times out. This is the
+		// regression the ticket restores: turn-two paste-recovery still runs
+		// because promptDidCommit reports not-committed.
+		s := &Session{buffer: NewBuffer(0)} // no spinner
+		jsonl := filepath.Join(t.TempDir(), "session.jsonl")
+		content := []byte("{\"turn\":1}\n")
+		if err := os.WriteFile(jsonl, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		if s.promptDidCommit(context.Background(), jsonl, int64(len(content)), 120*time.Millisecond) {
+			t.Error("promptDidCommit = true, want false (jsonl did not grow past baseline)")
+		}
+		if time.Since(start) < 100*time.Millisecond {
+			t.Errorf("returned in %v, want it to honor the timeout", time.Since(start))
 		}
 	})
 
@@ -274,7 +314,7 @@ func TestPromptDidCommit(t *testing.T) {
 		s := &Session{buffer: NewBuffer(0)}
 		missing := filepath.Join(t.TempDir(), "absent.jsonl")
 		start := time.Now()
-		if s.promptDidCommit(context.Background(), missing, 120*time.Millisecond) {
+		if s.promptDidCommit(context.Background(), missing, 0, 120*time.Millisecond) {
 			t.Error("promptDidCommit = true, want false (no signal)")
 		}
 		if time.Since(start) < 100*time.Millisecond {
@@ -286,7 +326,7 @@ func TestPromptDidCommit(t *testing.T) {
 		s := &Session{buffer: NewBuffer(0)}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if s.promptDidCommit(ctx, "", 5*time.Second) {
+		if s.promptDidCommit(ctx, "", 0, 5*time.Second) {
 			t.Error("promptDidCommit = true, want false (ctx cancelled)")
 		}
 	})

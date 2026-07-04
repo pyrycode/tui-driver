@@ -32,10 +32,12 @@ type DeliverOpts struct {
 	Prompt string
 
 	// JSONLPath is the per-session JSONL file claude writes once a turn
-	// commits. DeliverPrompt treats the file's appearance as a commit signal
-	// alongside the thinking spinner. Optional: pass "" to rely on the spinner
-	// signal alone. The session stays ignorant of home / cwd / sessionID — the
-	// consumer resolves the path (via SessionJSONLPath) and passes it in.
+	// commits and appends to thereafter. DeliverPrompt treats the file growing
+	// past its pre-delivery size as a commit signal alongside the thinking
+	// spinner — mere existence is not enough, since the file persists across
+	// turns. Optional: pass "" to rely on the spinner signal alone. The session
+	// stays ignorant of home / cwd / sessionID — the consumer resolves the path
+	// (via SessionJSONLPath) and passes it in.
 	JSONLPath string
 
 	// CommitTimeout bounds how long each delivery attempt waits for a commit
@@ -75,8 +77,8 @@ type DeliverResult struct {
 //     paste), whose "[Pasted text]" chip drives the corrupted-paste recovery
 //     below. See shouldTypePrompt.
 //   - Commit confirmation. After each delivery it polls for a commit signal
-//     (the thinking spinner is visible, or the per-session JSONL has appeared)
-//     up to CommitTimeout.
+//     (the thinking spinner is visible, or the per-session JSONL has grown past
+//     its pre-delivery size) up to CommitTimeout.
 //   - Recovery. If no commit signal lands AND the input box still shows the
 //     "[Pasted text]" chip, the paste was corrupted: it clears the input line
 //     and re-delivers, up to MaxAttempts. If no chip is present, the paste
@@ -100,11 +102,25 @@ func (s *Session) DeliverPrompt(ctx context.Context, opts DeliverOpts) (DeliverR
 	if shouldTypePrompt(opts.Prompt) {
 		write = s.TypePrompt
 	}
+	// Capture the JSONL size once, before delivery: the commit signal is the
+	// file growing past this baseline, not merely existing. A "" path or a
+	// missing file reads as size 0, so turn one — where the file first appears
+	// with content — still commits, while a stale file from a prior turn that
+	// does not grow does not. Captured here (outside the deliverPrompt retry
+	// loop) so every re-delivery attempt measures against the file state
+	// before this turn began, never folding an earlier attempt's growth into
+	// its own baseline.
+	var baseline int64
+	if opts.JSONLPath != "" {
+		if info, err := os.Stat(opts.JSONLPath); err == nil {
+			baseline = info.Size()
+		}
+	}
 	return deliverPrompt(ctx, opts, deliverDeps{
 		write: write,
 		clear: s.ClearInputLine,
 		didCommit: func(timeout time.Duration) bool {
-			return s.promptDidCommit(ctx, opts.JSONLPath, timeout)
+			return s.promptDidCommit(ctx, opts.JSONLPath, baseline, timeout)
 		},
 		hasChip: func() bool { return hasPastedChip(s.Snapshot()) },
 	})
@@ -180,12 +196,15 @@ func deliverPrompt(ctx context.Context, opts DeliverOpts, deps deliverDeps) (Del
 }
 
 // promptDidCommit reports whether claude started a turn after a prompt write:
-// the thinking spinner is visible OR the per-session JSONL has appeared (claude
-// writes it only once input lands). Polls at promptCommitPoll until a signal is
-// seen, the timeout elapses, or ctx is cancelled. It only observes — never
-// writes — so a false negative costs one extra re-delivery, never a corrupted
-// live turn.
-func (s *Session) promptDidCommit(ctx context.Context, jsonlPath string, timeout time.Duration) bool {
+// the thinking spinner is visible OR the per-session JSONL has grown past
+// baseline (the size captured immediately before this delivery). Because the
+// JSONL is append-only, a fresh append for the current turn always pushes the
+// size up, while a stale file from a prior turn that does not grow no longer
+// counts — so paste-recovery keeps protecting turn two onward, not just the
+// first. Polls at promptCommitPoll until a signal is seen, the timeout elapses,
+// or ctx is cancelled. It only observes — never writes — so a false negative
+// costs one extra re-delivery, never a corrupted live turn.
+func (s *Session) promptDidCommit(ctx context.Context, jsonlPath string, baseline int64, timeout time.Duration) bool {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	tk := time.NewTicker(promptCommitPoll)
@@ -195,7 +214,7 @@ func (s *Session) promptDidCommit(ctx context.Context, jsonlPath string, timeout
 			return true
 		}
 		if jsonlPath != "" {
-			if _, err := os.Stat(jsonlPath); err == nil {
+			if info, err := os.Stat(jsonlPath); err == nil && info.Size() > baseline {
 				return true
 			}
 		}
