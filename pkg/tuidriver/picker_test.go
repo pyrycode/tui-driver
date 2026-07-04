@@ -143,3 +143,53 @@ func TestParsePickerHypotheticalThirdEncoding(t *testing.T) {
 }
 
 func startsWithSlash(s string) bool { return len(s) > 0 && s[0] == '/' }
+
+// #151 chrome helper: true only for a known picker-highlight shade, in either
+// encoding; false for normal colors and no color.
+func TestSnapHasPickerHighlight(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+		want bool
+	}{
+		{"indexed highlight (153)", []byte("\x1b[38;5;153m/figma-use\x1b[39m"), true},
+		{"truecolor highlight (177,185,249)", []byte("\x1b[38;2;177;185;249m/code-review\x1b[39m"), true},
+		{"indexed highlight mid-stream after normal", []byte("\x1b[38;5;246m/\x1b[38;5;153mp\x1b[39m"), true},
+		{"normal indexed color (246 → gray 148)", []byte("\x1b[38;5;246m/figma-use\x1b[39m"), false},
+		{"normal truecolor (148,148,148)", []byte("\x1b[38;2;148;148;148m/figma-use\x1b[39m"), false},
+		{"no color at all", []byte("/figma-use description"), false},
+		{"empty", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := snapHasPickerHighlight(tc.in); got != tc.want {
+				t.Errorf("snapHasPickerHighlight(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// #151: isSlashPicker is the AND of grid-region row location and chrome. Truth
+// table over {on-screen /-row?, chrome?}. Fixtures use \r\n (the #150 grid
+// staircase lesson).
+func TestIsSlashPicker(t *testing.T) {
+	const hl = "\x1b[38;2;177;185;249m"
+	cases := []struct {
+		name string
+		in   []byte
+		want bool
+	}{
+		{"row + chrome", []byte(hl + "/figma-use\x1b[39m\r\n"), true},
+		{"row, no chrome (lone path)", []byte("/Users/x/file.go\r\n"), false},
+		{"chrome, no /-row", []byte(hl + "hello\x1b[39m\r\n"), false},
+		{"neither (idle)", []byte("just some idle text\r\n"), false},
+		{"empty", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isSlashPicker(tc.in); got != tc.want {
+				t.Errorf("isSlashPicker(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}

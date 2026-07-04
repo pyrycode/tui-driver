@@ -28,21 +28,30 @@ func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 		{"agents header + running tab", []byte("...Agents...Running..."), ModalClassAgents},
 		{"agents header + library tab", []byte("...Agents...Library..."), ModalClassAgents},
 		{
-			"slash-picker bare line (no color)",
+			// #151: a `/`-row with no picker highlight chrome is NOT a
+			// picker — a lone command-shaped line (or an absolute path) at
+			// idle must not phantom-picker. Chrome is now load-bearing.
+			"slash-picker bare line without chrome is NOT a picker",
 			[]byte("noise\n/figma-use description\n"),
-			ModalClassSlashPicker,
+			ModalClassUnknown,
 		},
 		{
-			"slash-picker indexed-color row",
+			// #151: normal indexed foreground (index 246 → gray 148) is not
+			// a highlight shade, so this fails the chrome check → Unknown.
+			"slash-picker row in normal indexed color (no highlight) is NOT a picker",
 			[]byte("noise\n\x1b[38;5;246m/figma-use\x1b[39m\n"),
-			ModalClassSlashPicker,
+			ModalClassUnknown,
 		},
 		{
-			"slash-picker truecolor row",
+			// #151: normal truecolor foreground (148,148,148) is not a
+			// highlight shade → fails chrome → Unknown.
+			"slash-picker row in normal truecolor (no highlight) is NOT a picker",
 			[]byte("noise\n\x1b[38;2;148;148;148m/figma-use\x1b[39m\n"),
-			ModalClassSlashPicker,
+			ModalClassUnknown,
 		},
 		{
+			// Stays a picker: the mid-row 38;5;153 is a real highlight shade
+			// (index 153 → 175,215,255), so chrome is present.
 			"slash-picker filtered (multiple colors mid-row)",
 			[]byte("noise\n\x1b[38;5;246m/\x1b[38;5;153mp\x1b[38;5;246mlugin desc\n"),
 			ModalClassSlashPicker,
@@ -81,6 +90,75 @@ func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDetectModalClassSlashPickerContract covers #151's two guarantees: the
+// slash-picker check runs LAST (a specific anchor wins even when picker signals
+// are present), and it requires picker chrome (a highlight color), not just an
+// on-screen `/`-row. Fixtures use \r\n so vt10x renders flat rows, not a
+// staircase (the #150 grid lesson).
+func TestDetectModalClassSlashPickerContract(t *testing.T) {
+	const (
+		hlTrue = "\x1b[38;2;177;185;249m" // truecolor highlight shade
+		hlIdx  = "\x1b[38;5;153m"         // indexed highlight (→ 175,215,255)
+		reset  = "\x1b[39m"
+	)
+	cases := []struct {
+		name string
+		in   []byte
+		want ModalClass
+	}{
+		{
+			// Lone absolute path on screen, no highlight → not a picker.
+			// Grid-region alone wouldn't reject it (the path IS on screen);
+			// chrome is what rejects it.
+			"lone absolute path with no chrome is not a picker",
+			[]byte("/Users/x/file.go\r\n"),
+			ModalClassUnknown,
+		},
+		{
+			// A real permission modal that also has a `/`-path on screen
+			// painted in the highlight shade — i.e. BOTH picker signals
+			// present. The reorder must let the Permission anchor win.
+			"permission modal wins over co-present picker signals",
+			[]byte("Do you want to proceed?\r\n" + hlTrue + "/Users/x/file.go" + reset + "\r\n"),
+			ModalClassPermission,
+		},
+		{
+			// Single-match filtered picker (one row) painted in the highlight
+			// shade → still a picker. Truecolor + indexed twins.
+			"single-match picker with truecolor chrome is a picker",
+			[]byte(hlTrue + "/figma-use" + reset + "\r\n"),
+			ModalClassSlashPicker,
+		},
+		{
+			"single-match picker with indexed chrome is a picker",
+			[]byte(hlIdx + "/figma-use" + reset + "\r\n"),
+			ModalClassSlashPicker,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DetectModalClass(tc.in); got != tc.want {
+				t.Errorf("DetectModalClass(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	// ParsePicker must stay behaviourally unchanged for a real one-item
+	// picker (AC: findPickerRows/ParsePicker untouched).
+	t.Run("ParsePicker output unchanged for single-match picker", func(t *testing.T) {
+		items := ParsePicker([]byte(hlTrue + "/figma-use" + reset + "\r\n"))
+		if len(items) != 1 {
+			t.Fatalf("ParsePicker returned %d items, want 1", len(items))
+		}
+		if items[0].Command != "/figma-use" {
+			t.Errorf("ParsePicker command = %q, want %q", items[0].Command, "/figma-use")
+		}
+		if !items[0].Highlighted {
+			t.Errorf("ParsePicker highlighted = false, want true")
+		}
+	})
 }
 
 func TestDetectModalClassStripsANSIAndOSCBeforeMatching(t *testing.T) {
