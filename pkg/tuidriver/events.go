@@ -355,6 +355,20 @@ func mergeEvents(
 					return
 				}
 			}
+			// Symmetric modal suppression (fixes #61-deferred → #157): while a
+			// modal is active the idle/thinking emissions above are suppressed
+			// (modal axis dominates), so their prev trackers must be frozen too.
+			// Otherwise prev.idle silently tracks the ❯-under-modal
+			// classification; when the modal clears with claude still idle,
+			// cur.idle && !prev.idle evaluates false and the idle rising edge is
+			// lost. Freezing preserves the pre-modal edge across the modal
+			// window so it fires on the clear tick — after EventKindPtyModalHidden,
+			// which the modal block above already emitted first. stalled is
+			// untouched: it was computed above (before this line) and reads
+			// prev.stalled, not prev.idle.
+			if cur.modal != ModalClassUnknown {
+				cur.idle, cur.thinking = prev.idle, prev.thinking
+			}
 			prev = cur
 		}
 	}

@@ -28,7 +28,33 @@ type Readiness struct {
 	// NetworkFailure is true when a network-unreachable anchor
 	// (FailedToOpenSocket) is present at idle: the claude API is unreachable.
 	NetworkFailure bool
+
+	// UnknownModal is true when a recognized modal class is up at idle that no
+	// other Readiness field already surfaces — any DetectModalClass result
+	// except ModalClassUnknown (the common no-modal idle screen) and the trust
+	// modal (surfaced by TrustModal). It catches a startup dialog the consumer
+	// would otherwise type its first prompt into. Detecting a genuinely novel,
+	// unclassified dialog is out of scope: this axis rides on the existing
+	// class set.
+	UnknownModal bool
 }
+
+// ProcessExitedError reports that the session's child process exited before
+// WaitReady observed idle. Err is the process's exit status (from cmd.Wait),
+// or nil on a clean exit-before-ready. Match with errors.As; the underlying
+// cause is available via the Err field or errors.Is (Unwrap).
+type ProcessExitedError struct {
+	Err error
+}
+
+func (e *ProcessExitedError) Error() string {
+	if e.Err != nil {
+		return "tuidriver: process exited before ready: " + e.Err.Error()
+	}
+	return "tuidriver: process exited before ready"
+}
+
+func (e *ProcessExitedError) Unwrap() error { return e.Err }
 
 // WaitReady waits for claude's TUI to reach idle, then classifies the post-idle
 // snapshot for the blocking conditions a driver must decide on. It only
@@ -36,11 +62,12 @@ type Readiness struct {
 // WaitUntil(IsIdle) plus the trust / mcp / network one-shot checks into a
 // single call.
 //
-// The error is WaitUntil's context cause on cancellation (the standard
-// operator-shutdown collapse) and nil otherwise; the returned Readiness is the
-// zero value on a non-nil error.
+// The error is the context cause on cancellation (the standard
+// operator-shutdown collapse) or a *ProcessExitedError when the child process
+// exits before idle, and nil otherwise; the returned Readiness is the zero
+// value on a non-nil error.
 func (s *Session) WaitReady(ctx context.Context) (Readiness, error) {
-	if err := WaitUntil(ctx, func() bool { return IsIdle(s.Snapshot()) }); err != nil {
+	if err := s.waitUntilOrExit(ctx, func() bool { return IsIdle(s.Snapshot()) }); err != nil {
 		return Readiness{}, err
 	}
 	snap := s.Snapshot()
@@ -50,5 +77,19 @@ func (s *Session) WaitReady(ctx context.Context) (Readiness, error) {
 		McpFailure:     HasMcpFailureBanner(snap),
 		FailedMcpCount: FailedMcpCount(snap),
 		NetworkFailure: HasNetworkFailure(snap),
+		UnknownModal:   isUnknownModal(snap),
 	}, nil
+}
+
+// isUnknownModal reports whether snap shows a recognized modal class that no
+// other Readiness field already surfaces. ModalClassUnknown is the common
+// no-modal idle screen, and the trust modal is surfaced by Readiness.TrustModal;
+// both are excluded so the normal ready path and a trust-only screen stay false.
+func isUnknownModal(snap []byte) bool {
+	switch DetectModalClass(snap) {
+	case ModalClassUnknown, ModalClassTrustFolder:
+		return false
+	default:
+		return true
+	}
 }

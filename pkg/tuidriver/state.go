@@ -1,7 +1,6 @@
 package tuidriver
 
 import (
-	"bytes"
 	"regexp"
 	"strconv"
 )
@@ -26,31 +25,79 @@ var IdleGlyph = []byte("\xe2\x9d\xaf")
 // extractor is incomplete (class C is documented as not matching).
 var SpinnerGlyph = []byte("\xe2\x9c\xbb")
 
+// InterruptHint is claude's on-screen "esc to interrupt" hint — the second,
+// independent busy anchor folded into busyInRegion alongside SpinnerGlyph.
+// It is the more reliable in-flight anchor now that the ✻ spinner's text
+// format has drifted dead (CLAUDE.md § Spinner caveat), so consumers writing
+// their own PTY-quiescence checks should prefer it.
+//
+// A const string, not a []byte var like the glyphs: it has no external
+// []byte consumer, and ContainsInLastRows takes a string. Match it over the
+// Grid's space-preserved rendered form — the multi-word phrase is exactly
+// what a StripANSI whole-buffer scan would corrupt (claude renders the
+// inter-word gaps as CSI cursor-forwards that strip to nothing; the grid
+// repaints them to real spaces). Match the full contiguous phrase, never a
+// shorter substring: benign in-region content ("…without interrupting the
+// main conversation" in the slash-picker) contains "interrupt" and would
+// forge busy on an idle picker.
+const InterruptHint = "esc to interrupt"
+
+// statusRegionRows bounds the idle/busy status region to the bottom N
+// rendered rows of the grid. Sized to include the input line (❯, ~row -3
+// from bottom) and the spinner line redrawn just above it (✻, ~row -5),
+// while excluding transcript body above the overlay (~row -6 and up when
+// idle). Small by construction — widening toward the whole grid would
+// reintroduce the mid-transcript forgeries this slice removes. Calibrated
+// from the committed captures (real idle ❯ at -3 in mcp-empty-snapshot.bin)
+// and pinned in both directions by the regressions in state_test.go: too
+// small fails the realistic-thinking pin, too wide fails the forgery cases.
+const statusRegionRows = 6
+
+// busyInRegion reports whether a busy anchor is present in the status
+// region — THE single busy predicate for the idle/busy axis. Region-scoping
+// lives in exactly one place so IsIdle and IsThinking stay coherent. Two
+// independent anchors are OR'd here: the spinner glyph ✻ (SpinnerGlyph) and
+// claude's "esc to interrupt" hint (InterruptHint). They fail independently —
+// claude would have to change both the glyph and the hint wording in one
+// release to defeat the check. Both key on the grid's space-preserved
+// rendered form; this must never reintroduce a StripANSI whole-buffer
+// substring path — that would both re-corrupt the multi-word hint's
+// inter-word spaces and re-open the mid-transcript forgery #153 closed.
+func busyInRegion(g *Grid) bool {
+	return g.ContainsInLastRows(string(SpinnerGlyph), statusRegionRows) ||
+		g.ContainsInLastRows(InterruptHint, statusRegionRows)
+}
+
 // IsIdle reports whether snap shows claude at the input prompt with no
-// thinking spinner active: ❯ glyph present AND ✻ glyph absent. The
+// thinking spinner active, decided from the bottom status region of the
+// rendered grid (not a substring anywhere in the raw history buffer): ❯
+// glyph present in the region AND no busy anchor present in the region. The
 // conjunction is load-bearing — ❯ alone is not enough (it's also present
-// during thinking, redrawn beneath the spinner).
+// during thinking, redrawn beneath the spinner). Region-scoping means a
+// stale ❯ scrolled off into history no longer forges idle.
 //
 // Use this as the "claude ready for input" predicate before writing
 // keystrokes. Modal states (permission, trust-folder, ask-user-question,
 // etc.) ALSO render ❯; check DetectModalClass to disambiguate when modal
 // handling matters.
 func IsIdle(snap []byte) bool {
-	stripped := StripANSI(snap)
-	if !bytes.Contains(stripped, IdleGlyph) {
+	g := NewGrid(snap, 0, 0)
+	if !g.ContainsInLastRows(string(IdleGlyph), statusRegionRows) {
 		return false
 	}
-	return !bytes.Contains(stripped, SpinnerGlyph)
+	return !busyInRegion(g)
 }
 
-// IsThinking reports whether snap shows claude's thinking spinner. Used as
-// the post-keystroke "claude received my prompt and started processing"
-// signal in flows where waiting for end-turn alone is too late (e.g. a
-// warm-up turn that needs the spinner-appeared signal before checking
-// IsIdle again — otherwise the post-keystroke ❯ redraw fools IsIdle into
-// reporting idle prematurely).
+// IsThinking reports whether claude's thinking spinner is present in the
+// bottom status region of the rendered grid (not a substring anywhere in
+// the raw history buffer). Used as the post-keystroke "claude received my
+// prompt and started processing" signal in flows where waiting for end-turn
+// alone is too late (e.g. a warm-up turn that needs the spinner-appeared
+// signal before checking IsIdle again — otherwise the post-keystroke ❯
+// redraw fools IsIdle into reporting idle prematurely). Region-scoping means
+// a stale ✻ printed as transcript content no longer forges thinking.
 func IsThinking(snap []byte) bool {
-	return bytes.Contains(StripANSI(snap), SpinnerGlyph)
+	return busyInRegion(NewGrid(snap, 0, 0))
 }
 
 // spinnerTokensRe matches the live output-token counter in claude's

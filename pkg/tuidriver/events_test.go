@@ -177,6 +177,100 @@ func TestMergeEvents_ModalShowAndHide(t *testing.T) {
 	assertEventChClosed(t, out, 500*time.Millisecond)
 }
 
+// TestMergeEvents_ModalClearRevealsSuppressedIdleThenThinking drives the
+// direct Permission → idle path the masking TestMergeEvents_ModalShowAndHide
+// misses (it detours through an MCP snapshot with no ❯, which resets prev.idle
+// to false). Here the modal renders ❯ throughout its lifetime, so IsIdle is
+// true across the whole modal-active window — the exact shape that leaked the
+// idle rising edge before #157. Asserts the edge survives the modal window and
+// fires on the clear tick, and (phases 3-4) that the freeze applies
+// symmetrically to prev.thinking.
+func TestMergeEvents_ModalClearRevealsSuppressedIdleThenThinking(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	snap := &testSnap{}
+	jsonlCh := make(chan JSONLEntry)
+	out := make(chan Event, defaultEventBuffer)
+	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+
+	// Phase 1: Permission modal with ❯ present. IsIdle is true throughout,
+	// but idle emission is suppressed while a modal is up — only ModalShown
+	// fires, no PtyIdle.
+	snap.Set([]byte("\xe2\x9d\xaf Do you want to proceed"))
+	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyModalShown {
+		t.Errorf("phase 1 Kind = %v, want EventKindPtyModalShown", ev.Kind)
+	}
+	if ev.Modal != ModalClassPermission {
+		t.Errorf("phase 1 Modal = %q, want %q", ev.Modal, ModalClassPermission)
+	}
+	select {
+	case extra, ok := <-out:
+		if !ok {
+			t.Fatalf("phase 1 channel closed unexpectedly")
+		}
+		t.Fatalf("phase 1 unexpected follow-up event %+v (idle suppressed under modal)", extra)
+	case <-time.After(2 * DefaultPollInterval):
+	}
+
+	// Phase 2: modal cleared, still idle (❯ present, no anchor, no spinner).
+	// Two events in order: ModalHidden(Permission) then PtyIdle. The idle edge
+	// is preserved because prev.idle was frozen at false across the modal
+	// window. Against the pre-#157 code only ModalHidden arrives (prev.idle
+	// had tracked the ❯-under-modal classification to true), so this receive
+	// times out.
+	snap.Set([]byte("\xe2\x9d\xaf ready"))
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyModalHidden {
+		t.Errorf("phase 2a Kind = %v, want EventKindPtyModalHidden", ev.Kind)
+	}
+	if ev.Modal != ModalClassPermission {
+		t.Errorf("phase 2a Modal = %q, want %q", ev.Modal, ModalClassPermission)
+	}
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyIdle {
+		t.Errorf("phase 2b Kind = %v, want EventKindPtyIdle", ev.Kind)
+	}
+
+	// Phase 3: re-enter the Permission modal (prev.idle is now true). Only
+	// ModalShown fires — the modal did not introduce a new low→high idle
+	// transition, and the freeze holds prev.idle/prev.thinking across the
+	// window.
+	snap.Set([]byte("\xe2\x9d\xaf Do you want to proceed"))
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyModalShown {
+		t.Errorf("phase 3 Kind = %v, want EventKindPtyModalShown", ev.Kind)
+	}
+	select {
+	case extra, ok := <-out:
+		if !ok {
+			t.Fatalf("phase 3 channel closed unexpectedly")
+		}
+		t.Fatalf("phase 3 unexpected follow-up event %+v (idle suppressed under modal)", extra)
+	case <-time.After(2 * DefaultPollInterval):
+	}
+
+	// Phase 4: modal cleared to a spinner-present snapshot. Two events in
+	// order: ModalHidden(Permission) then PtyThinking — confirming the freeze
+	// held prev.thinking at false across the modal window (AC 2). No spurious
+	// PtyIdle: cur.idle is false (busy anchor present).
+	snap.Set([]byte("\xe2\x9c\xbb Baked for 2s\n\xe2\x9d\xaf input"))
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyModalHidden {
+		t.Errorf("phase 4a Kind = %v, want EventKindPtyModalHidden", ev.Kind)
+	}
+	if ev.Modal != ModalClassPermission {
+		t.Errorf("phase 4a Modal = %q, want %q", ev.Modal, ModalClassPermission)
+	}
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyThinking {
+		t.Errorf("phase 4b Kind = %v, want EventKindPtyThinking", ev.Kind)
+	}
+
+	cancel()
+	assertEventChClosed(t, out, 500*time.Millisecond)
+}
+
 func TestMergeEvents_JsonlEntryAndSyntheticEndOfTurn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
