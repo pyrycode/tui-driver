@@ -5,12 +5,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf16"
 )
 
 func TestEncodeCwd(t *testing.T) {
 	// Cases below do not name on-disk directories (with the exception of "/"),
-	// so they exercise both the byte-transform and the post-#57 fallback
-	// contract: canonicalisePath returns ok=false → encode input as-passed.
+	// so they exercise both the per-UTF-16-unit transform and the post-#57
+	// fallback contract: canonicalisePath returns ok=false → encode input
+	// as-passed.
 	cases := []struct {
 		name string
 		in   string
@@ -28,7 +30,16 @@ func TestEncodeCwd(t *testing.T) {
 		{"adjacent specials produce adjacent hyphens", ") [", "---"},
 		{"dot and space mapped", "v1.2 beta", "v1-2-beta"},
 		{"underscore is non-alnum", "snake_case", "snake-case"},
-		{"unicode bytes mapped per-byte to hyphen", "café", "caf--"},
+		// é (U+00E9) is a BMP rune → 1 UTF-16 code unit → one hyphen. This
+		// replaces the pre-#207 self-referential "caf--" case, which was the
+		// old per-byte loop describing its own 2-byte output, never observed
+		// from claude.
+		{"BMP unicode maps per UTF-16 unit to one hyphen", "café", "caf-"},
+		// #206 golden observed against real claude 2.1.199 (2026-07-06): the
+		// discriminating astral fixture. ö (BMP, 1 unit → "-") then 😀
+		// (U+1F600, astral surrogate pair, 2 units → "--"). A naive per-*rune*
+		// implementation would emit "Ty--" and must fail this case.
+		{"astral rune maps per UTF-16 unit (#206 golden)", "Työ😀", "Ty---"},
 		{
 			"loop 2 B-4 reference case",
 			"/private/tmp/encode test (with) [brackets] & amp+plus_under",
@@ -45,18 +56,20 @@ func TestEncodeCwd(t *testing.T) {
 	}
 }
 
-// byteTransform applies the post-canonicalisation byte-by-byte hyphen
-// mapping used by EncodeCwd. Tests use it to compute expected outputs
-// from a canonicalised path without re-implementing the rule.
+// utf16Transform applies the post-canonicalisation per-UTF-16-code-unit hyphen
+// mapping used by EncodeCwd: each non-[a-zA-Z0-9] rune becomes one '-' per
+// UTF-16 code unit (BMP → 1, astral → 2). Tests use it to compute expected
+// outputs from a canonicalised path without hardcoding them.
 // Keep in sync with EncodeCwd's loop in cwd.go.
-func byteTransform(s string) string {
+func utf16Transform(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
-			b.WriteByte(c)
-		} else {
+	for _, r := range s {
+		if r < 128 && ((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+			b.WriteByte(byte(r))
+			continue
+		}
+		for range utf16.Encode([]rune{r}) {
 			b.WriteByte('-')
 		}
 	}
@@ -76,7 +89,7 @@ func TestEncodeCwd_RealpathHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvalSymlinks: %v", err)
 	}
-	want := byteTransform(canonical)
+	want := utf16Transform(canonical)
 	got := EncodeCwd(dir)
 	if got != want {
 		t.Errorf("EncodeCwd(%q) = %q, want %q (canonical=%q)", dir, got, want, canonical)
@@ -86,7 +99,7 @@ func TestEncodeCwd_RealpathHappyPath(t *testing.T) {
 func TestEncodeCwd_NonexistentPath(t *testing.T) {
 	tmp := t.TempDir()
 	p := filepath.Join(tmp, "this-does-not-exist")
-	want := byteTransform(p)
+	want := utf16Transform(p)
 	got := EncodeCwd(p)
 	if got != want {
 		t.Errorf("EncodeCwd(%q) = %q, want %q (fallback should encode input as-passed)", p, got, want)

@@ -11,14 +11,13 @@ Where `claude` writes its session JSONL and what the records look like, as obser
 ```
 
 - **Flat.** No `sessions/` subdirectory. (Vault design doc and ticket body both implied a `sessions/` subdir — wrong.)
-- **`<encoded-cwd>` is byte-by-byte substitution**, not a reversible encoding. For each byte of the absolute `os.Getwd()` result:
-  - `/` → `-`
-  - `.` → `-`
-  - everything else passes through
-- Adjacent `/.` therefore produces `--`. The encoding is **not reversible** — never try to recover the cwd from the directory name.
-- Compute at runtime via `os.Getwd()`; never hardcode.
+- **`<encoded-cwd>` maps every character outside `[a-zA-Z0-9]` to a hyphen**, not a reversible encoding. `claude` applies JS `.replace(/[^a-zA-Z0-9]/g,'-')` semantics — **one hyphen per UTF-16 code unit**: a BMP character (`/`, `.`, `_`, space, `ö`) → one hyphen; an astral character (`😀`, a surrogate pair) → two hyphens. Adjacent specials therefore produce adjacent hyphens (`/.` → `--`). The encoding is **not reversible** — never try to recover the cwd from the directory name.
+  - The canonical implementation is `tuidriver.EncodeCwd` (`pkg/tuidriver/cwd.go`) — it resolves the path to its on-disk canonical form (symlinks resolved, case canonicalised) first, then applies the per-UTF-16-unit map. Route through it, or through `SessionJSONLPath`, which wraps it; never re-implement the transform. The per-UTF-16 rule was **observed against real `claude` 2.1.199** ([#206](../codebase/206.md)) and shipped in [#207](../codebase/207.md), replacing an earlier per-*byte* transform that emitted 2 hyphens for a 2-byte char like `ö` — a projects-dir `claude` never writes. The #1-era "only `/` and `.` map" note below was a narrower observation of an ASCII-only cwd; the rule is every non-alnum character.
+  - Compute at runtime from the resolved cwd; never hardcode.
 
-Example: cwd `/Users/jhi/Workspace/Projects/.pyrycode-worktrees/architect-1` → `-Users-jhi-Workspace-Projects--pyrycode-worktrees-architect-1`.
+Examples (the ASCII cwd is unaffected by the per-byte → per-UTF-16 change; the non-ASCII cwd is the case [#207](../codebase/207.md) fixed):
+- `/Users/jhi/Workspace/Projects/.pyrycode-worktrees/architect-1` → `-Users-jhi-Workspace-Projects--pyrycode-worktrees-architect-1`
+- cwd leaf `Työ😀` → `Ty---` (`ö` = 1 UTF-16 unit → `-`; `😀` = 2 units → `--`); the old per-byte transform produced the wrong `Ty------`.
 
 ## Discovering the session file
 
