@@ -84,46 +84,82 @@ path (`probe outDir=<path>`), and the same block is written to
   trusted, so `claude` always shows the trust modal; `accept` auto-trusts it.
   The runner passes `-trust-folder=accept`.
 
-## Why no automated tests
+## Why no automated tests (and the one that should exist)
 
-Repo convention for live-`claude` spikes/probes: there is no `_test.go` in any
-`cmd/spike-*` or `cmd/probe-*` (see `spike-one-turn/README.md` § *Why no
-automated tests*). The deliverable is the recorded golden, produced by running
-the rig against real `claude` — the developer's `make check` gate has no live
-`claude`, so it verifies only that the binary builds/vets and is enrolled. The
-golden below is filled from the first live `make e2e` run.
+The **live observation** cannot be unit-tested — the deliverable is a golden
+produced by driving the rig against real `claude`, and the developer's
+`make check` gate has no live `claude`, so it verifies only that the binary
+builds/vets and is enrolled. That part is inherently `make e2e`-only.
+
+The **pure, claude-free transforms** (`perByte` / `perRune` / `perUTF16` /
+`deriveRule`) are a different matter: they are deterministic and *should* carry a
+table test, precisely to give `make check` teeth for the value #207 pins against.
+Code review flagged (PR #209, non-blocking SHOULD-FIX) that they shipped untested
+on a **factually false** premise — `cmd/spike-queued-modals/main_test.go` proves
+the real repo convention is that claude-free logic in a `cmd/*` binary *does* get
+table-tested. The follow-up: add `main_test.go` table-testing `Työ😀 → Ty--- /
+Ty------ / Ty--` and `deriveRule`'s leaf-suffix pick (tracked in
+[`codebase/206.md`](../../docs/knowledge/codebase/206.md) § Follow-ups, folded
+into #207's fix).
 
 ## Empirical log
 
-_Awaiting first live `make e2e` run._ Transcribe the first run's `OBSERVED:`
-block into the row below, verbatim.
+First live run recorded below — the `OBSERVED:` block transcribed verbatim from
+the `make e2e` run's `observation.log`.
 
 | run date | claude version | leaf | observed projects-dir (byte-for-byte) | derived rule | current `EncodeCwd` matched? |
 |----------|----------------|------|----------------------------------------|--------------|------------------------------|
-| _pending_ | _pending_ | `Työ😀` | _pending_ | _pending_ | _pending_ |
+| 2026-07-06 | 2.1.199 | `Työ😀` | `-private-var-folders-k0-gc07w9ws319b07n0plnw6y8r0000gn-T-probe-cwd-encoding-2549730227-Ty---` | **per-UTF-16 code unit** | **no** — `EncodeCwd` (per-byte) gives `…-Ty------` |
+
+Full `OBSERVED:` block (session `cf16bdbf-c05a-48bf-ac07-f7e127bb0b87`, temp
+suffix `…2549730227` elided in the middle for width):
+
+```
+OBSERVED: observed_projects_dir=-private-var-folders-…-probe-cwd-encoding-2549730227-Ty---
+OBSERVED: leaf=Työ😀 per_byte=Ty------ per_utf16=Ty--- per_rune=Ty--
+OBSERVED: derived_rule=per-utf16-code-unit whole_path_cross_check=per-utf16-code-unit
+OBSERVED: encode_cwd_current=…-Ty------ matches_observed=false
+```
+
+The `…2549730227` segment is the one-run `os.MkdirTemp` random suffix — it is
+**not** part of the portable golden. The stable finding #207 pins against is the
+**leaf-level** transform in the next section, not the full observed dir.
 
 ## Derived rule (for #207)
 
-_Awaiting first live `make e2e` run._ Once observed, state the rule for the
-`Työ😀` leaf in a form #207 can pin a unit test against — the leaf-level golden
-`Työ😀 → <encoded>` and which of {per-UTF-8 byte, per-UTF-16 code unit,
-per-Unicode character} produced it.
+**`Työ😀 → Ty---` — per-UTF-16 code unit.** Confirmed against real `claude`
+2.1.199 (2026-07-06). `claude` encodes the cwd with JS `.replace(/[^a-zA-Z0-9]/g,'-')`
+semantics — **one hyphen per UTF-16 code unit**, not per UTF-8 byte:
 
-### Open questions the first run resolves
+| char | Unicode | UTF-8 bytes | UTF-16 units | `claude` emits |
+|------|---------|-------------|--------------|----------------|
+| `ö`  | U+00F6 (BMP)   | 2 | 1 | `-`  (1 hyphen) |
+| `😀` | U+1F600 (astral, surrogate pair) | 4 | 2 | `--` (2 hyphens) |
 
-- **Does `claude` tolerate the astral char `😀` in a cwd?** The `😀` is what
-  separates per-UTF-16 from per-Unicode-character (both give one hyphen for the
-  BMP `ö`). The JS-UTF-16 hypothesis predicts `claude` handles it and emits two
-  hyphens. If `claude` wedges on it (never idles / never writes JSONL) the first
-  run goes red — fallback: swap the leaf to BMP-only `Työ` (still distinguishes
-  per-byte from per-character), ship green, and file a follow-up for astral
-  behaviour. Decide on the first live run; do not pre-emptively downgrade.
-- **Does the whole-path cross-check agree with the leaf-suffix derivation?** The
-  probe additionally reports `whole_path_cross_check` (does the observed dir
-  equal a candidate's full-string encoding of the canonical cwd?). If it
-  disagrees with the leaf-suffix rule, the leaf-suffix wins and the discrepancy
-  is a prefix quirk worth a note.
-- **NFC/NFD normalisation.** If `claude` (or the filesystem) normalises `ö` to
-  `o` + combining diaeresis, the byte/rune/UTF-16 counts shift and
-  `derived_rule` may come back `unknown`. That is a real, recordable ground
-  truth — capture the raw observed dir and note it here.
+So `Työ😀` → `Ty` + `-` (ö) + `--` (😀) = **`Ty---`** (5 chars). The current
+per-byte `EncodeCwd` produces `Ty------` (8 chars) — **wrong**. #207 pins a unit
+test on the leaf golden `Työ😀 → Ty---` and reimplements `EncodeCwd` per-UTF-16
+code unit (range the string by rune; emit `len(utf16.Encode([]rune{r}))` hyphens
+per non-alnum rune — see this probe's `perUTF16` for the reference transform).
+
+**Consequence for the library today:** `EncodeCwd` (and therefore
+`SessionJSONLPath` / `WaitForSessionJSONL`, which route through it) computes a
+projects-dir path `claude` never writes for **any** cwd containing a multi-byte
+char, so those helpers time out against a real non-ASCII cwd. That is the defect
+#207 closes; it was latent because every prior derivation exercised only ASCII.
+
+### Open questions the first run resolved
+
+- **Does `claude` tolerate the astral char `😀` in a cwd? → Yes.** It idled,
+  accepted trust, wrote the JSONL, and emitted two hyphens for `😀` exactly as
+  the JS-UTF-16 hypothesis predicted. The BMP-only `Työ` fallback was **not**
+  needed and the astral char stays in the leaf constant.
+- **Does the whole-path cross-check agree with the leaf-suffix derivation? →
+  Yes.** `whole_path_cross_check=per-utf16-code-unit` matched the leaf-suffix
+  rule — no prefix-canonicalisation surprise (`EvalSymlinks` gave the expected
+  `/private/var/...` and the ASCII prefix encodes identically under all three
+  candidate rules, so the full-string match was unambiguous).
+- **NFC/NFD normalisation? → No decomposition observed.** `ö` came through as a
+  single BMP code unit (1 hyphen), not `o` + combining diaeresis (which would
+  have been 2 units). `derived_rule` resolved cleanly to `per-utf16-code-unit`,
+  not `unknown`, so no normalisation caveat applies to this observation.
