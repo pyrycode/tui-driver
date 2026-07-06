@@ -168,7 +168,13 @@ func EnsureClaudeEnv(cmd *exec.Cmd) *exec.Cmd {
 //
 // Callers are responsible for cmd.Env (use EnsureClaudeEnv if driving
 // claude), for cmd.Wait, and for closing the returned *os.File when done.
+//
+// On Linux the child is given a hard parent-death SIGKILL (Pdeathsig) so it
+// cannot outlive a crashed host that never runs Session.Close; other platforms
+// have no kernel parent-death signal and rely on Close for shutdown (see
+// setParentDeathSignal).
 func StartPTY(cmd *exec.Cmd) (*os.File, error) {
+	setParentDeathSignal(cmd) // linux: SIGKILL child on parent death; no-op elsewhere
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		return nil, err
