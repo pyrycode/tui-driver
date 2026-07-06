@@ -317,6 +317,25 @@ func buildChecks(runVersionLock func(ctx context.Context) (string, map[string]an
 			},
 		},
 		{
+			// Records how claude encodes a non-ASCII cwd into its projects-dir
+			// name (#206). Observation rig: ^OBSERVED gate; ships green when it
+			// observes, including when the observation contradicts EncodeCwd.
+			// Timeout left unset → 60s default; the internal 30s glob-poll must
+			// fit inside it, so do NOT use the 30s probeCheckTimeout here.
+			Name:          "probe-cwd-encoding",
+			Kind:          "probe",
+			Binary:        "probe-cwd-encoding",
+			Args:          commonArgs,
+			SuccessMarker: observedSuccess,
+			OnFailure: func(stdout, stderr string) map[string]any {
+				m := probeOutDirRe.FindStringSubmatch(stderr)
+				if len(m) < 2 {
+					return nil
+				}
+				return map[string]any{"recording_dir": m[1]}
+			},
+		},
+		{
 			Name:       "snapshot-drift",
 			Kind:       "snapshot",
 			Binary:     "e2e-snapshot-check",
