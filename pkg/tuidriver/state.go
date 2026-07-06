@@ -203,14 +203,14 @@ var spinnerForRe = regexp.MustCompile(`✻\s+(\S+(?:\s+\S+)?)\s+for\s+(?:(\d+)m\
 //
 // Consumer paths:
 //   - The verb is empirical telemetry, logged by every spike binary
-//     when the thinking-detected transition fires; no consumer makes a
-//     correctness decision on the verb's specific value.
-//   - The total-seconds counter feeds Tracker.ObserveSpinner — the
-//     spinner-freeze arm of Tracker.CheckWatchdog needs strictly-
-//     increasing readings while the spinner stays visible. A class-B or
-//     class-C snapshot returns ok=false, which ObserveSpinner treats
-//     identically to "spinner not visible" — the freeze arm goes dormant
-//     until a class-A rendering appears.
+//     when the thinking-detected transition fires (e.g.
+//     cmd/spike-long-prompt); no consumer makes a correctness decision
+//     on the verb's specific value.
+//   - The total-seconds counter is still returned for callers that want
+//     it, but has no in-library consumer: the spinner-freeze watchdog arm
+//     it once fed (via Tracker.ObserveSpinner) was retired in #164 because
+//     ParseSpinner matches 0/667 pinned-Claude frames (#124). The one
+//     production consumer (spike-long-prompt) reads only the verb and ok.
 //
 // Sibling extractor: ParseSpinnerTokens (over the same snapshot, extracts
 // the live token counter from class-C renderings). Both are class-

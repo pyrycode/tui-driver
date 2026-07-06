@@ -43,8 +43,7 @@ func TestRunWatchdogPTYQuietWedge(t *testing.T) {
 	buf := NewBuffer(0)
 	buf.Append([]byte("x"))
 	tr := NewTracker(TrackerOpts{
-		PTYQuietLimit:      50 * time.Millisecond,
-		SpinnerFreezeLimit: 1 * time.Hour, // disable spinner arm
+		PTYQuietLimit: 50 * time.Millisecond,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -65,64 +64,6 @@ func TestRunWatchdogPTYQuietWedge(t *testing.T) {
 	}
 }
 
-// TestRunWatchdogSpinnerFreezeWedge covers AC 6(b) via the spinner-
-// freeze arm AND AC 6(c) — the 20ms custom tick must be honoured for
-// the wedge to fire within the test's window (the default 1s tick
-// would miss it).
-//
-// A helper goroutine keeps the buffer warm (defeats the PTY-quiet arm)
-// while the spinner rendering stays frozen at 2s — class-A snapshot
-// returns the same total every tick, so ObserveSpinner records no
-// progress and the freeze arm fires after SpinnerFreezeLimit.
-func TestRunWatchdogSpinnerFreezeWedge(t *testing.T) {
-	buf := NewBuffer(0)
-	// Pre-load a class-A spinner rendering. Subsequent warm-keep
-	// appends are pure ANSI noise — stripped before ParseSpinner runs,
-	// so the regex keeps matching ("Baked", 2, true).
-	buf.Append([]byte("\xe2\x9c\xbb Baked for 2s"))
-
-	tr := NewTracker(TrackerOpts{
-		PTYQuietLimit:      1 * time.Hour, // disable PTY-quiet arm
-		SpinnerFreezeLimit: 50 * time.Millisecond,
-	})
-
-	warmCtx, warmCancel := context.WithCancel(context.Background())
-	t.Cleanup(warmCancel)
-	go func() {
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-warmCtx.Done():
-				return
-			case <-ticker.C:
-				buf.Append([]byte("\x1b[?25h"))
-			}
-		}
-	}()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-
-	start := time.Now()
-	err := runWatchdogLoop(ctx, buf, tr, WatchdogOpts{Tick: 20 * time.Millisecond})
-	elapsed := time.Since(start)
-
-	if err == nil {
-		t.Fatal("RunWatchdog with frozen spinner = nil, want non-nil error")
-	}
-	if !strings.Contains(err.Error(), "spinner counter frozen") {
-		t.Errorf("error = %q, want it to contain 'spinner counter frozen'", err.Error())
-	}
-	// The wedge only fires if a tick lands after SpinnerFreezeLimit
-	// (50ms) elapses from the first ObserveSpinner call. With a 20ms
-	// tick, that's ~70-90ms from start. The default 1s tick would have
-	// gated the check until ~1s — which would exceed this bound.
-	if elapsed > 200*time.Millisecond {
-		t.Errorf("elapsed = %v, want < 200ms (custom 20ms tick honored)", elapsed)
-	}
-}
-
 // TestSessionRunWatchdogMethod proves the method form drives the loop against
 // the session's own buffer — the same wedge fires through s.RunWatchdog as
 // through the loop directly, with no raw buffer handed to the consumer.
@@ -130,8 +71,7 @@ func TestSessionRunWatchdogMethod(t *testing.T) {
 	s := &Session{buffer: NewBuffer(0)}
 	s.buffer.Append([]byte("x"))
 	tr := NewTracker(TrackerOpts{
-		PTYQuietLimit:      50 * time.Millisecond,
-		SpinnerFreezeLimit: 1 * time.Hour,
+		PTYQuietLimit: 50 * time.Millisecond,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -154,8 +94,7 @@ func TestRunWatchdogDefaultTickApplied(t *testing.T) {
 	buf := NewBuffer(0)
 	buf.Append([]byte("x"))
 	tr := NewTracker(TrackerOpts{
-		PTYQuietLimit:      50 * time.Millisecond,
-		SpinnerFreezeLimit: 1 * time.Hour,
+		PTYQuietLimit: 50 * time.Millisecond,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)

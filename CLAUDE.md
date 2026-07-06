@@ -20,7 +20,7 @@ When a feature idea surfaces, first ask: does this belong in tui-driver or in th
 
 PTY allocation → spawn target binary → continuous read into rolling buffer → pattern matchers classify state (idle / thinking / modal / hung / errored) → consumer subscribes to state events and writes input via library APIs. State detection uses pattern matching, not full terminal emulation.
 
-**Spinner caveat (claude 2.1.158):** the class-A `✻ <verb> for Ns` spinner format matches **0/667 frames**, so `ParseSpinner` and the spinner-freeze watchdog arm are effectively dead (tui-driver#124). `IsThinking` (bare `✻` glyph presence) still works as a "claude has started processing" signal. Prefer the `"esc to interrupt"` hint as the reliable in-flight anchor.
+**Spinner caveat (claude 2.1.158):** the class-A `✻ <verb> for Ns` spinner format matches **0/667 frames** (tui-driver#124), so the spinner-freeze watchdog arm was **retired** in #164 — the PTY-quiet arm and `Events()`'s `EventKindStallDetected` cover the freeze case. `ParseSpinner` is retained for verb telemetry (its seconds-counter now has no in-library consumer), and `SpinnerFreezeLimit` is a retained no-op. `IsThinking` (bare `✻` glyph presence) still works as a "claude has started processing" signal. Prefer the `"esc to interrupt"` hint as the reliable in-flight anchor.
 
 ## Library choices
 

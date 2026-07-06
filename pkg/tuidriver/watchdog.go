@@ -8,8 +8,8 @@ import (
 // DefaultWatchdogTick is the loop period RunWatchdog uses when
 // WatchdogOpts.Tick is zero. Matches the 1 Hz cadence every spike binary
 // runs at — fast enough that the wedge-detection latency stays under
-// SpinnerFreezeLimit / PTYQuietLimit, slow enough that the per-tick
-// snapshot + StripANSI + regex work is dwarfed by idle time.
+// PTYQuietLimit, slow enough that the per-tick work is dwarfed by idle
+// time.
 const DefaultWatchdogTick = 1 * time.Second
 
 // WatchdogOpts configures RunWatchdog.
@@ -30,21 +30,12 @@ type WatchdogOpts struct {
 // mode and the last recorded state). The function returns at most once; the
 // ticker is released via defer on every return path.
 //
-// Per-tick work (in order):
+// Per-tick work: tr.CheckWatchdog(buf) evaluates the PTY-quiet arm
+// against buf.QuietFor(); a non-nil return ends the loop.
 //
-//  1. buf.Snapshot — copy the rolling buffer.
-//  2. ParseSpinner(snap) — extract (verb, totalSeconds, ok) from class-A
-//     spinner renderings; class-B/C/D return ok=false, equivalent to
-//     "spinner not visible" for the freeze arm.
-//  3. tr.ObserveSpinner(ok, totalSeconds) — record progress for the
-//     spinner-freeze arm of CheckWatchdog.
-//  4. tr.CheckWatchdog(buf) — evaluate both arms (PTY-quiet and
-//     spinner-freeze). A non-nil return ends the loop.
-//
-// Customising this work list is intentionally not exposed; the
-// calibration is the validated cross-spike default. If a future
-// consumer needs a different shape, this comment documents the cost
-// of divergence.
+// Customising this is intentionally not exposed; the calibration is the
+// validated cross-spike default. If a future consumer needs a different
+// shape, this comment documents the cost of divergence.
 //
 // Recommended consumer pattern — spawn in a goroutine alongside the
 // linear state machine, log the non-nil return, and cancel the parent
@@ -57,21 +48,20 @@ type WatchdogOpts struct {
 //	    }
 //	}()
 //
-// Concurrency: RunWatchdog reads via Buffer.Snapshot / Buffer.QuietFor
-// (thread-safe per Buffer's contract) and Tracker.ObserveSpinner /
-// Tracker.CheckWatchdog (thread-safe per Tracker's contract). No
-// internal goroutines are spawned. Nil buf or tr will panic on first
-// dereference, matching the library's "construct or you get a
+// Concurrency: RunWatchdog reads via Buffer.QuietFor (thread-safe per
+// Buffer's contract) and Tracker.CheckWatchdog (thread-safe per Tracker's
+// contract). No internal goroutines are spawned. Nil buf or tr will panic
+// on first dereference, matching the library's "construct or you get a
 // nil-deref" posture.
 func (s *Session) RunWatchdog(ctx context.Context, tr *Tracker, opts WatchdogOpts) error {
 	return runWatchdogLoop(ctx, s.buffer, tr, opts)
 }
 
 // runWatchdogLoop is the unexported loop body behind Session.RunWatchdog and
-// the seam watchdog_test.go drives with a raw *Buffer. The per-tick work list
-// (Snapshot → ParseSpinner → ObserveSpinner → CheckWatchdog) is the
-// cross-spike-validated calibration; see the RunWatchdog doc for why it is
-// intentionally not configurable.
+// the seam watchdog_test.go drives with a raw *Buffer. The per-tick work
+// (CheckWatchdog against the PTY-quiet arm) is the cross-spike-validated
+// calibration; see the RunWatchdog doc for why it is intentionally not
+// configurable.
 func runWatchdogLoop(ctx context.Context, buf *Buffer, tr *Tracker, opts WatchdogOpts) error {
 	tick := opts.Tick
 	if tick <= 0 {
@@ -84,8 +74,6 @@ func runWatchdogLoop(ctx context.Context, buf *Buffer, tr *Tracker, opts Watchdo
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			_, total, ok := ParseSpinner(buf.Snapshot())
-			tr.ObserveSpinner(ok, total)
 			if err := tr.CheckWatchdog(buf); err != nil {
 				return err
 			}
