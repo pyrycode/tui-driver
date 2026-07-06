@@ -44,9 +44,12 @@ type ModalOption struct {
 // already clean. Group 1 (the marker) marks the pre-selected default.
 var modalOptionRe = regexp.MustCompile(`^(❯\s*)?(\d+)\.\s*(.+)$`)
 
-// anchorTrustHeaderSpaced locates the trust-folder header line in Render
-// output (cursor-forwards expanded back to spaces, so the space-stripped
-// anchorTrustFolder from modal.go does not match the rendered line). Kept
+// anchorTrustHeaderSpaced is the trust-folder header line as it renders on the
+// screen grid (cursor-forwards expanded back to spaces). It is the single
+// space-preserved trust anchor: ParseModalContent uses it to locate the header
+// for extraction, and since #152 DetectModalClass matches it against the
+// rendered grid to classify ModalClassTrustFolder (replacing the old
+// space-stripped modal.go anchor, which the grid never produces). Kept
 // unexported per the package's screen-literal discipline.
 var anchorTrustHeaderSpaced = []byte("Quick safety check")
 
@@ -215,11 +218,12 @@ func extractOptions(lines []string) (opts []ModalOption, def int) {
 }
 
 // lineHasPermissionPrompt reports whether line is the permission modal's
-// proceed question, reusing the anchors from modal.go. The spaced anchor
-// matches Render output; the stripped anchor is checked too for robustness.
+// proceed question. line is a Render'd, space-normalized modal row, so the
+// space-preserved anchor is what matches. #154 removed the space-stripped
+// variant: it could never match a rendered line, so it was dead weight and the
+// last space-stripped classification anchor in the package.
 func lineHasPermissionPrompt(line string) bool {
-	b := []byte(line)
-	return bytes.Contains(b, anchorPermissionSpaced) || bytes.Contains(b, anchorPermissionStripped)
+	return bytes.Contains([]byte(line), anchorPermissionSpaced)
 }
 
 // isSeparatorLine reports whether line is the modal's box-drawing separator: a

@@ -1,7 +1,7 @@
 package tuidriver
 
 import (
-	"bytes"
+	"strings"
 )
 
 // ModalClass identifies which of claude's modal/picker UI states a PTY
@@ -42,57 +42,47 @@ const (
 )
 
 // Modal-class detection anchors. Each is unique to its class — verified
-// empirically across loops 1-6 plus the 2026-05-18 API-extending probes.
-// CSI cursor-forward stripping eats inter-word spaces in some renderings
-// (Bash-style), so predicates match both space-stripped and space-
-// preserved forms where claude varies.
+// empirically across loops 1-6 plus the 2026-05-18 API-extending probes, and
+// re-verified against the rendered grid on 2026-07-06 (#152).
+//
+// Anchors key on the SPACE-PRESERVED form — the text as it appears in the
+// rendered screen grid. #152 moved DetectModalClass from a StripANSI substring
+// scan of the raw history buffer onto the #150 rendered Grid. Rendering (vt10x)
+// reconstructs the column spacing that StripANSI destroyed by eating CSI
+// cursor-forward moves, so the on-screen form is what matches. The old
+// space-stripped variants ("ManageMCPservers", "Doyouwanttoproceed", …) were an
+// artifact of that stripping — they can never appear in a rendered grid — and
+// are removed here rather than carried as dead no-op checks.
 //
 // Anchors are unexported — consumers call DetectModalClass rather than
-// matching directly. The literal forms are documented here for readers.
+// matching directly. Literal forms, matched against the rendered grid:
 //
-//	mcp                 → "ManageMCPservers" or "Manage MCP servers" (the
-//	                      modal title), or the strict-mcp inline empty-state
-//	                      "No MCP servers configured" / "NoMCPserversconfigured"
-//	                      (claude 2.1.158 renders the empty-state instead of
-//	                      the modal under --strict-mcp-config — see #128)
+//	mcp                 → "Manage MCP servers" (modal title) or the strict-mcp
+//	                      inline empty-state "No MCP servers configured" (#128)
 //	agents              → "Agents" header + "Running" or "Library" tab
 //	                      (pre-2.1.199 only — see ModalClassAgents)
-//	slash-picker        → an on-screen rendered row that starts with `/<letter>`
-//	                      AND picker highlight chrome (a foreground in
-//	                      pickerHighlightedRGBs) — see isSlashPicker
-//	ask-user-question   → "Entertoselect" or "Enter to select"
-//	trust-folder        → "Quicksafetycheck"
-//	permission          → "Doyouwanttoproceed" or "Do you want to proceed"
-//	model-select        → "Selectmodel" or "Select model" (the `/model` modal)
+//	ask-user-question   → "Enter to select"
+//	trust-folder        → "Quick safety check" (anchorTrustHeaderSpaced, defined
+//	                      in permission.go beside the trust-modal extractor)
+//	permission          → "Do you want to proceed" — region-scoped to the
+//	                      bottom overlay window (permissionRegionRows)
+//	model-select        → "Select model" (the `/model` modal)
 //	permissions-config  → "Permissions" header + one of Allow/Ask/Deny tabs
 //
-// slash-picker classification (isSlashPicker in picker.go) combines two
-// signals of different fabric: an on-screen rendered row that begins
-// `/<letter>` (located from #150's Grid, so scrolled-off history is
-// excluded) AND picker highlight chrome (a foreground color in
-// pickerHighlightedRGBs). Both are required. Row location alone
-// false-positived on benign content — the "? for shortcuts" hint bar at
-// idle (guarded by the `/`-prefix, which the hint line lacks) and, more
-// insidiously, a lone absolute path like `/Users/x/file.go` on screen.
-// Requiring chrome rejects the path; requiring an on-screen row rejects
-// off-screen matches. This is a separate path from ParsePicker, which
-// still uses findPickerRows on the raw color-preserving bytes; the two
-// diverge deliberately (ParsePicker runs only after classification
-// confirms a picker), so a grid/color split here does not touch parsing.
+// slash-picker classification (isSlashPicker in picker.go) combines two signals
+// of different fabric: an on-screen rendered row that begins `/<letter>`
+// (located from #150's Grid, so scrolled-off history is excluded) AND picker
+// highlight chrome (a foreground color in pickerHighlightedRGBs). Both are
+// required. It runs LAST (see DetectModalClass) and reuses the grid this
+// function already built.
 var (
-	anchorMCP                 = []byte("ManageMCPservers")
 	anchorMCPSpaced           = []byte("Manage MCP servers")
 	anchorMCPEmptySpaced      = []byte("No MCP servers configured")
-	anchorMCPEmptyStripped    = []byte("NoMCPserversconfigured")
 	anchorAgentsHeader        = []byte("Agents")
 	anchorAgentsTabRunning    = []byte("Running")
 	anchorAgentsTabLibrary    = []byte("Library")
-	anchorAskUserStripped     = []byte("Entertoselect")
 	anchorAskUserSpaced       = []byte("Enter to select")
-	anchorTrustFolder         = []byte("Quicksafetycheck")
-	anchorPermissionStripped  = []byte("Doyouwanttoproceed")
 	anchorPermissionSpaced    = []byte("Do you want to proceed")
-	anchorModelSelectStripped = []byte("Selectmodel")
 	anchorModelSelectSpaced   = []byte("Select model")
 	anchorPermissionsHeader   = []byte("Permissions")
 	anchorPermissionsTabAllow = []byte("Allow")
@@ -100,56 +90,80 @@ var (
 	anchorPermissionsTabDeny  = []byte("Deny")
 )
 
+// permissionRegionRows bounds how far up from the bottom of the rendered screen
+// the permission overlay's "Do you want to proceed?" line may sit and still
+// count. The real overlay renders that line ~5 rows from the bottom
+// (permission-snapshot.bin); the prompt always sits just above its numbered
+// options and the "(Esc to cancel)" footer, so this window covers it with
+// slack even for a modal with several options. Scoping the match to this bottom
+// window is what rejects an identical "Do you want to proceed?" phrase forged
+// higher up in the on-screen transcript body — the CRITICAL B case that a
+// whole-buffer or whole-grid match would misclassify as Permission.
+const permissionRegionRows = 12
+
+// gridContains reports whether sub appears within any rendered screen row of g.
+// This is the whole-visible-grid match used by the full-panel modal classes
+// (mcp, agents, model-select, permissions-config, trust-folder): the grid
+// already excludes scrolled-off history, so a panel anchor cannot be forged by
+// text that scrolled above the screen. The bottom-overlay class (permission)
+// uses Grid.ContainsInLastRows instead, to additionally reject an on-screen
+// transcript forgery rendered above the overlay.
+func gridContains(g *Grid, sub []byte) bool {
+	s := string(sub)
+	for _, row := range g.Rows() {
+		if strings.Contains(row, s) {
+			return true
+		}
+	}
+	return false
+}
+
 // DetectModalClass classifies the modal/picker currently rendered in snap.
-// Cheap predicate: StripANSI + StripOSC + substring matches for the specific
-// anchors, then a grid-plus-chrome slash-picker check (isSlashPicker) as the
-// last resort. Use Render (vt10x-backed) when you need to extract content from
-// the modal, not just classify it.
+// It renders snap once via the #150 Grid and matches each class's anchor
+// against the rendered screen rows — never a StripANSI substring over the raw
+// append-only history buffer. Full-panel classes match anywhere in the visible
+// grid; the permission overlay is region-scoped to the bottom window
+// (permissionRegionRows). Use Render/ParseModalContent when you need to extract
+// content from the modal, not just classify it.
 //
 // Order of checks is significant: the specific anchors run first and the
 // slash-picker check runs LAST (#151). The picker's signal is the most
 // permissive (any on-screen `/`-row plus a highlight color), so a real modal
 // that merely has a `/`-path on screen — e.g. a permission prompt showing a
 // file path — must match its own anchor before the picker is even considered.
-// Checking the picker first misclassified such modals and suppressed their
-// auto-answer.
+// The single grid built here is threaded into the picker check so the snapshot
+// is rendered only once.
 //
-// Returns ModalClassUnknown when no anchor matches (the common case at
-// idle — no modal currently rendered).
+// Returns ModalClassUnknown when no anchor matches (the common case at idle —
+// no modal currently rendered).
 func DetectModalClass(snap []byte) ModalClass {
-	stripped := StripOSC(StripANSI(snap))
+	g := NewGrid(snap, 0, 0)
 	switch {
-	case bytes.Contains(stripped, anchorMCP) ||
-		bytes.Contains(stripped, anchorMCPSpaced) ||
-		bytes.Contains(stripped, anchorMCPEmptySpaced) ||
-		bytes.Contains(stripped, anchorMCPEmptyStripped):
+	case gridContains(g, anchorMCPSpaced) || gridContains(g, anchorMCPEmptySpaced):
 		return ModalClassMCP
-	case bytes.Contains(stripped, anchorAgentsHeader) &&
-		(bytes.Contains(stripped, anchorAgentsTabRunning) ||
-			bytes.Contains(stripped, anchorAgentsTabLibrary)):
+	case gridContains(g, anchorAgentsHeader) &&
+		(gridContains(g, anchorAgentsTabRunning) ||
+			gridContains(g, anchorAgentsTabLibrary)):
 		return ModalClassAgents
-	case bytes.Contains(stripped, anchorAskUserStripped) ||
-		bytes.Contains(stripped, anchorAskUserSpaced):
+	case gridContains(g, anchorAskUserSpaced):
 		return ModalClassAskUserQuestion
-	case bytes.Contains(stripped, anchorTrustFolder):
+	case gridContains(g, anchorTrustHeaderSpaced):
 		return ModalClassTrustFolder
-	case bytes.Contains(stripped, anchorPermissionStripped) ||
-		bytes.Contains(stripped, anchorPermissionSpaced):
+	case g.ContainsInLastRows(string(anchorPermissionSpaced), permissionRegionRows):
 		return ModalClassPermission
-	case bytes.Contains(stripped, anchorModelSelectStripped) ||
-		bytes.Contains(stripped, anchorModelSelectSpaced):
+	case gridContains(g, anchorModelSelectSpaced):
 		return ModalClassModelSelect
-	case bytes.Contains(stripped, anchorPermissionsHeader) &&
-		(bytes.Contains(stripped, anchorPermissionsTabAllow) ||
-			bytes.Contains(stripped, anchorPermissionsTabAsk) ||
-			bytes.Contains(stripped, anchorPermissionsTabDeny)):
+	case gridContains(g, anchorPermissionsHeader) &&
+		(gridContains(g, anchorPermissionsTabAllow) ||
+			gridContains(g, anchorPermissionsTabAsk) ||
+			gridContains(g, anchorPermissionsTabDeny)):
 		return ModalClassPermissionsConfig
 	}
 	// Slash-picker is the last resort: reached only when no specific anchor
 	// matched. It requires an on-screen `/`-row AND picker highlight chrome
 	// (see isSlashPicker), so a real modal carrying a `/`-path wins above and a
-	// lone path at idle never phantom-pickers.
-	if isSlashPicker(snap) {
+	// lone path at idle never phantom-pickers. Reuses the grid built above.
+	if isSlashPickerWithGrid(g, snap) {
 		return ModalClassSlashPicker
 	}
 	return ModalClassUnknown

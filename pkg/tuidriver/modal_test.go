@@ -3,6 +3,7 @@ package tuidriver
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -15,16 +16,16 @@ func TestDetectModalClassUnknownOnEmpty(t *testing.T) {
 	}
 }
 
+// Spaced-form and multi-part synthetic anchors classify against the rendered
+// grid. Since #152 the anchors key on the space-preserved on-screen form.
 func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 	cases := []struct {
 		name string
 		in   []byte
 		want ModalClass
 	}{
-		{"mcp space-stripped", []byte("...ManageMCPservers..."), ModalClassMCP},
 		{"mcp spaced title", []byte("...Manage MCP servers..."), ModalClassMCP},
 		{"mcp empty-state spaced", []byte("...No MCP servers configured. Please run /doctor..."), ModalClassMCP},
-		{"mcp empty-state stripped", []byte("...NoMCPserversconfigured.Pleaserun/doctor..."), ModalClassMCP},
 		{"agents header + running tab", []byte("...Agents...Running..."), ModalClassAgents},
 		{"agents header + library tab", []byte("...Agents...Library..."), ModalClassAgents},
 		{
@@ -71,12 +72,9 @@ func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 			[]byte("see /usr/local/bin for binaries"),
 			ModalClassUnknown,
 		},
-		{"ask-user stripped", []byte("...Entertoselect..."), ModalClassAskUserQuestion},
 		{"ask-user spaced", []byte("...Enter to select..."), ModalClassAskUserQuestion},
-		{"trust-folder", []byte("...Quicksafetycheck..."), ModalClassTrustFolder},
-		{"permission stripped", []byte("...Doyouwanttoproceed..."), ModalClassPermission},
+		{"trust-folder spaced", []byte("...Quick safety check..."), ModalClassTrustFolder},
 		{"permission spaced", []byte("...Do you want to proceed..."), ModalClassPermission},
-		{"model-select stripped", []byte("...Selectmodel..."), ModalClassModelSelect},
 		{"model-select spaced", []byte("...Select model..."), ModalClassModelSelect},
 		{"permissions-config + Allow tab", []byte("Permissions header...Allow rules"), ModalClassPermissionsConfig},
 		{"permissions-config + Ask tab", []byte("Permissions...Ask before"), ModalClassPermissionsConfig},
@@ -89,6 +87,75 @@ func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 				t.Errorf("DetectModalClass(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// #152: the space-stripped anchor forms were a StripANSI artifact (CSI
+// cursor-forward moves eating inter-word spaces). The rendered grid restores
+// that spacing, so these forms can never appear in it. DetectModalClass now
+// matches the grid, so they no longer classify — the dead variants were removed,
+// not carried as no-op checks (AC).
+func TestDetectModalClassStrippedFormsNoLongerMatch(t *testing.T) {
+	for _, in := range []string{
+		"...ManageMCPservers...",
+		"...NoMCPserversconfigured.Pleaserun/doctor...",
+		"...Entertoselect...",
+		"...Quicksafetycheck...",
+		"...Doyouwanttoproceed...",
+		"...Selectmodel...",
+	} {
+		if got := DetectModalClass([]byte(in)); got != ModalClassUnknown {
+			t.Errorf("DetectModalClass(%q) = %q, want Unknown (stripped form must not classify)", in, got)
+		}
+	}
+}
+
+// TestDetectModalClassPermissionRegion is the CRITICAL B regression: an
+// identical "Do you want to proceed?" phrase forged in the on-screen transcript
+// body ABOVE the overlay must not classify as Permission, while the same phrase
+// in the live bottom overlay region must. Uses \r\n so vt10x renders flat rows
+// (the #150 grid fixture lesson).
+func TestDetectModalClassPermissionRegion(t *testing.T) {
+	const prompt = "Do you want to proceed?"
+	body := strings.Repeat("transcript body line\r\n", 25)
+
+	// Forged above the overlay: the prompt at the top, pushed far above the
+	// bottom region by the transcript body below it.
+	forged := []byte(prompt + "\r\n" + body)
+	// Sanity: a naive whole-snapshot substring match WOULD misclassify this —
+	// the region scoping is exactly what rejects it.
+	if !strings.Contains(string(forged), "Do you want to proceed") {
+		t.Fatal("fixture lost the forged phrase")
+	}
+	if got := DetectModalClass(forged); got != ModalClassUnknown {
+		t.Errorf("forged-above-region: DetectModalClass = %q, want Unknown", got)
+	}
+
+	// Live overlay: the prompt sits in the bottom region, above its options and
+	// the Esc footer, exactly as the real modal renders.
+	live := []byte(body + prompt + "\r\n❯ 1. Yes\r\n  2. No\r\n(Esc to cancel)\r\n")
+	if got := DetectModalClass(live); got != ModalClassPermission {
+		t.Errorf("live-overlay: DetectModalClass = %q, want Permission", got)
+	}
+}
+
+func TestDetectModalClassMatchesControlSequenceWrappedAnchor(t *testing.T) {
+	// Spaced anchor wrapped in CSI + OSC noise — the grid render consumes the
+	// control sequences and preserves the spacing, so the predicate still
+	// matches.
+	in := []byte("\x1b[1m\x1b]0;title text\x07Manage MCP servers\x1b[0m")
+	if got := DetectModalClass(in); got != ModalClassMCP {
+		t.Errorf("DetectModalClass(wrapped) = %q, want %q", got, ModalClassMCP)
+	}
+}
+
+func TestDetectModalClassAgentsNeedsHeaderAndTab(t *testing.T) {
+	// "Agents" header alone is NOT enough — claude renders the word in
+	// many contexts (e.g. `← for agents` status bar). Requires Running or
+	// Library tab adjacency.
+	in := []byte("...press ← for agents...")
+	if got := DetectModalClass(in); got == ModalClassAgents {
+		t.Errorf("DetectModalClass(status-bar only) = %q, want NOT agents", got)
 	}
 }
 
@@ -161,26 +228,10 @@ func TestDetectModalClassSlashPickerContract(t *testing.T) {
 	})
 }
 
-func TestDetectModalClassStripsANSIAndOSCBeforeMatching(t *testing.T) {
-	// Anchor wrapped in CSI + OSC noise — predicate should still match.
-	in := []byte("\x1b[1m\x1b]0;title text\x07ManageMCPservers\x1b[0m")
-	if got := DetectModalClass(in); got != ModalClassMCP {
-		t.Errorf("DetectModalClass(wrapped) = %q, want %q", got, ModalClassMCP)
-	}
-}
-
-func TestDetectModalClassAgentsNeedsHeaderAndTab(t *testing.T) {
-	// "Agents" header alone is NOT enough — claude renders the word in
-	// many contexts (e.g. `← for agents` status bar). Requires Running or
-	// Library tab adjacency.
-	in := []byte("...press ← for agents...")
-	if got := DetectModalClass(in); got == ModalClassAgents {
-		t.Errorf("DetectModalClass(status-bar only) = %q, want NOT agents", got)
-	}
-}
-
-// Fixture-based regression: real captured /mcp + /agents + slash-picker
-// snapshots from spike-multiselect runs must classify correctly.
+// Fixture-based regression: real captured snapshots must classify correctly
+// against the grid. #152 adds permission-snapshot.bin and trust-folder-
+// snapshot.bin — both classes it ports have a real fixture, so pin them to real
+// coverage, not just synthetic.
 func TestDetectModalClassRealFixtures(t *testing.T) {
 	cases := []struct {
 		fixture string
@@ -191,6 +242,8 @@ func TestDetectModalClassRealFixtures(t *testing.T) {
 		{"agents-snapshot.bin", ModalClassAgents},
 		{"picker-snapshot.bin", ModalClassSlashPicker},
 		{"picker-truecolor-snapshot.bin", ModalClassSlashPicker},
+		{"permission-snapshot.bin", ModalClassPermission},
+		{"trust-folder-snapshot.bin", ModalClassTrustFolder},
 	}
 	for _, tc := range cases {
 		t.Run(tc.fixture, func(t *testing.T) {
@@ -202,5 +255,80 @@ func TestDetectModalClassRealFixtures(t *testing.T) {
 				t.Errorf("DetectModalClass(%s) = %q, want %q", tc.fixture, got, tc.want)
 			}
 		})
+	}
+}
+
+// #152: three classes have no usable real .bin fixture (ask-user-question's is a
+// JSONL dump that DetectModalClass returns Unknown for; model-select and
+// permissions-config have none). Cover them with synthetic multi-row grids built
+// with \r\n so vt10x renders flat rows.
+func TestDetectModalClassSyntheticGridFixtures(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+		want ModalClass
+	}{
+		{
+			"ask-user-question grid",
+			[]byte("Which option do you prefer?\r\n❯ 1. Alpha\r\n  2. Beta\r\n(Enter to select · Esc to cancel)\r\n"),
+			ModalClassAskUserQuestion,
+		},
+		{
+			"model-select grid",
+			[]byte("Select model\r\n❯ 1. Default (recommended)\r\n  2. Opus\r\n  3. Sonnet\r\n"),
+			ModalClassModelSelect,
+		},
+		{
+			"permissions-config grid with Allow/Ask/Deny tabs",
+			[]byte("Permissions\r\nAllow   Ask   Deny\r\n  No rules configured\r\n"),
+			ModalClassPermissionsConfig,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DetectModalClass(tc.in); got != tc.want {
+				t.Errorf("DetectModalClass(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDetectModalClassMCPAnchorScrolledOffNotModal is the #155 content-forgery
+// regression for the mcp panel (CRITICAL B: "N MCP servers failed" in a pasted
+// log forges the modal). mcp is a full-panel class matched across the whole
+// visible grid — its title renders ~24 rows from the bottom, so a bottom-region
+// window can't be used (#152). The guard for panels is therefore the grid
+// excluding scrolled-off history: a real MCP anchor printed as a transcript/log
+// line that has scrolled off the top of the visible screen must not classify.
+// A naive bytes/strings.Contains over the raw buffer WOULD forge it.
+//
+// The permission body-forgery case (AC #2) is pinned separately by
+// TestDetectModalClassPermissionRegion; the idle/busy pair by #153 in
+// state_test.go. Do not duplicate them here.
+func TestDetectModalClassMCPAnchorScrolledOffNotModal(t *testing.T) {
+	rows := []string{"No MCP servers configured"} // a real mcp anchor, as a log line
+	for i := 0; i < 45; i++ {                      // enough output to scroll it off a 40-row screen
+		rows = append(rows, "transcript body line")
+	}
+	rows = append(rows, "❯ ") // idle prompt at the bottom; no modal is up
+	forged := gridRows(rows...)
+
+	// Contrast that makes the test non-vacuous: the anchor IS in the raw bytes,
+	// so a naive whole-buffer substring match would forge MCP. The grid never
+	// sees it because it scrolled off the visible screen.
+	if !strings.Contains(string(forged), "No MCP servers configured") {
+		t.Fatal("fixture lost the forged anchor — the forgery contrast is void")
+	}
+	if got := DetectModalClass(forged); got != ModalClassUnknown {
+		t.Errorf("scrolled-off mcp anchor: DetectModalClass = %q, want Unknown", got)
+	}
+
+	// Positive control: the genuine mcp panel still classifies.
+	snap, err := os.ReadFile(filepath.Join("testdata", "mcp-snapshot.bin"))
+	if err != nil {
+		t.Fatalf("read mcp fixture: %v", err)
+	}
+	if got := DetectModalClass(snap); got != ModalClassMCP {
+		t.Errorf("mcp-snapshot.bin positive control: DetectModalClass = %q, want MCP", got)
 	}
 }

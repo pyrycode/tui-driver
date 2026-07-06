@@ -141,8 +141,10 @@ func TestMergeEvents_ModalShowAndHide(t *testing.T) {
 	}
 
 	// Phase 2: class change Permission → MCP. Two events in order:
-	// Hidden(Permission) then Shown(MCP).
-	snap.Set([]byte("ManageMCPservers"))
+	// Hidden(Permission) then Shown(MCP). Spaced form: DetectModalClass matches
+	// the rendered grid since #152, so the on-screen "Manage MCP servers" (not
+	// the old StripANSI-stripped variant) is what classifies.
+	snap.Set([]byte("Manage MCP servers"))
 	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
 	if ev.Kind != EventKindPtyModalHidden {
 		t.Errorf("phase 2a Kind = %v, want EventKindPtyModalHidden", ev.Kind)

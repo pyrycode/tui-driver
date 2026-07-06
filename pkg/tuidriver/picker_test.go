@@ -193,3 +193,35 @@ func TestIsSlashPicker(t *testing.T) {
 		})
 	}
 }
+
+// TestPickerAbsolutePathForgeryNotClassified is the #155 content-forgery
+// regression for the slash-picker (CRITICAL A: a lone absolute path on screen
+// used to downgrade a real modal or phantom-picker at idle). An absolute path as
+// the sole `/`-prefixed line, with no picker highlight chrome, must not classify
+// as a picker: isSlashPicker requires an on-screen `/`-row AND chrome (#151), so
+// the path (row present, chrome absent) is rejected at classification.
+//
+// Note on ParsePicker and AC #1's "ParsePicker → nil": ParsePicker is
+// deliberately permissive and classification-gated (#151). findPickerRows
+// matches any `/`-line, so ParsePicker returns the path as an item if called
+// directly; it is only ever called AFTER DetectModalClass confirms a picker. So
+// the real guard against this forgery is DetectModalClass → Unknown (asserted
+// here), not an independent ParsePicker check.
+func TestPickerAbsolutePathForgeryNotClassified(t *testing.T) {
+	forged := gridRows("Reading the file:", "/Users/x/file.go") // sole /-line, no chrome
+	if got := DetectModalClass(forged); got != ModalClassUnknown {
+		t.Errorf("absolute-path forgery: DetectModalClass = %q, want Unknown", got)
+	}
+
+	// Positive control: a genuine highlighted picker still classifies and parses.
+	snap, err := os.ReadFile(filepath.Join("testdata", "picker-snapshot.bin"))
+	if err != nil {
+		t.Fatalf("read picker fixture: %v", err)
+	}
+	if got := DetectModalClass(snap); got != ModalClassSlashPicker {
+		t.Errorf("picker-snapshot.bin control: DetectModalClass = %q, want SlashPicker", got)
+	}
+	if items := ParsePicker(snap); len(items) == 0 {
+		t.Error("picker-snapshot.bin control: ParsePicker returned 0 items, want > 0")
+	}
+}
