@@ -17,9 +17,9 @@ var networkFailureAnchors = [][]byte{
 
 // HasNetworkFailure reports whether snap contains evidence of a network-
 // reachability failure to the claude API. Detects the same condition the
-// watchdog would eventually catch (spinner-freeze / PTY-quiet) but
-// earlier — useful for consumers that want to surface the failure to a
-// host UI before falling back to the watchdog timeout.
+// watchdog would eventually catch (PTY-quiet) but earlier — useful for
+// consumers that want to surface the failure to a host UI before falling
+// back to the watchdog timeout.
 //
 // Does NOT cover authentication failures (those render differently —
 // "Please run /login" appears at startup, before the welcome banner).
