@@ -277,6 +277,18 @@ func buildChecks(runVersionLock func(ctx context.Context) (string, map[string]an
 			SuccessMarker: observedSuccess,
 		},
 		{
+			Name:          "spike-queued-modals",
+			Kind:          "spike",
+			Binary:        "spike-queued-modals",
+			Args:          commonArgs,
+			SuccessMarker: observedSuccess,
+			// Two approvals + two fast tool executions + settle windows run
+			// ~20-40s; 120s gives ~3-6x margin. The spike's own 120s PTY-quiet
+			// watchdog bounds a true hang. Tunable after the first live run
+			// (same posture as spike-cancel #69 / spike-multi-turn #111).
+			Timeout: 120 * time.Second,
+		},
+		{
 			Name:          "spike-long-prompt",
 			Kind:          "spike",
 			Binary:        "spike-long-prompt",
