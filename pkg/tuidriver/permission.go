@@ -44,9 +44,12 @@ type ModalOption struct {
 // already clean. Group 1 (the marker) marks the pre-selected default.
 var modalOptionRe = regexp.MustCompile(`^(❯\s*)?(\d+)\.\s*(.+)$`)
 
-// anchorTrustHeaderSpaced locates the trust-folder header line in Render
-// output (cursor-forwards expanded back to spaces, so the space-stripped
-// anchorTrustFolder from modal.go does not match the rendered line). Kept
+// anchorTrustHeaderSpaced is the trust-folder header line as it renders on the
+// screen grid (cursor-forwards expanded back to spaces). It is the single
+// space-preserved trust anchor: ParseModalContent uses it to locate the header
+// for extraction, and since #152 DetectModalClass matches it against the
+// rendered grid to classify ModalClassTrustFolder (replacing the old
+// space-stripped modal.go anchor, which the grid never produces). Kept
 // unexported per the package's screen-literal discipline.
 var anchorTrustHeaderSpaced = []byte("Quick safety check")
 

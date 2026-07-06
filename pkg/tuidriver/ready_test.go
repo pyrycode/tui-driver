@@ -37,9 +37,11 @@ func TestWaitReady(t *testing.T) {
 		},
 		{
 			// A recognized modal that no other Readiness field surfaces (here a
-			// permission prompt) sets UnknownModal.
+			// permission prompt) sets UnknownModal. Spaced form: since #152
+			// DetectModalClass matches the rendered grid, so the on-screen
+			// "Do you want to proceed" is what classifies as Permission.
 			name: "unrecognized modal at idle",
-			snap: append([]byte("Doyouwanttoproceed"), idle...),
+			snap: append([]byte("Do you want to proceed"), idle...),
 			want: Readiness{Idle: true, UnknownModal: true},
 		},
 	}

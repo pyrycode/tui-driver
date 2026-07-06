@@ -213,7 +213,15 @@ func gridHasPickerRow(g *Grid) bool {
 // phantom-pickering, while a genuine single-match filtered picker (one `/`-row
 // painted in the highlight shade) still classifies.
 func isSlashPicker(snap []byte) bool {
-	if !gridHasPickerRow(NewGrid(snap, 0, 0)) {
+	return isSlashPickerWithGrid(NewGrid(snap, 0, 0), snap)
+}
+
+// isSlashPickerWithGrid is isSlashPicker over a grid the caller already built.
+// DetectModalClass renders the snapshot once and threads that grid in here so
+// classification does not render twice (#152). snap is still needed for the
+// chrome check, which reads the raw color bytes the grid discards.
+func isSlashPickerWithGrid(g *Grid, snap []byte) bool {
+	if !gridHasPickerRow(g) {
 		return false
 	}
 	return snapHasPickerHighlight(snap)
