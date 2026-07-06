@@ -26,8 +26,11 @@ const (
 // positioning escapes like `\x1b[<col>G`, and naive stripping produces
 // truncated names like "claude.ai Gmail" → "laude.ai Gmail" (loop 6 F-1).
 //
-// For state predicates (HasTrustModal, isIdle) the cheaper StripANSI path
-// remains correct — those match on text content, not column layout.
+// State predicates that key on a space-preserved on-screen anchor (isIdle,
+// HasTrustModal, DetectModalClass) render via NewGrid for the same reason —
+// StripANSI eats the inter-word spacing those anchors match on. Only the
+// raw-byte telemetry extractors (ParseSpinner*) still take the cheaper
+// StripANSI path.
 //
 // cols, rows are the grid dimensions to render at. Pass 0 for either to
 // use the package defaults (DefaultGridCols / DefaultGridRows). Render with
