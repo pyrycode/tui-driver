@@ -78,7 +78,7 @@ The close is registered as `defer close(s.mirrorOut)` **after** `defer close(s.r
 
 `SendKeys` is left exactly as-is — its "not intended for production drivers" doc and all its tests are unchanged. The two coexist for different consumers; `writeRaw` was **not** re-scoped or renamed (that would create edit fan-out for zero benefit).
 
-Concurrent `AttachInput` + the reader goroutine are opposite directions on the PTY master (independently safe). Concurrent *writers* through `writeRaw` could interleave bytes — but that is a pre-existing property of every keystroke method, and an attach head has a single input source.
+Concurrent `AttachInput` + the reader goroutine are opposite directions on the PTY master (independently safe). Concurrent *writers* are serialized since [#171](../codebase/171.md): `writeRaw` — and the direct-writing prompt helpers (`WritePrompt`/`TypePrompt`/`ClearInputLine`) — all hold one session-level `writeMu` for the full duration of each logical write, so an `AttachInput` from the attach head can no longer land between two of a concurrent `TypePrompt`'s byte-writes and split the prompt. The tradeoff: `AttachInput` **blocks** for the whole span of a concurrent `TypePrompt` (payload × `PromptInterByteDelay` + `PromptCommitSettle`) — intended, since an attach keystroke injected mid-prompt would corrupt it. See [system-overview § Concurrency model](../architecture/system-overview.md#concurrency-model).
 
 ## The opaque-bytes-no-parse contract
 
