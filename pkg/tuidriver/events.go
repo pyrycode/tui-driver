@@ -2,6 +2,7 @@ package tuidriver
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -86,7 +87,25 @@ const (
 	// thinking / banner edges). No payload fields — the kind is the
 	// signal; consumers wanting the quiet duration call Session.QuietFor.
 	EventKindStallDetected
+
+	// EventKindError is the terminal error signal: the internal JSONL
+	// tail goroutine hit a non-EOF read error and closed its stream
+	// while ctx was still live. Emitted at most once, immediately before
+	// Events()' channel closes; Err carries the reason (ErrJSONLTailRead)
+	// and Source is EventSourceJsonl. A clean shutdown (ctx cancel, or
+	// EOF-then-cancel) closes the stream without an EventKindError, so a
+	// consumer that only watches the stream can tell a broken tail apart
+	// from Claude finishing cleanly.
+	EventKindError
 )
+
+// ErrJSONLTailRead is the error carried by a terminal EventKindError:
+// the internal JSONL tail's underlying read failed with a non-EOF error
+// while ctx was still live. Match it with
+// errors.Is(ev.Err, ErrJSONLTailRead). It marks that the tail broke, not
+// why — it does not wrap the os-level read cause (see spec #167
+// § Error handling).
+var ErrJSONLTailRead = errors.New("tuidriver: jsonl tail read failed")
 
 // EventSource tags an Event with its origin. Redundant with Kind for
 // the cases consumers care about; convenient for switches that
@@ -114,6 +133,8 @@ const (
 //     entry.
 //   - EventKindStallDetected: no payload fields. The kind is the
 //     signal; consumers wanting the quiet duration call Session.QuietFor.
+//   - EventKindError: Err carries the terminal reason (ErrJSONLTailRead);
+//     Source is EventSourceJsonl. No other payload field is populated.
 //
 // Time is the wall-clock instant the merge loop detected the event —
 // the poll tick for PTY events, the channel-receive instant for JSONL
@@ -125,6 +146,7 @@ type Event struct {
 	Time   time.Time
 	Modal  ModalClass // populated only on EventKindPtyModal*
 	Entry  JSONLEntry // populated only on EventKindJsonl*
+	Err    error      // populated only on EventKindError
 }
 
 // Events spawns a merge goroutine that emits PTY-state transitions
@@ -136,7 +158,11 @@ type Event struct {
 // returned directly with the wrap shape TailJSONL provides. The
 // returned channel is buffered (capacity 32 — matches TailJSONL); it
 // is closed when ctx is cancelled, when the internal JSONL tail
-// closes, or when the session terminates.
+// closes, or when the session terminates. If the internal JSONL tail
+// hits a runtime (non-EOF) read error, a single terminal
+// EventKindError carrying ErrJSONLTailRead is emitted immediately
+// before the channel closes; a clean shutdown (ctx cancel or
+// EOF-then-cancel) emits no such event.
 //
 // The merge loop is single-threaded with respect to the output
 // channel — at most one Event is emitted per select iteration; the
@@ -226,6 +252,22 @@ func mergeEvents(
 			return
 		case e, ok := <-jsonlCh:
 			if !ok {
+				// The tail closes jsonlCh with ctx still live ONLY on its
+				// default: read-error arm (jsonl.go) — every other tail
+				// exit is ctx-driven. So ctx.Err()==nil here means the tail
+				// broke on a read; emit one terminal EventKindError before
+				// the deferred close(out) so a stream-only consumer can
+				// tell failure from a clean end. ctx.Err()!=nil is a clean
+				// shutdown: emit nothing. (Reverses spec #61's out-of-band
+				// discriminator; see spec #167.)
+				if ctx.Err() == nil {
+					_ = send(Event{
+						Kind:   EventKindError,
+						Source: EventSourceJsonl,
+						Time:   time.Now(),
+						Err:    ErrJSONLTailRead,
+					})
+				}
 				return
 			}
 			now := time.Now()

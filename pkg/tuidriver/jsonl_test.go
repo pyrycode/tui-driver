@@ -378,6 +378,56 @@ func TestTailJSONL_ContextCancellationMidRead(t *testing.T) {
 	}
 }
 
+// errBoom is a non-EOF read fault injected via faultReader.
+var errBoom = errors.New("boom: injected read fault")
+
+// faultReader is an io.ReadCloser test seam: it hands out its scripted
+// good bytes, then returns errBoom (a non-EOF error) on the next Read.
+// It injects the runtime read error the tail loop's default: arm exits
+// on — the failure mode a real *os.File cannot be made to produce
+// deterministically. Shared with events_test.go (same package).
+type faultReader struct {
+	data []byte // remaining good bytes to hand out before the fault
+}
+
+func (r *faultReader) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	return 0, errBoom
+}
+
+func (r *faultReader) Close() error { return nil }
+
+func TestTailJSONLLoop_ReadErrorClosesChannelCtxLive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := &faultReader{data: []byte(`{"type":"good"}` + "\n")}
+	ch := make(chan JSONLEntry, defaultJSONLTailBuffer)
+	go tailJSONLLoop(ctx, r, ch)
+
+	// The one scripted good line arrives first...
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "good" {
+		t.Fatalf("entry Type = %q, want %q", got, "good")
+	}
+	// ...then the injected read fault drives the default: arm, which
+	// closes ch with ctx STILL LIVE — the invariant mergeEvents relies on
+	// to tell a read error apart from a ctx-driven shutdown.
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatalf("got entry instead of close after read fault")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("channel did not close within 500ms after read fault")
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("ctx.Err() = %v, want nil (read-error exit must not touch ctx)", ctx.Err())
+	}
+}
+
 func TestTailJSONL_EOFAppendCycles(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "session.jsonl")
