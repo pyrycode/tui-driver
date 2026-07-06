@@ -120,7 +120,7 @@ const defaultPrompt = "In a single step, do these two independent things at once
 // own answer count.
 type observation struct {
 	modalBObserved  bool // a DISTINCT permission modal was present after A's `1\r`
-	parallelToolUse bool // some assistant message carried >=2 tool_use blocks
+	parallelToolUse bool // some assistant message (grouped by msg_id) carried >=2 tool_use blocks
 	modalsAnswered  int  // modals the spike explicitly answered (1 or 2)
 	toolsExecuted   int  // tool_result blocks seen in JSONL
 }
@@ -372,11 +372,10 @@ func run(prompt, trustFolderPolicy string) error {
 	// here no successor is expected, so its class-level dismissal confirm is
 	// sound and this exercises the production answer surface). ---
 	var (
-		parallelToolUse bool
 		toolsExecuted   int
 		modalBObserved  bool
 		gotEndTurn      bool
-		distinctTools   = map[string]bool{}
+		assistantEvents []tuidriver.JSONLEntry
 	)
 
 	tr.RecordTransition("observe-b-start")
@@ -395,17 +394,13 @@ func run(prompt, trustFolderPolicy string) error {
 			}
 			switch ev.Type {
 			case "assistant":
-				if n, names := toolUseBlocks(ev); n > 0 {
-					if n >= 2 {
-						if !parallelToolUse {
-							logger.Printf("parallel-tool-use-observed blocks=%d names=%v", n, names)
-						}
-						parallelToolUse = true
-					}
-					for _, nm := range names {
-						distinctTools[nm] = true
-					}
-				}
+				// Retain the assistant event; parallel-tool-use detection is a
+				// cross-entry, msg_id-grouped computation (analyzeToolUse, run
+				// after the drain loop), NOT a per-entry one — claude serialises
+				// one assistant message as N JSONL lines, one tool_use block
+				// each, all sharing one msg_id, so a per-entry count of tool_use
+				// blocks never reaches 2 even for genuinely parallel calls.
+				assistantEvents = append(assistantEvents, ev)
 				if tuidriver.IsEndTurn(ev) {
 					gotEndTurn = true
 				}
@@ -445,6 +440,17 @@ func run(prompt, trustFolderPolicy string) error {
 	}
 	tr.RecordTransition("end-turn-detected")
 
+	// Parallel tool-use is read per msg_id, NOT per JSONL entry: a single
+	// assistant message serialises as N lines (one content block each) sharing
+	// one msg_id (docs/knowledge/architecture/jsonl-layout.md), so genuinely
+	// parallel tool calls arrive as separate single-block entries and a
+	// per-entry count never reaches 2. analyzeToolUse sums tool_use blocks by
+	// msg_id — the established cross-entry pattern (spike-multi-turn).
+	parallelToolUse, distinctTools := analyzeToolUse(assistantEvents)
+	if parallelToolUse {
+		logger.Printf("parallel-tool-use-observed distinct_tools=%v", distinctTools)
+	}
+
 	obs := observation{
 		modalBObserved:  modalBObserved,
 		parallelToolUse: parallelToolUse,
@@ -464,28 +470,47 @@ func run(prompt, trustFolderPolicy string) error {
 	return nil
 }
 
-// toolUseBlocks returns how many tool_use content blocks an assistant JSONL
-// entry carries and the tool names among them. A SINGLE assistant message
-// carrying >=2 tool_use blocks is claude genuinely queuing parallel tool
-// calls (the queued-B precondition this spike must confirm) — as opposed to
-// two tools issued sequentially across separate messages, which does not
-// queue two modals.
-func toolUseBlocks(ev tuidriver.JSONLEntry) (int, []string) {
-	if ev.Message == nil {
-		return 0, nil
-	}
-	n := 0
-	var names []string
-	for _, c := range ev.Message.Content {
-		if c.Type != "tool_use" {
+// analyzeToolUse groups tool_use content blocks across assistant JSONL entries
+// by msg_id and reports (a) whether any single assistant message carried >=2
+// tool_use blocks — the signal that claude genuinely QUEUED parallel tool
+// calls (the queued-B precondition this spike must confirm) — and (b) the
+// distinct tool names seen, in first-seen order.
+//
+// Grouping by msg_id is load-bearing. A single Anthropic assistant message is
+// serialised as N JSONL lines, ONE content block per line, all sharing one
+// msg_id (docs/knowledge/architecture/jsonl-layout.md § "One Anthropic
+// message ⇒ N JSONL lines"; cmd/spike-multi-turn's extractByMsgID). So for
+// genuinely parallel tool calls each tool_use arrives as its own entry with a
+// single-element Content — a per-ENTRY count of tool_use blocks never reaches
+// 2. The per-msg_id SUM is what distinguishes parallel queuing (>=2 tool_use
+// under one msg_id) from sequential calls (one tool_use under each of several
+// msg_ids, which does not queue two modals). Entries that are not assistant
+// envelopes, or carry no Message, contribute nothing.
+func analyzeToolUse(events []tuidriver.JSONLEntry) (parallel bool, distinct []string) {
+	counts := map[string]int{}
+	seen := map[string]bool{}
+	for _, ev := range events {
+		if ev.Type != "assistant" || ev.Message == nil {
 			continue
 		}
-		n++
-		if name, _ := c.Raw["name"].(string); name != "" {
-			names = append(names, name)
+		for _, c := range ev.Message.Content {
+			if c.Type != "tool_use" {
+				continue
+			}
+			counts[ev.Message.ID]++
+			if name, _ := c.Raw["name"].(string); name != "" && !seen[name] {
+				seen[name] = true
+				distinct = append(distinct, name)
+			}
 		}
 	}
-	return n, names
+	for _, n := range counts {
+		if n >= 2 {
+			parallel = true
+			break
+		}
+	}
+	return parallel, distinct
 }
 
 // toolResultBlocks counts tool_result content blocks in a user JSONL entry —

@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+
+	"github.com/pyrycode/tui-driver/pkg/tuidriver"
+)
 
 // TestClassify exercises the pure epistemic decision — one row per branch of
 // the decision table in classify's doc comment. This is the AC's
@@ -68,6 +73,122 @@ func TestClassify(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := classify(tc.obs); got != tc.want {
 				t.Errorf("classify(%+v) = %q, want %q", tc.obs, got, tc.want)
+			}
+		})
+	}
+}
+
+// asstToolUse builds an assistant JSONLEntry carrying one tool_use content
+// block per name — the on-the-wire shape claude emits (one block per line).
+func asstToolUse(msgID string, toolNames ...string) tuidriver.JSONLEntry {
+	blocks := make([]tuidriver.ContentBlock, 0, len(toolNames))
+	for _, n := range toolNames {
+		blocks = append(blocks, tuidriver.ContentBlock{
+			Type: "tool_use",
+			Raw:  map[string]any{"name": n},
+		})
+	}
+	return tuidriver.JSONLEntry{
+		Type:    "assistant",
+		Message: &tuidriver.EntryMessage{ID: msgID, Content: blocks},
+	}
+}
+
+// TestAnalyzeToolUse pins the msg_id-grouped parallel-tool-use detection. The
+// load-bearing row is "parallel calls across separate lines sharing one
+// msg_id": that is exactly how claude serialises genuinely parallel tool calls
+// (one content block per JSONL line, all under one msg_id —
+// docs/knowledge/architecture/jsonl-layout.md), and a per-ENTRY count of
+// tool_use blocks — the pre-fix implementation — would report `parallel=false`
+// for it, leaving the spike permanently stuck at `inconclusive`. This test is
+// the deterministic guard on the one measurement that gates every
+// non-inconclusive verdict.
+func TestAnalyzeToolUse(t *testing.T) {
+	tests := []struct {
+		name         string
+		events       []tuidriver.JSONLEntry
+		wantParallel bool
+		wantDistinct []string
+	}{
+		{
+			// THE regression case: two parallel tool calls, each its own JSONL
+			// line, both under one msg_id. Per-entry counting sees 1+1 and
+			// misses it; per-msg_id summing sees 2.
+			name: "parallel across separate lines, shared msg_id -> parallel",
+			events: []tuidriver.JSONLEntry{
+				asstToolUse("msgA", "Bash"),
+				asstToolUse("msgA", "Read"),
+			},
+			wantParallel: true,
+			wantDistinct: []string{"Bash", "Read"},
+		},
+		{
+			// Sequential: two tools, distinct msg_ids. No single message has 2.
+			name: "sequential across distinct msg_ids -> not parallel",
+			events: []tuidriver.JSONLEntry{
+				asstToolUse("msgA", "Bash"),
+				asstToolUse("msgB", "Read"),
+			},
+			wantParallel: false,
+			wantDistinct: []string{"Bash", "Read"},
+		},
+		{
+			// Belt: two tool_use blocks in ONE entry under one msg_id (should
+			// claude ever emit that shape) is still parallel — the per-msg_id
+			// sum subsumes the old per-entry check.
+			name: "two blocks in one entry, one msg_id -> parallel",
+			events: []tuidriver.JSONLEntry{
+				asstToolUse("msgA", "Bash", "Read"),
+			},
+			wantParallel: true,
+			wantDistinct: []string{"Bash", "Read"},
+		},
+		{
+			name: "single tool_use -> not parallel",
+			events: []tuidriver.JSONLEntry{
+				asstToolUse("msgA", "Bash"),
+			},
+			wantParallel: false,
+			wantDistinct: []string{"Bash"},
+		},
+		{
+			// Non-assistant and message-less entries contribute nothing; the
+			// two tool_use lines under msgA still make it parallel.
+			name: "user and message-less entries ignored",
+			events: []tuidriver.JSONLEntry{
+				{Type: "user", Message: &tuidriver.EntryMessage{ID: "u1", Content: []tuidriver.ContentBlock{{Type: "tool_result"}}}},
+				{Type: "assistant", Message: nil},
+				asstToolUse("msgA", "Bash"),
+				asstToolUse("msgA", "Read"),
+			},
+			wantParallel: true,
+			wantDistinct: []string{"Bash", "Read"},
+		},
+		{
+			// Text-only assistant message: no tool_use, not parallel, no names.
+			name: "text-only assistant -> not parallel",
+			events: []tuidriver.JSONLEntry{
+				{Type: "assistant", Message: &tuidriver.EntryMessage{ID: "msgA", Content: []tuidriver.ContentBlock{{Type: "text", Raw: map[string]any{"text": "hi"}}}}},
+			},
+			wantParallel: false,
+			wantDistinct: nil,
+		},
+		{
+			name:         "no events -> not parallel",
+			events:       nil,
+			wantParallel: false,
+			wantDistinct: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotParallel, gotDistinct := analyzeToolUse(tc.events)
+			if gotParallel != tc.wantParallel {
+				t.Errorf("analyzeToolUse parallel = %v, want %v", gotParallel, tc.wantParallel)
+			}
+			if !reflect.DeepEqual(gotDistinct, tc.wantDistinct) {
+				t.Errorf("analyzeToolUse distinct = %v, want %v", gotDistinct, tc.wantDistinct)
 			}
 		})
 	}

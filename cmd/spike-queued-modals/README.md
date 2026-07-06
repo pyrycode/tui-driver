@@ -75,9 +75,11 @@ Single session, single probe:
      survived** A's `\r`; snapshot B (0600) and answer it via `AnswerModal`
      (here the class-level confirm is sound — no successor expected);
    - no modal, the turn proceeds → **B not visible**.
-8. Accumulate from JSONL: `parallelToolUse` (any assistant message with
-   ≥2 `tool_use` blocks), `distinctTools`, `toolsExecuted` (`tool_result`
-   blocks in `user` entries).
+8. Accumulate from JSONL: `parallelToolUse` (any assistant message —
+   **grouped by `msg_id`** — carrying ≥2 `tool_use` blocks; claude serialises
+   one message as N lines, one content block each, sharing a `msg_id`, so the
+   count is summed per `msg_id`, not per JSONL line), `distinctTools`,
+   `toolsExecuted` (`tool_result` blocks in `user` entries).
 9. Feed the observation into the pure classifier and print `OBSERVED:`.
 
 ### Flags
