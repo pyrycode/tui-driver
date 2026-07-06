@@ -400,19 +400,32 @@ func (s *Session) LastAppendAt() time.Time { return s.buffer.LastAppendAt() }
 // best-effort and a dropped chunk heals on claude's next full repaint.
 func (s *Session) MirrorOutput() <-chan []byte { return s.mirrorOut }
 
-// Wait blocks until both the underlying process has exited AND the PTY
-// reader goroutine has drained the final bytes from the PTY master FD.
-// Returns the exit error (or nil for clean exit). Safe to call from
+// Wait blocks until the underlying process exits, then waits up to a bounded
+// grace (ShutdownGrace; DefaultShutdownGrace when unset) for the PTY reader
+// goroutine to drain the final bytes from the PTY master FD. Returns the
+// process's exit error (or nil for a clean exit) on both the drained and the
+// timed-out path — never a substitute or sentinel error. Safe to call from
 // multiple goroutines and before/after Close.
 //
-// After Wait returns, any bytes the reader wrote into the rolling buffer or
-// into the RecordTo recording before the subprocess exited are guaranteed
-// visible to the caller (happens-before via the readerDone channel close).
-// This is the synchronisation point for inspecting Snapshot() without racing
-// the reader.
+// Reader-drained path (normal): the reader drains within the grace. Once Wait
+// returns, any bytes the reader wrote into the rolling buffer or into the
+// RecordTo recording before the subprocess exited are guaranteed visible to
+// the caller (happens-before via the readerDone channel close). This is the
+// synchronisation point for inspecting Snapshot() without racing the reader.
+//
+// Bounded-grace path (timeout): if a tool grandchild inherited the PTY slave
+// FD and holds it open after the process exits, the master read never returns
+// EOF and the reader does not drain; Wait returns after the grace with the real
+// exit error, but the "final bytes guaranteed visible" guarantee above
+// explicitly no longer holds — Snapshot()/recording may be missing the
+// process's final bytes. Wait does not tear the reader down; it stays parked on
+// the PTY read until a later Close() closes the master and reaps it.
 func (s *Session) Wait() error {
 	<-s.exited
-	<-s.readerDone
+	select {
+	case <-s.readerDone: // normal: reader drained the final bytes
+	case <-time.After(s.shutdownGrace): // grandchild holds the slave open; give up the drain wait
+	}
 	return s.exitErr
 }
 

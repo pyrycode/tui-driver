@@ -3,8 +3,10 @@
 package tuidriver
 
 import (
+	"errors"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
 	"syscall"
 	"testing"
@@ -141,5 +143,119 @@ func TestCloseReapsProcessGroupGrandchild(t *testing.T) {
 	}
 	if !reaped {
 		t.Errorf("grandchild %d still alive after Close — group signal did not reach it", gcPid)
+	}
+}
+
+// TestWaitBoundedWhenGrandchildHoldsPTY proves Wait returns within the bounded
+// grace when the leader has exited but a tool grandchild still holds the PTY
+// slave FD open, so the master read never returns EOF and the reader never
+// drains (AC #1, AC #4).
+//
+// The leader sets trap '' HUP (SIG_IGN) *before* forking, so the backgrounded
+// sleep 300 inherits the ignore disposition from birth — no fork-to-trap race —
+// then exit 7 makes the leader exit non-zero. The sleeper (the grandchild)
+// shares the leader's process group, inherits fd 0/1/2 = the PTY slave, and
+// ignores the SIGHUP the kernel sends the foreground group when the
+// controlling-terminal leader exits, so it survives still holding the slave
+// open. With the bug present, Wait blocks forever on readerDone; the outer 5s
+// guard turns that into a fast failure instead of hanging the suite.
+//
+// Linux-only. On Darwin/BSD the kernel revoke(2)s the controlling terminal when
+// the session leader exits, forcibly invalidating every open descriptor to the
+// slave PTY — even in a surviving, SIGHUP-ignoring, setsid-detached grandchild
+// (verified empirically: fd1/fd2 show "(revoked)"). The master then reads EOF,
+// readerDone closes, and Wait cannot hang — so this scenario is structurally
+// impossible to reproduce on Darwin and the precondition below would false-red.
+// The production fix is platform-agnostic and is covered on every platform by
+// the deterministic Wait select unit test in session_test.go; this test is the
+// realistic Linux repro, exercised by the ubuntu-latest CI gate.
+func TestWaitBoundedWhenGrandchildHoldsPTY(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("controlling-terminal revoke on session-leader exit makes the held-slave hang unreproducible off Linux; see doc comment")
+	}
+	const grace = 500 * time.Millisecond
+	cmd := exec.Command("sh", "-c", `trap '' HUP; sleep 300 & echo GC=$!; exit 7`)
+	s, err := Spawn(cmd, SpawnOpts{ShutdownGrace: grace})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	// Register cleanup first so it runs *after* the assertion — calling Close
+	// before asserting would close the PTY master, let the read return, and mask
+	// the bug. Reap the grandchild explicitly by PID as a backstop.
+	var gcPid int
+	t.Cleanup(func() {
+		s.Close()
+		if gcPid > 0 {
+			_ = syscall.Kill(gcPid, syscall.SIGKILL)
+		}
+	})
+
+	// Poll the buffer for the grandchild PID the shell echoed.
+	re := regexp.MustCompile(`GC=(\d+)`)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if m := re.FindSubmatch(s.Snapshot()); m != nil {
+			gcPid, _ = strconv.Atoi(string(m[1]))
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if gcPid <= 0 {
+		t.Fatalf("never saw GC=<pid> in snapshot; snap=%q", s.Snapshot())
+	}
+
+	// Confirm the leader is reaped (exited closed) before we assert on Wait.
+	select {
+	case <-s.exited:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("leader never exited")
+	}
+
+	// Self-validating precondition: the grandchild must still hold the slave
+	// open, so the reader must NOT have drained. If it did, Wait would return
+	// fast even with the bug present — a silent false green. Hard-fail here so
+	// the repro proves itself.
+	select {
+	case <-s.readerDone:
+		t.Fatalf("precondition broken: reader drained before Wait — grandchild did not hold the slave open")
+	default:
+	}
+
+	// The AC assertion: Wait is bounded and returns the leader's real status.
+	type waitResult struct {
+		err     error
+		elapsed time.Duration
+	}
+	resultCh := make(chan waitResult, 1)
+	go func() {
+		start := time.Now()
+		werr := s.Wait()
+		resultCh <- waitResult{err: werr, elapsed: time.Since(start)}
+	}()
+
+	select {
+	case res := <-resultCh:
+		// Bounded, not merely "eventually": well under the 5s outer guard and
+		// comfortably above the 500ms grace.
+		if res.elapsed >= 2*time.Second {
+			t.Errorf("Wait took %v, want bounded by ShutdownGrace (%v) + slack", res.elapsed, grace)
+		}
+		// Real exit status, never nil-by-default or a sentinel.
+		var exitErr *exec.ExitError
+		if !errors.As(res.err, &exitErr) {
+			t.Fatalf("Wait err = %v, want *exec.ExitError", res.err)
+		}
+		if exitErr.ExitCode() != 7 {
+			t.Errorf("Wait exit code = %d, want 7", exitErr.ExitCode())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait did not return — unbounded block on readerDone regressed")
+	}
+
+	// The timeout must not have torn the reader/grandchild down: the sleeper is
+	// still alive, evidencing that the reader was blocked *because* the slave was
+	// held and Wait left it parked.
+	if err := syscall.Kill(gcPid, 0); err != nil {
+		t.Errorf("grandchild %d not alive after Wait: %v — Wait must not reap the reader", gcPid, err)
 	}
 }
