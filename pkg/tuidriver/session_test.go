@@ -2,6 +2,7 @@ package tuidriver
 
 import (
 	"bytes"
+	"errors"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -29,6 +30,61 @@ func TestSpawnAndBufferReceivesOutput(t *testing.T) {
 	if !strings.Contains(got, "hello") {
 		t.Errorf("Buffer.Snapshot = %q, want it to contain %q", got, "hello")
 	}
+}
+
+// TestWaitBoundsReaderDrainAndReturnsExitErr drives Wait's two-arm select by
+// hand — closing exited and controlling readerDone directly — so the
+// bounded-grace behaviour is verified deterministically on every platform. The
+// realistic PTY-holder repro (session_signal_other_test.go) only reproduces on
+// Linux; this covers the exact changed logic everywhere, including the Darwin
+// dev gate.
+func TestWaitBoundsReaderDrainAndReturnsExitErr(t *testing.T) {
+	exitErr := errors.New("real exit status")
+
+	t.Run("reader drains: returns immediately with the exit error", func(t *testing.T) {
+		s := &Session{
+			exited:        make(chan struct{}),
+			readerDone:    make(chan struct{}),
+			shutdownGrace: time.Hour, // must not be reached on the drain path
+			exitErr:       exitErr,
+		}
+		close(s.exited)
+		close(s.readerDone)
+
+		start := time.Now()
+		err := s.Wait()
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Errorf("drain path took %v, want ~immediate (grace timer must not fire)", elapsed)
+		}
+		if !errors.Is(err, exitErr) {
+			t.Errorf("Wait err = %v, want the real exit error %v", err, exitErr)
+		}
+	})
+
+	t.Run("reader parked: returns the real exit error within the grace", func(t *testing.T) {
+		s := &Session{
+			exited:        make(chan struct{}),
+			readerDone:    make(chan struct{}), // left open — simulates a held-open PTY slave
+			shutdownGrace: 200 * time.Millisecond,
+			exitErr:       exitErr,
+		}
+		close(s.exited)
+
+		start := time.Now()
+		err := s.Wait()
+		elapsed := time.Since(start)
+		// Waited the drain window (not instant) but stayed bounded (not hung).
+		if elapsed < 100*time.Millisecond {
+			t.Errorf("Wait returned after %v, want it to wait ~the grace window first", elapsed)
+		}
+		if elapsed > 2*time.Second {
+			t.Errorf("Wait returned after %v, want bounded by the grace (%v) + slack", elapsed, s.shutdownGrace)
+		}
+		// The real exit error flows through the timeout path — never a substitute.
+		if !errors.Is(err, exitErr) {
+			t.Errorf("Wait err = %v, want the real exit error %v (never a sentinel/substitute)", err, exitErr)
+		}
+	})
 }
 
 func TestSpawnWriteRawSendsToPTY(t *testing.T) {
