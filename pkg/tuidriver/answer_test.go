@@ -148,6 +148,34 @@ func TestModalDismissed(t *testing.T) {
 		}
 	})
 
+	t.Run("history-only permission anchor counts as dismissed", func(t *testing.T) {
+		// #161: the answered permission modal's anchor ("Do you want to
+		// proceed") lingers in scrolled-up transcript history after dismissal.
+		// Pre-#152 the whole-buffer substring match reported the class still
+		// present, firing a spurious "still present" error that re-drove an
+		// already-committed turn. Post-#152 DetectModalClass region-scopes the
+		// permission anchor to the bottom overlay window, so an anchor pushed
+		// above that window by transcript body renders as Unknown → dismissed.
+		// Same forged-above-region shape as modal_test.go's
+		// TestDetectModalClassPermissionRegion, asserted one layer up at the
+		// dismissal seam (returns dismissed, not the detection-level Unknown).
+		body := strings.Repeat("transcript body line\r\n", 25)
+		forged := []byte("Do you want to proceed?\r\n" + body)
+		// Sanity: the anchor IS in the buffer — a naive whole-buffer match would
+		// forge "still present". Region-scoping is exactly what rejects it.
+		if !strings.Contains(string(forged), "Do you want to proceed") {
+			t.Fatal("fixture lost the forged phrase")
+		}
+		snap := func() []byte { return forged }
+		start := time.Now()
+		if !modalDismissed(context.Background(), ModalClassPermission, snap, time.Second) {
+			t.Error("modalDismissed = false, want true (anchor only in above-region history)")
+		}
+		if time.Since(start) >= answerConfirmPoll {
+			t.Errorf("returned in %v, want it to short-circuit before the first poll tick", time.Since(start))
+		}
+	})
+
 	t.Run("different modal counts as dismissed", func(t *testing.T) {
 		fixture := loadFixture(t, "trust-folder-snapshot.bin")
 		snap := func() []byte { return fixture }
