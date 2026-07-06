@@ -28,11 +28,16 @@ func (k ArrowKey) bytes() []byte {
 	}
 }
 
-// writeRaw is the single internal PTY-write path that every typed-keystroke
-// method and the prompt-delivery helpers funnel through. Unexported on
-// purpose: with the public Write seam gone, a consumer cannot inject arbitrary
-// bytes — only the named intents below and the constrained SendKeys hatch.
+// writeRaw is the serialized single-buffer PTY-write path that every
+// typed-keystroke method and WritePrompt funnel through. It holds writeMu for
+// its one atomic write so it cannot interleave with another writer — including
+// the multi-write TypePrompt/ClearInputLine, which hold the same writeMu
+// directly across their spans. Unexported on purpose: with the public Write
+// seam gone, a consumer cannot inject arbitrary bytes — only the named intents
+// below and the constrained SendKeys hatch.
 func (s *Session) writeRaw(p []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	_, err := s.pty.Write(p)
 	return err
 }
