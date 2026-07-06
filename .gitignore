@@ -14,6 +14,7 @@ tui-driver
 /spike-long-prompt
 /spike-queued-modals
 /probe-first-prompt-hang
+/probe-cwd-encoding
 /e2e-runner
 /e2e-snapshot-check
 /bin/
