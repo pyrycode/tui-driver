@@ -292,3 +292,43 @@ func TestDetectModalClassSyntheticGridFixtures(t *testing.T) {
 		})
 	}
 }
+
+// TestDetectModalClassMCPAnchorScrolledOffNotModal is the #155 content-forgery
+// regression for the mcp panel (CRITICAL B: "N MCP servers failed" in a pasted
+// log forges the modal). mcp is a full-panel class matched across the whole
+// visible grid — its title renders ~24 rows from the bottom, so a bottom-region
+// window can't be used (#152). The guard for panels is therefore the grid
+// excluding scrolled-off history: a real MCP anchor printed as a transcript/log
+// line that has scrolled off the top of the visible screen must not classify.
+// A naive bytes/strings.Contains over the raw buffer WOULD forge it.
+//
+// The permission body-forgery case (AC #2) is pinned separately by
+// TestDetectModalClassPermissionRegion; the idle/busy pair by #153 in
+// state_test.go. Do not duplicate them here.
+func TestDetectModalClassMCPAnchorScrolledOffNotModal(t *testing.T) {
+	rows := []string{"No MCP servers configured"} // a real mcp anchor, as a log line
+	for i := 0; i < 45; i++ {                      // enough output to scroll it off a 40-row screen
+		rows = append(rows, "transcript body line")
+	}
+	rows = append(rows, "❯ ") // idle prompt at the bottom; no modal is up
+	forged := gridRows(rows...)
+
+	// Contrast that makes the test non-vacuous: the anchor IS in the raw bytes,
+	// so a naive whole-buffer substring match would forge MCP. The grid never
+	// sees it because it scrolled off the visible screen.
+	if !strings.Contains(string(forged), "No MCP servers configured") {
+		t.Fatal("fixture lost the forged anchor — the forgery contrast is void")
+	}
+	if got := DetectModalClass(forged); got != ModalClassUnknown {
+		t.Errorf("scrolled-off mcp anchor: DetectModalClass = %q, want Unknown", got)
+	}
+
+	// Positive control: the genuine mcp panel still classifies.
+	snap, err := os.ReadFile(filepath.Join("testdata", "mcp-snapshot.bin"))
+	if err != nil {
+		t.Fatalf("read mcp fixture: %v", err)
+	}
+	if got := DetectModalClass(snap); got != ModalClassMCP {
+		t.Errorf("mcp-snapshot.bin positive control: DetectModalClass = %q, want MCP", got)
+	}
+}
