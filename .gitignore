@@ -12,6 +12,7 @@ tui-driver
 /spike-multiselect
 /spike-ask-user
 /spike-long-prompt
+/spike-queued-modals
 /probe-first-prompt-hang
 /e2e-runner
 /e2e-snapshot-check

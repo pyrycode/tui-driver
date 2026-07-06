@@ -8,7 +8,7 @@ BIN_DIR    := ./bin
 REPORT     := ./e2e-report.json
 GO         ?= go
 
-SPIKES     := spike-one-turn spike-multi-turn spike-cancel spike-permission spike-multiselect spike-ask-user spike-long-prompt spike-short-prompt
+SPIKES     := spike-one-turn spike-multi-turn spike-cancel spike-permission spike-multiselect spike-ask-user spike-long-prompt spike-short-prompt spike-queued-modals
 PROBES     := probe-first-prompt-hang
 CHECKERS   := e2e-snapshot-check
 RUNNER     := e2e-runner
