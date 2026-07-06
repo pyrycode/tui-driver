@@ -118,6 +118,12 @@ type Session struct {
 	// SendKeys) and DeliverPrompt, never the raw FD.
 	pty *os.File
 
+	// writeMu serializes every write onto the PTY master (pty). Held for the
+	// full duration of one logical write so a concurrent writer cannot split a
+	// multi-write sequence — see TypePrompt. Distinct from the read-side mutexes
+	// (Buffer, tracker, castRecorder): this one guards the write FD only.
+	writeMu sync.Mutex
+
 	cmd           *exec.Cmd
 	exited        chan struct{} // closed by the cmd.Wait goroutine
 	exitErr       error         // populated before exited is closed
@@ -299,8 +305,8 @@ func buildMirror(opts SpawnOpts) (io.Writer, io.Closer, error) {
 // approval) should still use Write, not WritePrompt — paste-wrapping a
 // single token has no upside.
 func (s *Session) WritePrompt(text string) error {
-	_, err := s.pty.Write(bracketedPaste(text))
-	return err
+	// One buffer, one write — funnel through writeRaw to pick up writeMu.
+	return s.writeRaw(bracketedPaste(text))
 }
 
 // bracketedPaste builds the byte payload WritePrompt writes: open marker,
@@ -333,6 +339,15 @@ func bracketedPaste(text string) []byte {
 //
 // Returns the first non-nil error from the underlying PTY write.
 func (s *Session) TypePrompt(text string) error {
+	// Hold writeMu across the entire byte-by-byte sequence (loop + settles + \r
+	// commit) so no other writer can land between two byte-writes and split the
+	// prompt. Calls s.pty.Write directly, NOT writeRaw: sync.Mutex is
+	// non-reentrant, so funnelling through writeRaw would self-deadlock. defer
+	// releases on the mid-loop error return too. Blocking a concurrent writer
+	// (e.g. AttachInput) for the whole typing span is intended — an injected
+	// keystroke mid-prompt would corrupt it.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	for i := 0; i < len(text); i++ {
 		if _, err := s.pty.Write([]byte{text[i]}); err != nil {
 			return err
@@ -357,6 +372,12 @@ func (s *Session) TypePrompt(text string) error {
 //
 // Returns the first non-nil error from the underlying PTY write.
 func (s *Session) ClearInputLine() error {
+	// Hold writeMu across the Ctrl-U write and its settle so another writer
+	// cannot inject into the input area during the line-kill window. Direct
+	// s.pty.Write (not writeRaw) for the same non-reentrancy reason as
+	// TypePrompt; defer releases on the write-error return too.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if _, err := s.pty.Write([]byte{0x15}); err != nil {
 		return err
 	}
