@@ -55,6 +55,10 @@ func TestShouldTypePrompt(t *testing.T) {
 		{"sigterm prompt", "Use the Bash tool to run `sleep 30`. Do nothing else.", true},
 		{"multi-line", "line one\nline two", false},
 		{"single trailing newline", "ok\n", false},
+		{"embedded carriage return", "before\rafter", false},
+		{"embedded ESC", "a\x1bb", false},
+		{"embedded tab", "a\tb", false},
+		{"embedded NUL", "a\x00b", false},
 		{"over the length cap", overCap, false},
 	}
 	for _, tt := range tests {

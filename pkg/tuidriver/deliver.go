@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
 	"time"
 )
 
@@ -242,14 +241,43 @@ func hasPastedChip(snap []byte) bool {
 // load-bearing condition — multi-line prompts always paste.
 const typePromptMaxLen = 256
 
-// shouldTypePrompt reports whether text is a short, single-line prompt that
-// should be delivered with TypePrompt (byte-spaced body + isolated \r) instead
-// of a bracketed paste. claude's terminal paste-detection heuristic mis-
-// classifies a fast bulk write of such a prompt, absorbing the trailing \r so
-// the turn never commits — and because a short prompt renders inline with no
+// hasControlByte reports whether text contains any C0 control byte (< 0x20).
+// A plain byte scan is correct for UTF-8: printable ASCII is >= 0x20 (space),
+// and no byte of a multi-byte rune is < 0x80 (lead >= 0xC0, continuation
+// >= 0x80), so this never trips on Unicode content. Total over the empty
+// string (returns false). DEL (0x7F) is intentionally not screened — it is
+// neither C0 nor a demonstrated steering byte.
+func hasControlByte(text string) bool {
+	for i := 0; i < len(text); i++ {
+		if text[i] < 0x20 {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldTypePrompt reports whether text is a short, control-byte-free prompt
+// that should be delivered with TypePrompt (byte-spaced body + isolated \r)
+// instead of a bracketed paste. claude's terminal paste-detection heuristic
+// mis-classifies a fast bulk write of such a prompt, absorbing the trailing \r
+// so the turn never commits — and because a short prompt renders inline with no
 // "[Pasted text]" chip, the chip-based recovery in deliverPrompt cannot catch
 // it. Typing the bytes keeps the stream under the paste threshold and commits
 // reliably (the #71 / PR #77 fix).
+//
+// A prompt carrying any C0 control byte (< 0x20) is disqualified from the typed
+// path and falls through to WritePrompt (bracketed paste) instead — no separate
+// routing code, the else branch in deliverPrompt already handles it. TypePrompt
+// writes every byte to the PTY verbatim, so a stray \r there commits the turn
+// early and a stray ESC can steer claude's TUI; the paste path embeds the body
+// verbatim inside \x1b[200~ … \x1b[201~, so claude treats those same bytes as
+// literal pasted text (backed by TestBracketedPasteWrapping's "embedded CR
+// survives" case). Route-to-paste — not reject or sanitise — is the chosen
+// strategy because it never drops a legitimate turn, never mutates user
+// content, and keeps short control-byte prompts on the identical path already
+// used by every long/multi-line prompt (the newline check this subsumes was
+// only ever a special case of "a control byte disqualifies the typed path").
+// See #172.
 func shouldTypePrompt(text string) bool {
-	return len(text) <= typePromptMaxLen && !strings.Contains(text, "\n")
+	return len(text) <= typePromptMaxLen && !hasControlByte(text)
 }
