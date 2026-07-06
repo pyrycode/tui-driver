@@ -83,10 +83,6 @@ var (
 	anchorAgentsTabLibrary    = []byte("Library")
 	anchorAskUserSpaced       = []byte("Enter to select")
 	anchorPermissionSpaced    = []byte("Do you want to proceed")
-	// anchorPermissionStripped is no longer used by DetectModalClass (which now
-	// matches the rendered grid). It is retained because permission.go's
-	// raw-bytes hasPermissionPrompt path still matches both forms.
-	anchorPermissionStripped  = []byte("Doyouwanttoproceed")
 	anchorModelSelectSpaced   = []byte("Select model")
 	anchorPermissionsHeader   = []byte("Permissions")
 	anchorPermissionsTabAllow = []byte("Allow")
