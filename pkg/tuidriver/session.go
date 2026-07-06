@@ -418,9 +418,10 @@ func (s *Session) Wait() error {
 
 // Close shuts the session down cleanly:
 //
-//  1. SIGTERM the process.
+//  1. SIGTERM the process group (leader + any tool subprocesses claude forked),
+//     falling back to the leader alone if a safe group target is unavailable.
 //  2. Wait up to ShutdownGrace for the process to exit.
-//  3. If still alive, SIGKILL and wait for the exit.
+//  3. If still alive, SIGKILL the group and wait for the exit.
 //  4. Close the PTY file.
 //  5. Wait for the reader goroutine to finish (PTY close unblocks it).
 //  6. Close the recording file, if one was opened for SpawnOpts.RecordTo.
@@ -430,11 +431,11 @@ func (s *Session) Wait() error {
 func (s *Session) Close() error {
 	s.shutdownOnce.Do(func() {
 		if s.cmd.Process != nil {
-			_ = s.cmd.Process.Signal(syscall.SIGTERM)
+			s.signalShutdown(syscall.SIGTERM)
 			select {
 			case <-s.exited:
 			case <-time.After(s.shutdownGrace):
-				_ = s.cmd.Process.Signal(syscall.SIGKILL)
+				s.signalShutdown(syscall.SIGKILL)
 				<-s.exited
 			}
 		}
