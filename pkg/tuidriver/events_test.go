@@ -430,7 +430,7 @@ func TestMergeEvents_CleanShutdown(t *testing.T) {
 	}
 }
 
-func TestMergeEvents_JsonlChClosureClosesOutput(t *testing.T) {
+func TestMergeEvents_JsonlChClosureCtxLiveEmitsError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	snap := &testSnap{}
@@ -439,17 +439,76 @@ func TestMergeEvents_JsonlChClosureClosesOutput(t *testing.T) {
 	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Park briefly so the merge goroutine is in its select loop, then
-	// close jsonlCh — that should drive the loop to exit and close out.
+	// close jsonlCh with ctx STILL LIVE — the merge-seam simulation of the
+	// tail's default: read-error exit. mergeEvents must emit one terminal
+	// EventKindError before closing out.
 	time.Sleep(75 * time.Millisecond)
 	close(jsonlCh)
-	select {
-	case _, ok := <-out:
-		if ok {
-			t.Fatalf("got event instead of close after jsonlCh closure")
-		}
-	case <-time.After(200 * time.Millisecond):
-		t.Fatalf("output did not close within 200ms after jsonlCh closure")
+	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindError {
+		t.Fatalf("Kind = %v, want EventKindError", ev.Kind)
 	}
+	if ev.Source != EventSourceJsonl {
+		t.Errorf("Source = %v, want EventSourceJsonl", ev.Source)
+	}
+	if !errors.Is(ev.Err, ErrJSONLTailRead) {
+		t.Errorf("Err = %v, want errors.Is(_, ErrJSONLTailRead)", ev.Err)
+	}
+	assertEventChClosed(t, out, 500*time.Millisecond)
+}
+
+// TestMergeEvents_JsonlChCloseAfterCancelEmitsNoError covers the
+// EOF-then-shutdown shape: ctx cancels first (the clean tail-exit
+// trigger), then the tail's deferred close(jsonlCh) fires. ctx.Err() is
+// non-nil at the !ok branch, so mergeEvents emits NO EventKindError —
+// the AC-#4 clean-path companion to the read-error case above.
+func TestMergeEvents_JsonlChCloseAfterCancelEmitsNoError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	snap := &testSnap{}
+	jsonlCh := make(chan JSONLEntry)
+	out := make(chan Event, defaultEventBuffer)
+	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+
+	time.Sleep(75 * time.Millisecond)
+	cancel()
+	close(jsonlCh)
+	// A spurious EventKindError would surface here as an event, not a
+	// close; assertEventChClosed fails on any event.
+	assertEventChClosed(t, out, 500*time.Millisecond)
+}
+
+// TestMergeEvents_ReadFaultSurfacesTerminalError wires the full chain —
+// faultReader → tailJSONLLoop → jsonlCh → mergeEvents → out — proving a
+// read error injected into the running tail loop reaches the Events()
+// consumer as a distinct terminal EventKindError (AC #1, #4).
+func TestMergeEvents_ReadFaultSurfacesTerminalError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	snap := &testSnap{}
+	r := &faultReader{data: []byte(`{"type":"good"}` + "\n")}
+	jsonlCh := make(chan JSONLEntry, defaultJSONLTailBuffer)
+	out := make(chan Event, defaultEventBuffer)
+	go tailJSONLLoop(ctx, r, jsonlCh)
+	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+
+	// The scripted good line surfaces as a normal entry event first...
+	if ev := mustReceiveEvent(t, out, 500*time.Millisecond); ev.Kind != EventKindJsonlEntry {
+		t.Fatalf("first Kind = %v, want EventKindJsonlEntry", ev.Kind)
+	}
+	// ...then the injected read fault surfaces end-to-end as one terminal
+	// EventKindError before the stream closes.
+	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindError {
+		t.Fatalf("Kind = %v, want EventKindError", ev.Kind)
+	}
+	if ev.Source != EventSourceJsonl {
+		t.Errorf("Source = %v, want EventSourceJsonl", ev.Source)
+	}
+	if !errors.Is(ev.Err, ErrJSONLTailRead) {
+		t.Errorf("Err = %v, want errors.Is(_, ErrJSONLTailRead)", ev.Err)
+	}
+	assertEventChClosed(t, out, 500*time.Millisecond)
 }
 
 func TestMergeEvents_McpFailureBannerTransitions(t *testing.T) {

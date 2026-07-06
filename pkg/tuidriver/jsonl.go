@@ -182,12 +182,15 @@ func TailJSONL(ctx context.Context, path string, startOffset int64) (<-chan JSON
 	return ch, nil
 }
 
-// tailJSONLLoop owns f and ch from entry. It closes both on every
-// exit path. Runs on its own goroutine spawned by TailJSONL.
-func tailJSONLLoop(ctx context.Context, f *os.File, ch chan<- JSONLEntry) {
+// tailJSONLLoop owns r and ch from entry. It closes both on every exit
+// path. Runs on its own goroutine spawned by TailJSONL. The reader is
+// typed io.ReadCloser (not *os.File) purely so tests can inject a
+// fault reader; TailJSONL passes the opened *os.File and the production
+// behaviour is unchanged.
+func tailJSONLLoop(ctx context.Context, r io.ReadCloser, ch chan<- JSONLEntry) {
 	defer close(ch)
-	defer f.Close()
-	reader := bufio.NewReader(f)
+	defer r.Close()
+	reader := bufio.NewReader(r)
 	var partial []byte
 	for {
 		if ctx.Err() != nil {
@@ -220,6 +223,10 @@ func tailJSONLLoop(ctx context.Context, f *os.File, ch chan<- JSONLEntry) {
 			case <-time.After(DefaultPollInterval):
 			}
 		default:
+			// A non-EOF read error. Returning here closes ch with ctx
+			// still live — every other exit above is ctx-driven.
+			// mergeEvents reads this ctx-live close as a tail read error
+			// and emits a terminal EventKindError (see events.go).
 			return
 		}
 	}
