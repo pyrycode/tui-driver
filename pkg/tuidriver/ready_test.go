@@ -21,8 +21,11 @@ func TestWaitReady(t *testing.T) {
 			want: Readiness{Idle: true},
 		},
 		{
+			// Spaced form: since #163 HasTrustModal matches the rendered grid, so
+			// the on-screen "Quick safety check" header is what sets TrustModal
+			// (consistent with DetectModalClass). A real trust modal renders spaced.
 			name: "trust modal at idle",
-			snap: append([]byte("Quicksafetycheck"), idle...),
+			snap: append([]byte("Quick safety check"), idle...),
 			want: Readiness{Idle: true, TrustModal: true},
 		},
 		{
