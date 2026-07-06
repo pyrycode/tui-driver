@@ -128,6 +128,13 @@ is safe" — it cannot distinguish the safe case from a failed setup. Only
   prompt — a follow-up, not a faked result)
 - **Consequence for #200:** _TBD_
 
+> **Cross-check a `dangerous` reading before trusting it.** The `dangerous`
+> verdict keys off `tools_executed > modals_answered`, which a *third*,
+> auto-approved tool in the same turn could inflate without any `\r` leak.
+> Before scoping #200 off a `dangerous` finding, confirm `distinct_tools`
+> matches the two tools the prompt requested and inspect the `modalB`
+> snapshot — both raw fields are on the `OBSERVED:` line.
+
 ## Open questions (resolve on first live run)
 
 - Does the default prompt reliably induce **parallel** (not sequential)
