@@ -98,6 +98,20 @@ func (g *Grid) ContainsInLastRows(sub string, n int) bool {
 	return false
 }
 
+// LastRows returns the last n rendered rows (top-to-bottom order). n <= 0
+// returns nil; n greater than the row count is clamped to all rows. The
+// returned slice aliases the grid's backing store — read-only; callers must not
+// mutate it. Used by the status-area banner detectors (network, mcp-failure) to
+// run a match only over the bottom status region, the same scoping that keeps
+// the permission overlay from being forged by transcript content.
+func (g *Grid) LastRows(n int) []string {
+	if n <= 0 {
+		return nil
+	}
+	n = min(n, len(g.rows))
+	return g.rows[len(g.rows)-n:]
+}
+
 // RowHasPrefix reports whether row i (0-based, top-down) starts with prefix.
 // An out-of-range i returns false rather than panicking.
 func (g *Grid) RowHasPrefix(i int, prefix string) bool {

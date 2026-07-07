@@ -61,9 +61,9 @@ const (
 	EventKindPtyMcpFailureHidden
 
 	// EventKindPtyNetworkFailureShown fires when a network-failure
-	// anchor (e.g. FailedToOpenSocket) appears in the snapshot. Same
-	// rising-edge semantics, same payload-free shape, same
-	// independence from the modal/idle/thinking axes.
+	// anchor (e.g. "Unable to connect to API") appears in the status region
+	// of the snapshot. Same rising-edge semantics, same payload-free shape,
+	// same independence from the modal/idle/thinking axes.
 	EventKindPtyNetworkFailureShown
 
 	// EventKindPtyNetworkFailureHidden is the paired falling edge.

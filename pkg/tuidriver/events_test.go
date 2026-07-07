@@ -585,8 +585,9 @@ func TestMergeEvents_NetworkFailureTransitions(t *testing.T) {
 	case <-time.After(2 * DefaultPollInterval):
 	}
 
-	// Phase 2: anchor appears → NetworkFailureShown fires once.
-	snap.Set([]byte("...FailedToOpenSocket..."))
+	// Phase 2: anchor appears → NetworkFailureShown fires once. #220: the
+	// anchor is claude's real 2.1.199 status line, matched in the status region.
+	snap.Set([]byte("Unable to connect to API (ConnectionRefused)"))
 	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
 	if ev.Kind != EventKindPtyNetworkFailureShown {
 		t.Errorf("phase 2 Kind = %v, want EventKindPtyNetworkFailureShown", ev.Kind)
@@ -605,8 +606,9 @@ func TestMergeEvents_NetworkFailureTransitions(t *testing.T) {
 		t.Errorf("phase 3 Kind = %v, want EventKindPtyNetworkFailureHidden", ev.Kind)
 	}
 
-	// Phase 4: ANSI-wrapped reappearance → NetworkFailureShown again.
-	snap.Set([]byte("\x1b[31mFailedToOpenSocket\x1b[0m"))
+	// Phase 4: ANSI-wrapped reappearance → NetworkFailureShown again. The grid
+	// render consumes the CSI and preserves the on-screen phrase.
+	snap.Set([]byte("\x1b[31mUnable to connect to API (ConnectionRefused)\x1b[0m"))
 	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
 	if ev.Kind != EventKindPtyNetworkFailureShown {
 		t.Errorf("phase 4 Kind = %v, want EventKindPtyNetworkFailureShown", ev.Kind)
