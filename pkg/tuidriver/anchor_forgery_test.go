@@ -27,9 +27,9 @@ import (
 //                       window, where the region-scoped detectors look.
 //
 // Anchor sites enumerated here (keep in sync when adding or changing an anchor):
-//   - modal.go       anchorMCPSpaced, anchorMCPEmptySpaced, the agents pair,
-//                    anchorAskUserSpaced, anchorPermissionSpaced,
-//                    anchorModelSelectSpaced, the permissions-config pair.
+//   - modal.go       anchorMCPSpaced, the agents pair, anchorAskUserSpaced,
+//                    anchorPermissionSpaced, anchorModelSelectSpaced, the
+//                    permissions-config pair.
 //   - permission.go  anchorTrustHeaderSpaced.
 //   - network.go     networkFailureAnchors.
 //   - mcp_banner.go  mcpFailureBannerRe.
@@ -41,12 +41,13 @@ import (
 //     status banners, the permission overlay and the busy/idle axis (bottom-
 //     region scoping, #220/#153). A transcript-body forgery of these MUST fire
 //     nothing. These are the teeth; they pass now and encode 173 and 217.
-//  2. NOT YET PROTECTED — the whole-grid panel classes (mcp, model-select,
-//     permissions-config, ask-user, agents) still classify from one on-screen
-//     content line, because their structural co-signal is #223's job and #223
-//     is blocked by this ticket. TestWholeGridAnchorsStillForgePending223 pins
-//     that gap as current behaviour, so when #223 lands a co-signal the
-//     assertion flips and forces the class up into tier 1.
+//  2. Formerly NOT YET PROTECTED — the whole-grid panel classes (mcp,
+//     model-select, permissions-config, ask-user, agents). #223 gave each a
+//     structural co-signal (a pointer-marked option row for model-select and
+//     ask-user, the picker highlight color for mcp/agents/permissions-config),
+//     so they too now fire nothing on a one-line content forgery. The former
+//     characterization test that pinned the gap is now
+//     TestWholeGridAnchorsRejectContentForgery, a fire-nothing regression.
 
 // forgedForm is one realistic rendering of a forged anchor: a label and the
 // snapshot bytes that carry the anchor as screen content.
@@ -193,37 +194,27 @@ func TestTrustAnchorRejectsStatusRegionQuotation(t *testing.T) {
 	}
 }
 
-// TestWholeGridAnchorsStillForgePending223 pins the tier-2 KNOWN, TRACKED gap.
-// The whole-grid panel classes still classify from a single on-screen content
-// line, because their structural co-signal is #223's job and #223 is blocked by
-// this ticket. This test asserts that forgery as CURRENT behaviour so the gap is
-// visible and cannot change silently.
-//
-// Handoff protocol: when #223 lands a co-signal for one of these classes, the
-// matching assertion here flips (DetectModalClass returns Unknown). Move that
-// class into the fire-nothing suite above and delete its row here. This is how
-// #223 consumes the suite.
-func TestWholeGridAnchorsStillForgePending223(t *testing.T) {
-	cases := []struct {
-		name string
-		line string
-		want ModalClass
-	}{
-		{"mcp title", "the /mcp screen shows Manage MCP servers at the top", ModalClassMCP},
-		{"mcp empty-state", "it printed No MCP servers configured after /doctor", ModalClassMCP},
-		{"ask-user footer", "the picker footer reads Enter to select at the bottom", ModalClassAskUserQuestion},
-		{"model-select title", "run /model to open the Select model picker", ModalClassModelSelect},
-		{"agents header+tab", "the Agents modal lists a Running and a Library tab", ModalClassAgents},
-		{"permissions-config", "the Permissions screen has Allow, Ask and Deny tabs", ModalClassPermissionsConfig},
-	}
-	for _, tc := range cases {
+// TestWholeGridAnchorsRejectContentForgery closes the #221→#223 handoff. Before
+// #223 these whole-grid panel classes classified from a single on-screen content
+// line, and this test (then TestWholeGridAnchorsStillForgePending223) pinned that
+// gap as tracked behaviour. #223 gave each class a structural co-signal, so one
+// prose line quoting a class's header text now fires nothing — the assertion
+// flipped from "forges" to "Unknown", exactly the handoff the #221 comment
+// promised.
+func TestWholeGridAnchorsRejectContentForgery(t *testing.T) {
+	for _, tc := range []struct{ name, line string }{
+		{"mcp title", "the /mcp screen shows Manage MCP servers at the top"},
+		{"mcp empty-state", "it printed No MCP servers configured after /doctor"},
+		{"ask-user footer", "the picker footer reads Enter to select at the bottom"},
+		{"model-select title", "run /model to open the Select model picker"},
+		{"agents header+tab", "the Agents modal lists a Running and a Library tab"},
+		{"permissions-config", "the Permissions screen has Allow, Ask and Deny tabs"},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			snap := gridRows(tc.line) // one on-screen prose line, no dialog chrome
-			got := DetectModalClass(snap)
-			if got != tc.want {
-				t.Errorf("%s: DetectModalClass = %q, want %q (the known pre-#223 forgery). "+
-					"If #223 added this class's structural co-signal, this now reads Unknown — "+
-					"move the class into the fire-nothing suite and delete this row.", tc.name, got, tc.want)
+			// One on-screen prose line: no ❯-marked option row and no picker
+			// highlight color, so neither co-signal is satisfied.
+			if got := DetectModalClass(gridRows(tc.line)); got != ModalClassUnknown {
+				t.Errorf("%s: DetectModalClass = %q, want Unknown (content forgery must not classify)", tc.name, got)
 			}
 		})
 	}

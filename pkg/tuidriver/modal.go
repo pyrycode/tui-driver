@@ -55,13 +55,27 @@ const (
 // are removed here rather than carried as dead no-op checks.
 //
 // Anchors are unexported — consumers call DetectModalClass rather than
-// matching directly. Literal forms, matched against the rendered grid:
+// matching directly. Since #223 every class also requires a STRUCTURAL
+// co-signal of a different fabric, not the anchor text alone, so one on-screen
+// content line quoting the text no longer forges the class (the F3 forgery the
+// negative suite pins). Literal forms plus co-signal, matched against the
+// rendered grid:
 //
-//	mcp                 → "Manage MCP servers" (modal title) or the strict-mcp
-//	                      inline empty-state "No MCP servers configured" (#128)
-//	agents              → "Agents" header + "Running" or "Library" tab
-//	                      (pre-2.1.199 only — see ModalClassAgents)
-//	ask-user-question   → "Enter to select"
+//	mcp                 → "Manage MCP servers" (modal title) AND the picker
+//	                      highlight color (snapHasPickerHighlight). #223 removed
+//	                      the inline empty-state "No MCP servers configured"
+//	                      (#128) anchor entirely: it is a /mcp result echoed on an
+//	                      idle screen, not a modal, and matching it held the modal
+//	                      axis on idle and suppressed idle/thinking edge events.
+//	agents              → "Agents" header + "Running" or "Library" tab AND the
+//	                      picker highlight color (#223). Pre-2.1.199 only — the
+//	                      wizard was removed in 2.1.199 (see ModalClassAgents);
+//	                      the color closes the one-line text forgery on old builds.
+//	ask-user-question   → "Enter to select" AND a pointer-marked option row
+//	                      (gridHasSelectionDialog, #223). The footer phrase is
+//	                      generic — the agents modal's footer carries it too — so
+//	                      the option-row shape plus the #223 re-order (this class
+//	                      runs AFTER the header-specific ones) keep it honest.
 //	trust-folder        → "Quick safety check" (anchorTrustHeaderSpaced, defined
 //	                      in permission.go) AND a pointer-marked numbered option
 //	                      row directly below it — the dialog shape, via
@@ -70,8 +84,10 @@ const (
 //	                      a fatal false positive under the runner's abort policy.
 //	permission          → "Do you want to proceed" — region-scoped to the
 //	                      bottom overlay window (permissionRegionRows)
-//	model-select        → "Select model" (the `/model` modal)
-//	permissions-config  → "Permissions" header + one of Allow/Ask/Deny tabs
+//	model-select        → "Select model" AND a pointer-marked option row
+//	                      (gridHasSelectionDialog, #223) — the `/model` modal.
+//	permissions-config  → "Permissions" header + one of Allow/Ask/Deny tabs AND
+//	                      the picker highlight color (#223).
 //
 // slash-picker classification (isSlashPicker in picker.go) combines two signals
 // of different fabric: an on-screen rendered row that begins `/<letter>`
@@ -87,7 +103,6 @@ const (
 // and 217 forgeries shipped.
 var (
 	anchorMCPSpaced           = []byte("Manage MCP servers")
-	anchorMCPEmptySpaced      = []byte("No MCP servers configured")
 	anchorAgentsHeader        = []byte("Agents")
 	anchorAgentsTabRunning    = []byte("Running")
 	anchorAgentsTabLibrary    = []byte("Library")
@@ -136,38 +151,48 @@ func gridContains(g *Grid, sub []byte) bool {
 // (permissionRegionRows). Use Render/ParseModalContent when you need to extract
 // content from the modal, not just classify it.
 //
-// Order of checks is significant: the specific anchors run first and the
-// slash-picker check runs LAST (#151). The picker's signal is the most
-// permissive (any on-screen `/`-row plus a highlight color), so a real modal
-// that merely has a `/`-path on screen — e.g. a permission prompt showing a
-// file path — must match its own anchor before the picker is even considered.
+// Order of checks is significant (#151, #223): the header-specific classes run
+// first, the generic-footer ask-user class runs after them, and the slash-picker
+// check runs LAST. Two reasons. The picker's signal is the most permissive (any
+// on-screen `/`-row plus a highlight color), so a real modal that merely has a
+// `/`-path on screen must match its own anchor first. And ask-user's anchor is a
+// generic list footer that other dialogs draw too (the agents modal's footer
+// carries it), so the classes with a specific header must be tried before it.
 // The single grid built here is threaded into the picker check so the snapshot
 // is rendered only once.
 //
-// Returns ModalClassUnknown when no anchor matches (the common case at idle —
-// no modal currently rendered).
+// Since #223 each class also requires a structural co-signal of a different
+// fabric — a pointer-marked option row (gridHasSelectionDialog) for the option
+// dialogs, or the picker highlight color (snapHasPickerHighlight) for the
+// full panels — so one on-screen content line quoting a class's header text no
+// longer forges it.
+//
+// Returns ModalClassUnknown when no class matches (the common case at idle — no
+// modal currently rendered).
 func DetectModalClass(snap []byte) ModalClass {
 	g := NewGrid(snap, 0, 0)
 	switch {
-	case gridContains(g, anchorMCPSpaced) || gridContains(g, anchorMCPEmptySpaced):
+	case gridContains(g, anchorMCPSpaced) && snapHasPickerHighlight(snap):
 		return ModalClassMCP
 	case gridContains(g, anchorAgentsHeader) &&
 		(gridContains(g, anchorAgentsTabRunning) ||
-			gridContains(g, anchorAgentsTabLibrary)):
+			gridContains(g, anchorAgentsTabLibrary)) &&
+		snapHasPickerHighlight(snap):
 		return ModalClassAgents
-	case gridContains(g, anchorAskUserSpaced):
-		return ModalClassAskUserQuestion
 	case gridHasTrustDialog(g):
 		return ModalClassTrustFolder
 	case g.ContainsInLastRows(string(anchorPermissionSpaced), permissionRegionRows):
 		return ModalClassPermission
-	case gridContains(g, anchorModelSelectSpaced):
+	case gridContains(g, anchorModelSelectSpaced) && gridHasSelectionDialog(g):
 		return ModalClassModelSelect
 	case gridContains(g, anchorPermissionsHeader) &&
 		(gridContains(g, anchorPermissionsTabAllow) ||
 			gridContains(g, anchorPermissionsTabAsk) ||
-			gridContains(g, anchorPermissionsTabDeny)):
+			gridContains(g, anchorPermissionsTabDeny)) &&
+		snapHasPickerHighlight(snap):
 		return ModalClassPermissionsConfig
+	case gridContains(g, anchorAskUserSpaced) && gridHasSelectionDialog(g):
+		return ModalClassAskUserQuestion
 	}
 	// Slash-picker is the last resort: reached only when no specific anchor
 	// matched. It requires an on-screen `/`-row AND picker highlight chrome

@@ -72,6 +72,11 @@ var pickerHighlightedRGBs = []rgb{
 // rgbIsHighlighted reports whether c matches any of the known highlighted
 // shades. Equality, not nearness — claude paints deterministic constants
 // per render; we extend the set rather than fuzzy-matching.
+//
+// The whole-snapshot highlight scan built on this (snapHasPickerHighlight,
+// picker.go) is reused as the #223 second-fabric co-signal for the full-panel
+// modal classes (mcp, agents, permissions-config): their real screens carry the
+// highlight color, a one-line content quotation of their header text does not.
 func rgbIsHighlighted(c rgb) bool {
 	for _, h := range pickerHighlightedRGBs {
 		if c == h {

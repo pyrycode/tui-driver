@@ -16,18 +16,25 @@ func TestDetectModalClassUnknownOnEmpty(t *testing.T) {
 	}
 }
 
-// Spaced-form and multi-part synthetic anchors classify against the rendered
-// grid. Since #152 the anchors key on the space-preserved on-screen form.
+// Synthetic anchors classify against the rendered grid. Since #152 the anchors
+// key on the space-preserved on-screen form; since #223 the anchor TEXT alone is
+// never enough — every class needs its structural co-signal too. So the bare
+// header/footer phrases below now classify Unknown: that IS the #223 contract.
+// The co-signal-satisfying positives live in TestDetectModalClassRealFixtures and
+// TestDetectModalClassSyntheticGridFixtures.
 func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 	cases := []struct {
 		name string
 		in   []byte
 		want ModalClass
 	}{
-		{"mcp spaced title", []byte("...Manage MCP servers..."), ModalClassMCP},
-		{"mcp empty-state spaced", []byte("...No MCP servers configured. Please run /doctor..."), ModalClassMCP},
-		{"agents header + running tab", []byte("...Agents...Running..."), ModalClassAgents},
-		{"agents header + library tab", []byte("...Agents...Library..."), ModalClassAgents},
+		// #223: bare header text with no co-signal (no highlight color for the
+		// panels, no ❯-option row for the option dialogs) no longer classifies.
+		{"mcp title text alone is NOT the mcp panel", []byte("...Manage MCP servers..."), ModalClassUnknown},
+		{"agents header + tab text alone is NOT agents", []byte("...Agents...Running..."), ModalClassUnknown},
+		{"model-select text alone is NOT model-select", []byte("...Select model..."), ModalClassUnknown},
+		{"ask-user footer alone is NOT ask-user", []byte("...Enter to select..."), ModalClassUnknown},
+		{"permissions-config text alone is NOT the config modal", []byte("Permissions...Allow...Ask...Deny"), ModalClassUnknown},
 		{
 			// #151: a `/`-row with no picker highlight chrome is NOT a
 			// picker — a lone command-shaped line (or an absolute path) at
@@ -72,7 +79,6 @@ func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 			[]byte("see /usr/local/bin for binaries"),
 			ModalClassUnknown,
 		},
-		{"ask-user spaced", []byte("...Enter to select..."), ModalClassAskUserQuestion},
 		{
 			// #219: trust now needs the dialog shape (header + a pointer-marked
 			// option row), not the header phrase alone. A structurally complete
@@ -83,10 +89,6 @@ func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 			ModalClassTrustFolder,
 		},
 		{"permission spaced", []byte("...Do you want to proceed..."), ModalClassPermission},
-		{"model-select spaced", []byte("...Select model..."), ModalClassModelSelect},
-		{"permissions-config + Allow tab", []byte("Permissions header...Allow rules"), ModalClassPermissionsConfig},
-		{"permissions-config + Ask tab", []byte("Permissions...Ask before"), ModalClassPermissionsConfig},
-		{"permissions-config + Deny tab", []byte("Permissions...Deny list"), ModalClassPermissionsConfig},
 		{"permissions header alone is NOT a config modal", []byte("see Permissions docs for details"), ModalClassUnknown},
 	}
 	for _, tc := range cases {
@@ -150,8 +152,10 @@ func TestDetectModalClassPermissionRegion(t *testing.T) {
 func TestDetectModalClassMatchesControlSequenceWrappedAnchor(t *testing.T) {
 	// Spaced anchor wrapped in CSI + OSC noise — the grid render consumes the
 	// control sequences and preserves the spacing, so the predicate still
-	// matches.
-	in := []byte("\x1b[1m\x1b]0;title text\x07Manage MCP servers\x1b[0m")
+	// matches. The 38;5;153 highlight-color escape supplies the #223 mcp
+	// co-signal (index 153 → 175,215,255), so the panel classifies as it would
+	// on the real screen.
+	in := []byte("\x1b[1m\x1b]0;title text\x07\x1b[38;5;153mManage MCP servers\x1b[0m")
 	if got := DetectModalClass(in); got != ModalClassMCP {
 		t.Errorf("DetectModalClass(wrapped) = %q, want %q", got, ModalClassMCP)
 	}
@@ -246,7 +250,12 @@ func TestDetectModalClassRealFixtures(t *testing.T) {
 		want    ModalClass
 	}{
 		{"mcp-snapshot.bin", ModalClassMCP},
-		{"mcp-empty-snapshot.bin", ModalClassMCP},
+		// #223: mcp-empty-snapshot.bin is NOT a modal — it is the inline `/mcp`
+		// result ("No MCP servers configured…") echoed on an otherwise idle
+		// screen (❯ input prompt and the status bar are at the bottom). #223
+		// removed the empty-state anchor, so it now classifies Unknown and reads
+		// idle. TestDetectModalClassMcpEmptyIsIdleNotModal pins that below.
+		{"mcp-empty-snapshot.bin", ModalClassUnknown},
 		{"agents-snapshot.bin", ModalClassAgents},
 		{"picker-snapshot.bin", ModalClassSlashPicker},
 		{"picker-truecolor-snapshot.bin", ModalClassSlashPicker},
@@ -275,13 +284,10 @@ func TestDetectModalClassRealFixtures(t *testing.T) {
 }
 
 // TestDetectModalClassSyntheticGridFixtures keeps hand-built grids for the three
-// classes that were fixture-less before #222 (ask-user-question's only .bin was
-// a JSONL dump that classifies Unknown; model-select and permissions-config had
-// none). #222 captured real-screen fixtures for all three — asserted in
-// TestDetectModalClassRealFixtures — so these synthetic grids are now redundant
-// controls, retained because they pin the anchor against a minimal hand-built
-// screen independent of a captured fixture's incidental chrome. Built with \r\n
-// so vt10x renders flat rows.
+// classes captured for real in #222, retained as minimal controls that also
+// exercise each #223 co-signal: the ❯-marked option row for ask-user and
+// model-select, and the picker highlight color (the 38;5;153 escape → 175,215,255)
+// for permissions-config. Built with \r\n so vt10x renders flat rows.
 func TestDetectModalClassSyntheticGridFixtures(t *testing.T) {
 	cases := []struct {
 		name string
@@ -300,7 +306,7 @@ func TestDetectModalClassSyntheticGridFixtures(t *testing.T) {
 		},
 		{
 			"permissions-config grid with Allow/Ask/Deny tabs",
-			[]byte("Permissions\r\nAllow   Ask   Deny\r\n  No rules configured\r\n"),
+			[]byte("Permissions\r\n\x1b[38;5;153mAllow\x1b[39m   Ask   Deny\r\n  No rules configured\r\n"),
 			ModalClassPermissionsConfig,
 		},
 	}
@@ -326,8 +332,11 @@ func TestDetectModalClassSyntheticGridFixtures(t *testing.T) {
 // TestDetectModalClassPermissionRegion; the idle/busy pair by #153 in
 // state_test.go. Do not duplicate them here.
 func TestDetectModalClassMCPAnchorScrolledOffNotModal(t *testing.T) {
-	rows := []string{"No MCP servers configured"} // a real mcp anchor, as a log line
-	for i := 0; i < 45; i++ {                      // enough output to scroll it off a 40-row screen
+	// The real mcp title AND a picker-highlight escape, as a log line — both
+	// #223 co-signals present — so grid exclusion is the sole reason it must not
+	// classify once it scrolls off the visible screen.
+	rows := []string{"\x1b[38;5;153mManage MCP servers\x1b[39m"} // real anchor + highlight, as a log line
+	for i := 0; i < 45; i++ {                                     // enough output to scroll it off a 40-row screen
 		rows = append(rows, "transcript body line")
 	}
 	rows = append(rows, "❯ ") // idle prompt at the bottom; no modal is up
@@ -336,7 +345,7 @@ func TestDetectModalClassMCPAnchorScrolledOffNotModal(t *testing.T) {
 	// Contrast that makes the test non-vacuous: the anchor IS in the raw bytes,
 	// so a naive whole-buffer substring match would forge MCP. The grid never
 	// sees it because it scrolled off the visible screen.
-	if !strings.Contains(string(forged), "No MCP servers configured") {
+	if !strings.Contains(string(forged), "Manage MCP servers") {
 		t.Fatal("fixture lost the forged anchor — the forgery contrast is void")
 	}
 	if got := DetectModalClass(forged); got != ModalClassUnknown {
@@ -350,6 +359,24 @@ func TestDetectModalClassMCPAnchorScrolledOffNotModal(t *testing.T) {
 	}
 	if got := DetectModalClass(snap); got != ModalClassMCP {
 		t.Errorf("mcp-snapshot.bin positive control: DetectModalClass = %q, want MCP", got)
+	}
+}
+
+// TestDetectModalClassMcpEmptyIsIdleNotModal pins the #223 decision on the
+// inline `/mcp` empty-state echo. mcp-empty-snapshot.bin is the "No MCP servers
+// configured…" result of running /mcp with strict MCP, sitting on an otherwise
+// idle screen (the ❯ input prompt and status bar render at the bottom). It is
+// NOT a modal. Before #223 the "No MCP servers configured" anchor classified it
+// as mcp, which held the modal axis on an idle screen and suppressed idle and
+// thinking edge events. #223 removed the anchor: the screen now reads Unknown
+// (no modal) and idle.
+func TestDetectModalClassMcpEmptyIsIdleNotModal(t *testing.T) {
+	snap := loadFixture(t, "mcp-empty-snapshot.bin")
+	if got := DetectModalClass(snap); got != ModalClassUnknown {
+		t.Errorf("DetectModalClass(mcp-empty) = %q, want Unknown (inline echo, not a modal)", got)
+	}
+	if !IsIdle(snap) {
+		t.Errorf("IsIdle(mcp-empty) = false, want true (the screen is idle, ready for input)")
 	}
 }
 
