@@ -46,8 +46,8 @@ func TestHasUnknownDialogDetectsMcpEnablement(t *testing.T) {
 	if !HasUnknownDialog(snap) {
 		t.Errorf("HasUnknownDialog(mcp-enablement) = false, want true")
 	}
-	if !isUnknownModal(snap) {
-		t.Errorf("isUnknownModal(mcp-enablement) = false, want true (Readiness.UnknownModal must catch it)")
+	if !isUnexpectedStartupModal(snap) {
+		t.Errorf("isUnexpectedStartupModal(mcp-enablement) = false, want true (WaitReady must fail loudly on it)")
 	}
 }
 
@@ -116,17 +116,18 @@ func TestHasUnknownDialogIdleAndEmpty(t *testing.T) {
 	if HasUnknownDialog(nil) || HasUnknownDialog([]byte{}) {
 		t.Errorf("HasUnknownDialog(empty) = true, want false")
 	}
-	if isUnknownModal(idle) {
-		t.Errorf("isUnknownModal(idle) = true, want false")
+	if isUnexpectedStartupModal(idle) {
+		t.Errorf("isUnexpectedStartupModal(idle) = true, want false")
 	}
 }
 
-// TestReadinessUnknownModalTrustExcluded: the trust modal is surfaced by
-// Readiness.TrustModal, so isUnknownModal must stay false for it — no
-// double-surfacing — even though trust carries the selection shape.
-func TestReadinessUnknownModalTrustExcluded(t *testing.T) {
+// TestReadinessUnexpectedModalTrustExcluded: the trust modal is surfaced by
+// Readiness.TrustModal (report-only, driver decides), so isUnexpectedStartupModal
+// must stay false for it — WaitReady must not fail loudly on trust — even though
+// trust carries the selection shape.
+func TestReadinessUnexpectedModalTrustExcluded(t *testing.T) {
 	snap := loadFixture(t, "trust-folder-snapshot.bin")
-	if isUnknownModal(snap) {
-		t.Errorf("isUnknownModal(trust) = true, want false (surfaced by TrustModal, not UnknownModal)")
+	if isUnexpectedStartupModal(snap) {
+		t.Errorf("isUnexpectedStartupModal(trust) = true, want false (surfaced by TrustModal, not a loud error)")
 	}
 }

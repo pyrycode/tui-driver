@@ -10,10 +10,26 @@ import (
 func TestWaitReady(t *testing.T) {
 	idle := []byte(idleGlyphTest + " ") // ❯ present, no spinner → IsIdle
 
+	// loadIdleFixture loads a real fixture and guards that it renders idle. A
+	// non-idle fixture would make WaitReady block until the ctx deadline, so this
+	// fails loudly at load time instead of as an opaque test timeout.
+	loadIdleFixture := func(t *testing.T, name string) []byte {
+		snap := loadFixture(t, name)
+		if !IsIdle(snap) {
+			t.Fatalf("fixture %s is not IsIdle; WaitReady would block on it", name)
+		}
+		return snap
+	}
+
 	tests := []struct {
 		name string
 		snap []byte
-		want Readiness
+		// want is the expected Readiness on a nil-error return. wantErr selects
+		// the #173 loud-error path instead, with wantClass the modal class the
+		// UnexpectedModalError must carry.
+		want      Readiness
+		wantErr   bool
+		wantClass ModalClass
 	}{
 		{
 			name: "clean idle",
@@ -21,13 +37,22 @@ func TestWaitReady(t *testing.T) {
 			want: Readiness{Idle: true},
 		},
 		{
+			// mcp-empty is the `/mcp` "No MCP servers configured" line echoed on an
+			// otherwise idle screen (#223): DetectModalClass is Unknown and no
+			// selection shape is present, so it is clean-ready, not an unexpected
+			// modal. Guards a regression that would re-classify the echo as a modal.
+			name: "mcp-empty echo at idle is clean-ready",
+			snap: loadIdleFixture(t, "mcp-empty-snapshot.bin"),
+			want: Readiness{Idle: true},
+		},
+		{
+			// AC3: trust stays report-only, the driver owns the trust decision.
 			// Spaced form: since #163 HasTrustModal matches the rendered grid, so
-			// the on-screen "Quick safety check" header is what sets TrustModal
-			// (consistent with DetectModalClass). #219: the header alone no longer
-			// suffices — the fixture is now the full dialog shape (header plus a
-			// pointer-marked option row), as trust-folder-snapshot.bin renders it.
-			// The option row's ❯ also supplies the idle glyph, so Idle stays true.
-			name: "trust modal at idle",
+			// the on-screen "Quick safety check" header sets TrustModal. #219: the
+			// header alone no longer suffices — the fixture is the full dialog shape
+			// (header plus a pointer-marked option row). The option row's ❯ also
+			// supplies the idle glyph, so Idle stays true.
+			name: "trust modal at idle stays report-only (synthetic)",
 			snap: []byte("Quick safety check: Is this a project you created or one you trust?\r\n" +
 				"❯ 1. Yes, I trust this folder\r\n" +
 				"  2. No, I selected this folder by mistake\r\n" +
@@ -35,32 +60,63 @@ func TestWaitReady(t *testing.T) {
 			want: Readiness{Idle: true, TrustModal: true},
 		},
 		{
-			name: "mcp failure banner at idle",
+			name: "trust modal at idle stays report-only (real fixture)",
+			snap: loadIdleFixture(t, "trust-folder-snapshot.bin"),
+			want: Readiness{Idle: true, TrustModal: true},
+		},
+		{
+			// AC3: the MCP-failure banner is a status line, not a modal class, so it
+			// does not trip the gate — it stays a report-only flag.
+			name: "mcp failure banner at idle stays report-only",
 			snap: append([]byte("2 MCP servers failed "), idle...),
 			want: Readiness{Idle: true, McpFailure: true, FailedMcpCount: 2},
 		},
 		{
-			// #220: the network anchor is now claude's real 2.1.199 status
-			// line, "Unable to connect to API", matched in the status region.
-			name: "network failure at idle",
+			// AC3: #220's network anchor ("Unable to connect to API") is a status
+			// line, advisory only — claude retries it itself — so it stays a flag.
+			name: "network failure at idle stays report-only",
 			snap: append([]byte("Unable to connect to API (ConnectionRefused) "), idle...),
 			want: Readiness{Idle: true, NetworkFailure: true},
 		},
 		{
-			// A recognized modal that no other Readiness field surfaces (here a
-			// permission prompt) sets UnknownModal. Spaced form: since #152
-			// DetectModalClass matches the rendered grid, so the on-screen
-			// "Do you want to proceed" is what classifies as Permission.
-			name: "unrecognized modal at idle",
-			snap: append([]byte("Do you want to proceed"), idle...),
-			want: Readiness{Idle: true, UnknownModal: true},
+			// AC2/AC5, #173 inversion: a recognized modal that is not part of a
+			// clean startup no longer rides as an advisory flag — it fails loudly so
+			// a consumer reading only the error never types its first prompt into it.
+			name:      "unexpected permission modal at idle fails loudly (real fixture)",
+			snap:      loadIdleFixture(t, "permission-snapshot.bin"),
+			wantErr:   true,
+			wantClass: ModalClassPermission,
+		},
+		{
+			// Synthetic permission overlay in the bottom region (#152/#153). Spaced
+			// form: since #152 DetectModalClass matches the rendered grid, so the
+			// on-screen "Do you want to proceed" classifies as Permission.
+			name:      "unexpected permission modal at idle fails loudly (synthetic)",
+			snap:      append([]byte("Do you want to proceed"), idle...),
+			wantErr:   true,
+			wantClass: ModalClassPermission,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Session{buffer: NewBuffer(0)}
 			s.buffer.Append(tt.snap)
-			got, err := s.WaitReady(context.Background())
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			got, err := s.WaitReady(ctx)
+			if tt.wantErr {
+				var ume *UnexpectedModalError
+				if !errors.As(err, &ume) {
+					t.Fatalf("WaitReady err = %v, want *UnexpectedModalError", err)
+				}
+				if ume.Class != tt.wantClass {
+					t.Errorf("UnexpectedModalError.Class = %q, want %q", ume.Class, tt.wantClass)
+				}
+				if (got != Readiness{}) {
+					t.Errorf("WaitReady = %+v on error, want zero Readiness", got)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("WaitReady: %v", err)
 			}
