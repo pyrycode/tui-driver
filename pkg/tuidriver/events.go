@@ -191,7 +191,7 @@ func (s *Session) Events(ctx context.Context, jsonlPath string, startOffset int6
 		return nil, err
 	}
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, s.buffer.Snapshot, s.buffer.QuietFor, tr.ptyQuietLimit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, s.buffer.Snapshot, s.gridDims, s.buffer.QuietFor, tr.ptyQuietLimit, jsonlCh, out, DefaultPollInterval)
 	return out, nil
 }
 
@@ -219,6 +219,7 @@ func (s *Session) Events(ctx context.Context, jsonlPath string, startOffset int6
 func mergeEvents(
 	ctx context.Context,
 	snapshot func() []byte,
+	dims func() (cols, rows int),
 	quietFor func() time.Duration,
 	ptyQuietLimit time.Duration,
 	jsonlCh <-chan JSONLEntry,
@@ -293,7 +294,8 @@ func mergeEvents(
 				}
 			}
 		case <-ticker.C:
-			cur := classify(snapshot())
+			cols, rows := dims()
+			cur := classify(snapshot(), cols, rows)
 			now := time.Now()
 			// Stall predicate (ADR 025 safe-degrade): mid-turn AND PTY
 			// quiet beyond the limit AND no JSONL progress within that
@@ -441,15 +443,21 @@ type ptyState struct {
 var gridForClassify = NewGrid
 
 // classify reduces snap to the independent PTY-state axes the merge loop
-// tracks. It renders the snapshot once (gridForClassify) and threads that one
-// Grid into the grid-accepting variant of each predicate — isIdleGrid,
-// busyInRegion, detectModalClassWithGrid, mcpBannerMatchInRegion, and
-// hasNetworkFailureGrid — so a tick renders once, not once per axis. The
+// tracks. It renders the snapshot once (gridForClassify) at cols x rows and
+// threads that one Grid into the grid-accepting variant of each predicate —
+// isIdleGrid, busyInRegion, detectModalClassWithGrid, mcpBannerMatchInRegion,
+// and hasNetworkFailureGrid — so a tick renders once, not once per axis. The
 // exported single-snapshot predicates (IsIdle, DetectModalClass, …) stay as thin
 // wrappers over these same variants, so non-tick callers and the public API are
 // unchanged.
-func classify(snap []byte) ptyState {
-	g := gridForClassify(snap, 0, 0)
+//
+// cols/rows are the render dimensions (#226); the merge loop passes the
+// session's current terminal size so a resized interactive session is rendered
+// at the size claude drew it for. 0 for either falls through to the package
+// default (NewGrid's convention), which is what non-session callers and the
+// default-size case get.
+func classify(snap []byte, cols, rows int) ptyState {
+	g := gridForClassify(snap, cols, rows)
 	return ptyState{
 		idle:           isIdleGrid(g),
 		thinking:       busyInRegion(g),

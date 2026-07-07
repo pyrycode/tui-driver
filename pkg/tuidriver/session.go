@@ -143,6 +143,14 @@ type Session struct {
 	// is possible. Set once before any goroutine starts and only read after, so
 	// the hot-loop nil check and the accessor need no lock.
 	mirrorOut chan []byte
+
+	// sizeMu guards curCols/curRows — the session's current terminal size, the
+	// dimensions detection renders at (#226). Resize (consumer goroutine) writes
+	// it; gridDims (the merge-loop goroutine, per tick) reads it, so the two
+	// need synchronising. Seeded in Spawn to the StartPTY default, updated on
+	// each successful Resize.
+	sizeMu           sync.Mutex
+	curCols, curRows int
 }
 
 // Spawn launches cmd inside a PTY and starts a reader goroutine that
@@ -180,6 +188,10 @@ func Spawn(cmd *exec.Cmd, opts SpawnOpts) (*Session, error) {
 		readerDone:    make(chan struct{}),
 		shutdownGrace: grace,
 		recCloser:     recCloser,
+		// Seed the tracked size to what StartPTY set the PTY to. A session that
+		// never calls Resize keeps detection rendering at this default.
+		curCols: int(DefaultPtyCols),
+		curRows: int(DefaultPtyRows),
 	}
 	if opts.MirrorOutput {
 		s.mirrorOut = make(chan []byte, defaultMirrorOutputBuffer)

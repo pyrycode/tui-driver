@@ -44,6 +44,13 @@ func (s *testSnap) Set(b []byte) {
 // unchanged: no stall event ever fires.
 func neverQuiet() time.Duration { return 0 }
 
+// zeroDims is the dims closure the merge-loop tests pass: (0, 0) falls through
+// to the package default grid size (NewGrid's convention), so these tests
+// exercise detection at the default 120x40 exactly as before #226 added the
+// session-size-aware render path. The session-resize path is covered in
+// resize_test.go.
+func zeroDims() (int, int) { return 0, 0 }
+
 // mustReceiveEvent blocks for at most timeout waiting for an Event on
 // ch. Fails the test if no value arrives or if the channel closes
 // early. Mirrors the mustReceive helper in jsonl_test.go.
@@ -81,7 +88,7 @@ func TestMergeEvents_PtyIdleAndThinkingTransitions(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Phase 1: ❯ alone → PtyIdle.
 	snap.Set([]byte("\xe2\x9d\xaf input"))
@@ -123,7 +130,7 @@ func TestMergeEvents_ModalShowAndHide(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Phase 1: enter Permission modal. ❯ is present (modal still renders
 	// the input line) but idle/thinking emissions are suppressed while a
@@ -194,7 +201,7 @@ func TestMergeEvents_ModalClearRevealsSuppressedIdleThenThinking(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Phase 1: Permission modal with ❯ present. IsIdle is true throughout,
 	// but idle emission is suppressed while a modal is up — only ModalShown
@@ -282,7 +289,7 @@ func TestMergeEvents_JsonlEntryAndSyntheticEndOfTurn(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry, 4)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Non-assistant entry: emits one JsonlEntry, no EndOfTurn.
 	userEntry := JSONLEntry{
@@ -369,7 +376,7 @@ func TestMergeEvents_InterleavedArrivalOrder(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry, 4)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// 1. PTY: enter idle.
 	snap.Set([]byte("\xe2\x9d\xaf input"))
@@ -411,7 +418,7 @@ func TestMergeEvents_CleanShutdown(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Park briefly so the merge goroutine has set up its ticker and is
 	// blocked in the select — the close-on-cancel timing test exercises
@@ -437,7 +444,7 @@ func TestMergeEvents_JsonlChClosureCtxLiveEmitsError(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Park briefly so the merge goroutine is in its select loop, then
 	// close jsonlCh with ctx STILL LIVE — the merge-seam simulation of the
@@ -469,7 +476,7 @@ func TestMergeEvents_JsonlChCloseAfterCancelEmitsNoError(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	time.Sleep(75 * time.Millisecond)
 	cancel()
@@ -491,7 +498,7 @@ func TestMergeEvents_ReadFaultSurfacesTerminalError(t *testing.T) {
 	jsonlCh := make(chan JSONLEntry, defaultJSONLTailBuffer)
 	out := make(chan Event, defaultEventBuffer)
 	go tailJSONLLoop(ctx, r, jsonlCh)
-	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// The scripted good line surfaces as a normal entry event first...
 	if ev := mustReceiveEvent(t, out, 500*time.Millisecond); ev.Kind != EventKindJsonlEntry {
@@ -518,7 +525,7 @@ func TestMergeEvents_McpFailureBannerTransitions(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Phase 1: empty snap, no banner → no event within two ticks.
 	select {
@@ -574,7 +581,7 @@ func TestMergeEvents_NetworkFailureTransitions(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Phase 1: empty snap → no event.
 	select {
@@ -625,7 +632,7 @@ func TestMergeEvents_BannerCoexistsWithIdleAndModal(t *testing.T) {
 	snap := &testSnap{}
 	jsonlCh := make(chan JSONLEntry)
 	out := make(chan Event, defaultEventBuffer)
-	go mergeEvents(ctx, snap.Snapshot, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
 	// Phase 1: idle glyph AND banner in one snapshot. Expect two events
 	// in the same tick: PtyIdle and McpFailureShown. Internal emission
@@ -716,7 +723,7 @@ func TestMergeEvents_StallRisingEdgeFiresOnceAndDoesNotRepeat(t *testing.T) {
 	const limit = 10 * time.Millisecond
 	// The PTY has been quiet well beyond the limit on every tick.
 	quietFor := func() time.Duration { return 5 * limit }
-	go mergeEvents(ctx, snap.Snapshot, quietFor, limit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, quietFor, limit, jsonlCh, out, DefaultPollInterval)
 
 	// (a) not idle, (b) quietFor > limit, (c) no JSONL ever → stall.
 	snap.Set(stallSnap)
@@ -754,7 +761,7 @@ func TestMergeEvents_StallSuppressedAtIdle(t *testing.T) {
 	out := make(chan Event, defaultEventBuffer)
 	const limit = 10 * time.Millisecond
 	quietFor := func() time.Duration { return 5 * limit }
-	go mergeEvents(ctx, snap.Snapshot, quietFor, limit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, quietFor, limit, jsonlCh, out, DefaultPollInterval)
 
 	// Idle snapshot (❯, no ✻): (a) !idle is false even though the PTY is
 	// quiet beyond the limit and no JSONL has arrived. The idle edge
@@ -787,7 +794,7 @@ func TestMergeEvents_StallSuppressedByRecentPty(t *testing.T) {
 	// PTY bytes arrived recently — quiet window stays below the limit, so
 	// (b) never holds.
 	quietFor := func() time.Duration { return limit / 10 }
-	go mergeEvents(ctx, snap.Snapshot, quietFor, limit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, quietFor, limit, jsonlCh, out, DefaultPollInterval)
 
 	snap.Set(stallSnap)
 	select {
@@ -813,7 +820,7 @@ func TestMergeEvents_StallSuppressedByRecentJsonlThenFires(t *testing.T) {
 	// The PTY is quiet beyond the limit throughout; only JSONL progress
 	// gates the stall in this scenario.
 	quietFor := func() time.Duration { return 10 * limit }
-	go mergeEvents(ctx, snap.Snapshot, quietFor, limit, jsonlCh, out, DefaultPollInterval)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, quietFor, limit, jsonlCh, out, DefaultPollInterval)
 
 	// (a) and (b) hold immediately. Record a JSONL arrival so (c) — no
 	// JSONL within the window — is suppressed.
@@ -861,7 +868,7 @@ func TestClassifyRendersGridOncePerTick(t *testing.T) {
 		return orig(snap, cols, rows)
 	}
 	snap := []byte("\xe2\x9d\xaf input ... 1 MCP server failed \xc2\xb7 /mcp")
-	_ = classify(snap)
+	_ = classify(snap, 0, 0)
 	if calls != 1 {
 		t.Fatalf("classify rendered %d grids, want exactly 1", calls)
 	}
@@ -883,7 +890,7 @@ func TestClassifyBehaviorUnchangedAfterSingleRender(t *testing.T) {
 	}
 	for name, snap := range cases {
 		t.Run(name, func(t *testing.T) {
-			got := classify(snap)
+			got := classify(snap, 0, 0)
 			if got.idle != IsIdle(snap) {
 				t.Errorf("idle = %v, want %v", got.idle, IsIdle(snap))
 			}
@@ -917,7 +924,7 @@ func TestMergeEvents_StallReusesPtyQuietLimit(t *testing.T) {
 		snap := &testSnap{}
 		jsonlCh := make(chan JSONLEntry)
 		out := make(chan Event, defaultEventBuffer)
-		go mergeEvents(ctx, snap.Snapshot, quietFor, quiet/3, jsonlCh, out, DefaultPollInterval)
+		go mergeEvents(ctx, snap.Snapshot, zeroDims, quietFor, quiet/3, jsonlCh, out, DefaultPollInterval)
 
 		snap.Set(stallSnap)
 		ev := mustReceiveEvent(t, out, 500*time.Millisecond)
@@ -934,7 +941,7 @@ func TestMergeEvents_StallReusesPtyQuietLimit(t *testing.T) {
 		snap := &testSnap{}
 		jsonlCh := make(chan JSONLEntry)
 		out := make(chan Event, defaultEventBuffer)
-		go mergeEvents(ctx, snap.Snapshot, quietFor, 10*quiet, jsonlCh, out, DefaultPollInterval)
+		go mergeEvents(ctx, snap.Snapshot, zeroDims, quietFor, 10*quiet, jsonlCh, out, DefaultPollInterval)
 
 		snap.Set(stallSnap)
 		select {
