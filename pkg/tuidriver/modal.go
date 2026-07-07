@@ -79,6 +79,12 @@ const (
 // highlight chrome (a foreground color in pickerHighlightedRGBs). Both are
 // required. It runs LAST (see DetectModalClass) and reuses the grid this
 // function already built.
+//
+// ⚠️ When you add or change an anchor here, add it to the #221 negative
+// regression suite (anchor_forgery_test.go). That suite renders every anchor as
+// screen CONTENT and asserts the detector does not fire — an anchor without a
+// structural co-signal fails it by default. Skipping this step is how the 173
+// and 217 forgeries shipped.
 var (
 	anchorMCPSpaced           = []byte("Manage MCP servers")
 	anchorMCPEmptySpaced      = []byte("No MCP servers configured")
