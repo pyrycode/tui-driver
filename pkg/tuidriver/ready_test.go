@@ -23,9 +23,15 @@ func TestWaitReady(t *testing.T) {
 		{
 			// Spaced form: since #163 HasTrustModal matches the rendered grid, so
 			// the on-screen "Quick safety check" header is what sets TrustModal
-			// (consistent with DetectModalClass). A real trust modal renders spaced.
+			// (consistent with DetectModalClass). #219: the header alone no longer
+			// suffices — the fixture is now the full dialog shape (header plus a
+			// pointer-marked option row), as trust-folder-snapshot.bin renders it.
+			// The option row's ❯ also supplies the idle glyph, so Idle stays true.
 			name: "trust modal at idle",
-			snap: append([]byte("Quick safety check"), idle...),
+			snap: []byte("Quick safety check: Is this a project you created or one you trust?\r\n" +
+				"❯ 1. Yes, I trust this folder\r\n" +
+				"  2. No, I selected this folder by mistake\r\n" +
+				"(Esc to cancel)\r\n"),
 			want: Readiness{Idle: true, TrustModal: true},
 		},
 		{

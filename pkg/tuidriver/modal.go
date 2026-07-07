@@ -63,7 +63,11 @@ const (
 //	                      (pre-2.1.199 only — see ModalClassAgents)
 //	ask-user-question   → "Enter to select"
 //	trust-folder        → "Quick safety check" (anchorTrustHeaderSpaced, defined
-//	                      in permission.go beside the trust-modal extractor)
+//	                      in permission.go) AND a pointer-marked numbered option
+//	                      row directly below it — the dialog shape, via
+//	                      gridHasTrustDialog (trust.go). #219: the header alone
+//	                      classified any on-screen quotation of it as the modal,
+//	                      a fatal false positive under the runner's abort policy.
 //	permission          → "Do you want to proceed" — region-scoped to the
 //	                      bottom overlay window (permissionRegionRows)
 //	model-select        → "Select model" (the `/model` modal)
@@ -147,7 +151,7 @@ func DetectModalClass(snap []byte) ModalClass {
 		return ModalClassAgents
 	case gridContains(g, anchorAskUserSpaced):
 		return ModalClassAskUserQuestion
-	case gridContains(g, anchorTrustHeaderSpaced):
+	case gridHasTrustDialog(g):
 		return ModalClassTrustFolder
 	case g.ContainsInLastRows(string(anchorPermissionSpaced), permissionRegionRows):
 		return ModalClassPermission
