@@ -118,7 +118,13 @@ func busyInRegion(g *Grid) bool {
 // etc.) ALSO render ❯; check DetectModalClass to disambiguate when modal
 // handling matters.
 func IsIdle(snap []byte) bool {
-	g := NewGrid(snap, 0, 0)
+	return isIdleGrid(NewGrid(snap, 0, 0))
+}
+
+// isIdleGrid is IsIdle over a Grid the caller already rendered. Factored out so
+// the per-tick classifier can render the snapshot once and share the grid across
+// every axis (#225); IsIdle stays the thin single-snapshot wrapper.
+func isIdleGrid(g *Grid) bool {
 	if !g.ContainsInLastRows(string(IdleGlyph), statusRegionRows) {
 		return false
 	}

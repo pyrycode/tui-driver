@@ -72,14 +72,18 @@ func (s *Session) WaitReady(ctx context.Context) (Readiness, error) {
 	if err := s.waitUntilOrExit(ctx, func() bool { return IsIdle(s.Snapshot()) }); err != nil {
 		return Readiness{}, err
 	}
+	// Render the post-idle snapshot once and share the one Grid across every
+	// blocking-condition check (#225), instead of each of the five predicates
+	// rebuilding its own grid from the same bytes.
 	snap := s.Snapshot()
+	g := NewGrid(snap, 0, 0)
 	return Readiness{
 		Idle:           true,
-		TrustModal:     HasTrustModal(snap),
-		McpFailure:     HasMcpFailureBanner(snap),
-		FailedMcpCount: FailedMcpCount(snap),
-		NetworkFailure: HasNetworkFailure(snap),
-		UnknownModal:   isUnknownModal(snap),
+		TrustModal:     gridHasTrustDialog(g),
+		McpFailure:     mcpBannerMatchInRegion(g) != nil,
+		FailedMcpCount: mcpCountFromGrid(g),
+		NetworkFailure: hasNetworkFailureGrid(g),
+		UnknownModal:   isUnknownModalGrid(g, snap),
 	}, nil
 }
 
@@ -90,11 +94,19 @@ func (s *Session) WaitReady(ctx context.Context) (Readiness, error) {
 // UNLESS a novel dialog shape is present (#224): a dialog whose class is not
 // recognized but whose selection shape is, which still blocks input.
 func isUnknownModal(snap []byte) bool {
-	switch DetectModalClass(snap) {
+	return isUnknownModalGrid(NewGrid(snap, 0, 0), snap)
+}
+
+// isUnknownModalGrid is isUnknownModal over a Grid the caller already rendered.
+// WaitReady threads its single post-idle grid here (#225), so the unknown-modal
+// check reuses the same render as the class detection it wraps rather than
+// building two more grids (DetectModalClass + the selection-dialog probe).
+func isUnknownModalGrid(g *Grid, snap []byte) bool {
+	switch detectModalClassWithGrid(g, snap) {
 	case ModalClassTrustFolder:
 		return false
 	case ModalClassUnknown:
-		return gridHasSelectionDialog(NewGrid(snap, 0, 0))
+		return gridHasSelectionDialog(g)
 	default:
 		return true
 	}

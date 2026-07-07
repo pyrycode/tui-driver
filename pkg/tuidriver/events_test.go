@@ -844,6 +844,65 @@ func TestMergeEvents_StallSuppressedByRecentJsonlThenFires(t *testing.T) {
 	assertEventChClosed(t, out, 500*time.Millisecond)
 }
 
+// TestClassifyRendersGridOncePerTick pins the #225 property: one classifier
+// tick renders the snapshot through the terminal emulator exactly once, not
+// once per predicate. gridForClassify is the sole render seam in the classify
+// path; the test swaps it for a counting wrapper and asserts a single call.
+// classify is driven synchronously (no merge goroutine), so the package-var
+// swap races nothing. The snapshot exercises every axis (idle glyph, spinner,
+// modal anchor, banner) so a predicate that rebuilt its own grid would push the
+// count past one.
+func TestClassifyRendersGridOncePerTick(t *testing.T) {
+	orig := gridForClassify
+	t.Cleanup(func() { gridForClassify = orig })
+	var calls int
+	gridForClassify = func(snap []byte, cols, rows int) *Grid {
+		calls++
+		return orig(snap, cols, rows)
+	}
+	snap := []byte("\xe2\x9d\xaf input ... 1 MCP server failed \xc2\xb7 /mcp")
+	_ = classify(snap)
+	if calls != 1 {
+		t.Fatalf("classify rendered %d grids, want exactly 1", calls)
+	}
+}
+
+// TestClassifyBehaviorUnchangedAfterSingleRender guards that threading one grid
+// through the predicate variants keeps classify's per-axis output identical to
+// calling the exported single-snapshot predicates independently. It is the
+// behavior-equivalence net for the #225 refactor, over a spread of snapshots.
+func TestClassifyBehaviorUnchangedAfterSingleRender(t *testing.T) {
+	cases := map[string][]byte{
+		"empty":       nil,
+		"idle":        []byte("\xe2\x9d\xaf input"),
+		"thinking":    []byte("\xe2\x9c\xbb Baked for 2s\n\xe2\x9d\xaf input"),
+		"permission":  []byte("\xe2\x9d\xaf Do you want to proceed"),
+		"mcp-banner":  []byte("\xe2\x9d\xaf input ... 1 MCP server failed \xc2\xb7 /mcp"),
+		"network":     []byte("Unable to connect to API (ConnectionRefused)"),
+		"idle+banner": []byte("\xe2\x9d\xaf input ... 2 MCP servers failed"),
+	}
+	for name, snap := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := classify(snap)
+			if got.idle != IsIdle(snap) {
+				t.Errorf("idle = %v, want %v", got.idle, IsIdle(snap))
+			}
+			if got.thinking != IsThinking(snap) {
+				t.Errorf("thinking = %v, want %v", got.thinking, IsThinking(snap))
+			}
+			if got.modal != DetectModalClass(snap) {
+				t.Errorf("modal = %q, want %q", got.modal, DetectModalClass(snap))
+			}
+			if got.mcpFailure != HasMcpFailureBanner(snap) {
+				t.Errorf("mcpFailure = %v, want %v", got.mcpFailure, HasMcpFailureBanner(snap))
+			}
+			if got.networkFailure != HasNetworkFailure(snap) {
+				t.Errorf("networkFailure = %v, want %v", got.networkFailure, HasNetworkFailure(snap))
+			}
+		})
+	}
+}
+
 func TestMergeEvents_StallReusesPtyQuietLimit(t *testing.T) {
 	// quietFor reports a fixed quiet window on every tick. The stall
 	// fires only when the configured ptyQuietLimit is below that window,

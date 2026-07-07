@@ -67,7 +67,15 @@ func HasMcpFailureBanner(snap []byte) bool {
 // only need a boolean — FailedMcpCount does the full region-scoped match either
 // way.
 func FailedMcpCount(snap []byte) int {
-	m := mcpBannerMatchInRegion(NewGrid(snap, 0, 0))
+	return mcpCountFromGrid(NewGrid(snap, 0, 0))
+}
+
+// mcpCountFromGrid is FailedMcpCount over a Grid the caller already rendered.
+// WaitReady's one-shot classification renders the post-idle snapshot once and
+// shares that grid across the trust/mcp/network/unknown checks (#225);
+// FailedMcpCount stays the thin single-snapshot wrapper.
+func mcpCountFromGrid(g *Grid) int {
+	m := mcpBannerMatchInRegion(g)
 	if m == nil {
 		return 0
 	}
