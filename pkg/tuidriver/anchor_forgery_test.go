@@ -220,6 +220,65 @@ func TestWholeGridAnchorsRejectContentForgery(t *testing.T) {
 	}
 }
 
+// TestSlashPickerRejectsBodyForgery is the #237 content-forgery regression for
+// the slash-picker class. Its two signals are both individually weak: the picker
+// highlight color (xterm-256 index 153 and its truecolor twin) is a general
+// light blue claude paints on paths, links and markers, so the chrome half is
+// present in a large fraction of frames; and before #237 the other half — a
+// rendered row beginning `/<letter>` — matched ANYWHERE on the grid, so an
+// ordinary transcript line that merely starts with a slash forged the picker.
+// The #227 corpus-replay harness caught this firing in 124 production-ok runs,
+// the largest modal-class false-fire source. The three forms below are the ones
+// sampled from that corpus: an absolute path, a markdown-link fragment, and a
+// command name in a diff, each starting a rendered line in the transcript body.
+//
+// #237 region-scopes the `/`-row signal to the bottom input window
+// (pickerRegionRows), where a real picker's command list reaches. A `/`-line in
+// the scrolled transcript body renders far above that window, so it no longer
+// classifies. Each case carries a real picker-highlight escape, so the chrome
+// half IS satisfied: the region scope, not a missing color, is what rejects it.
+// \r\n so vt10x renders flat rows (the #150 grid fixture lesson).
+func TestSlashPickerRejectsBodyForgery(t *testing.T) {
+	const hl = "\x1b[38;5;153m" // index 153 → 175,215,255, a real picker-highlight shade
+	forms := []struct{ name, line string }{
+		{"absolute-path", hl + "/Users/x/Projects/architecture/README.md"},
+		{"markdown-link", hl + "/load](#session-boundary) — see the design note"},
+		{"command-in-diff", hl + "/staticcheck passes on the current tree"},
+	}
+	filler := make([]string, 20) // push the /-line above the bottom region
+	for i := range filler {
+		filler[i] = "transcript body line"
+	}
+	for _, f := range forms {
+		t.Run(f.name, func(t *testing.T) {
+			snap := gridRows(append([]string{f.line}, filler...)...)
+			// Non-vacuous: the highlight chrome IS present, so only the region
+			// scope stops the fire. A naive whole-grid `/`-row match WOULD forge it.
+			if !snapHasPickerHighlight(snap) {
+				t.Fatal("fixture lost the highlight chrome — the forgery contrast is void")
+			}
+			if isSlashPicker(snap) {
+				t.Errorf("%s: isSlashPicker = true, want false (transcript-body /-line)", f.name)
+			}
+			if got := DetectModalClass(snap); got == ModalClassSlashPicker {
+				t.Errorf("%s: DetectModalClass = SlashPicker, want not-picker", f.name)
+			}
+		})
+	}
+
+	// Positive control: a genuine single-match filtered picker whose /-row sits
+	// in the bottom region still classifies — the region scope must not silence a
+	// real picker (#237 AC). Same 20-row transcript above it as the forgeries, so
+	// the ONLY difference from a forgery is the /-row's screen position.
+	live := gridRows(append(append([]string{}, filler...), hl+"/figma-use  (figma) invoke this skill first")...)
+	if !isSlashPicker(live) {
+		t.Error("in-region single-match picker: isSlashPicker = false, want true")
+	}
+	if got := DetectModalClass(live); got != ModalClassSlashPicker {
+		t.Errorf("in-region single-match picker: DetectModalClass = %q, want SlashPicker", got)
+	}
+}
+
 // TestNegativeSuitePositiveControls is the co-signal safety check: a guard a fix
 // like #223 adds must not break real detection. Every committed real-screen
 // fixture must still fire its own detector.

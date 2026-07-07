@@ -153,9 +153,9 @@ func gridContains(g *Grid, sub []byte) bool {
 //
 // Order of checks is significant (#151, #223): the header-specific classes run
 // first, the generic-footer ask-user class runs after them, and the slash-picker
-// check runs LAST. Two reasons. The picker's signal is the most permissive (any
-// on-screen `/`-row plus a highlight color), so a real modal that merely has a
-// `/`-path on screen must match its own anchor first. And ask-user's anchor is a
+// check runs LAST. Two reasons. The picker's signal is the most permissive (a
+// bottom-region `/`-row plus a highlight color), so a real modal that merely has
+// a `/`-path on screen must match its own anchor first. And ask-user's anchor is a
 // generic list footer that other dialogs draw too (the agents modal's footer
 // carries it), so the classes with a specific header must be tried before it.
 // The single grid built here is threaded into the picker check so the snapshot
@@ -204,9 +204,10 @@ func detectModalClassWithGrid(g *Grid, snap []byte) ModalClass {
 		return ModalClassAskUserQuestion
 	}
 	// Slash-picker is the last resort: reached only when no specific anchor
-	// matched. It requires an on-screen `/`-row AND picker highlight chrome
-	// (see isSlashPicker), so a real modal carrying a `/`-path wins above and a
-	// lone path at idle never phantom-pickers. Reuses the grid built above.
+	// matched. It requires a bottom-region `/`-row AND picker highlight chrome
+	// (see isSlashPicker), so a real modal carrying a `/`-path wins above, a lone
+	// path at idle never phantom-pickers, and a `/`-line up in the transcript body
+	// is out of the region window (#237). Reuses the grid built above.
 	if isSlashPickerWithGrid(g, snap) {
 		return ModalClassSlashPicker
 	}
