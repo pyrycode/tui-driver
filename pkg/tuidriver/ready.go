@@ -30,13 +30,14 @@ type Readiness struct {
 	// claude API is unreachable. Advisory; claude retries it itself.
 	NetworkFailure bool
 
-	// UnknownModal is true when a recognized modal class is up at idle that no
-	// other Readiness field already surfaces — any DetectModalClass result
-	// except ModalClassUnknown (the common no-modal idle screen) and the trust
-	// modal (surfaced by TrustModal). It catches a startup dialog the consumer
-	// would otherwise type its first prompt into. Detecting a genuinely novel,
-	// unclassified dialog is out of scope: this axis rides on the existing
-	// class set.
+	// UnknownModal is true when a modal the consumer must handle is up at idle
+	// that no other Readiness field already surfaces. Two cases feed it. First,
+	// any recognized DetectModalClass result except ModalClassUnknown (the common
+	// no-modal idle screen) and the trust modal (surfaced by TrustModal). Second,
+	// since #224, a genuinely NOVEL dialog: DetectModalClass does not recognise it
+	// but it carries the structural selection-dialog shape (HasUnknownDialog).
+	// Either way it catches a startup dialog the consumer would otherwise type its
+	// first prompt into — the failure the 2.1.199 MCP-enablement modal caused.
 	UnknownModal bool
 }
 
@@ -82,14 +83,18 @@ func (s *Session) WaitReady(ctx context.Context) (Readiness, error) {
 	}, nil
 }
 
-// isUnknownModal reports whether snap shows a recognized modal class that no
-// other Readiness field already surfaces. ModalClassUnknown is the common
-// no-modal idle screen, and the trust modal is surfaced by Readiness.TrustModal;
-// both are excluded so the normal ready path and a trust-only screen stay false.
+// isUnknownModal reports whether snap shows a modal the consumer must handle
+// that no other Readiness field already surfaces. The trust modal is surfaced by
+// Readiness.TrustModal, so it stays false here. A recognized non-trust class is
+// true. ModalClassUnknown is the common no-modal idle screen and stays false,
+// UNLESS a novel dialog shape is present (#224): a dialog whose class is not
+// recognized but whose selection shape is, which still blocks input.
 func isUnknownModal(snap []byte) bool {
 	switch DetectModalClass(snap) {
-	case ModalClassUnknown, ModalClassTrustFolder:
+	case ModalClassTrustFolder:
 		return false
+	case ModalClassUnknown:
+		return gridHasSelectionDialog(NewGrid(snap, 0, 0))
 	default:
 		return true
 	}
