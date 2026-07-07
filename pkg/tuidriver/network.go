@@ -41,7 +41,14 @@ var networkFailureAnchors = []string{
 //
 // Returns false on nil/empty snap.
 func HasNetworkFailure(snap []byte) bool {
-	for _, row := range NewGrid(snap, 0, 0).LastRows(bannerRegionRows) {
+	return hasNetworkFailureGrid(NewGrid(snap, 0, 0))
+}
+
+// hasNetworkFailureGrid is HasNetworkFailure over a Grid the caller already
+// rendered. The per-tick classifier renders the snapshot once and threads that
+// grid here (#225); HasNetworkFailure stays the thin single-snapshot wrapper.
+func hasNetworkFailureGrid(g *Grid) bool {
+	for _, row := range g.LastRows(bannerRegionRows) {
 		for _, anchor := range networkFailureAnchors {
 			if strings.Contains(row, anchor) {
 				return true

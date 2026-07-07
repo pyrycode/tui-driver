@@ -170,7 +170,16 @@ func gridContains(g *Grid, sub []byte) bool {
 // Returns ModalClassUnknown when no class matches (the common case at idle — no
 // modal currently rendered).
 func DetectModalClass(snap []byte) ModalClass {
-	g := NewGrid(snap, 0, 0)
+	return detectModalClassWithGrid(NewGrid(snap, 0, 0), snap)
+}
+
+// detectModalClassWithGrid is DetectModalClass over a Grid the caller already
+// rendered. The per-tick classifier renders the snapshot once and threads that
+// grid here (#225), so a tick classifies every axis off one render;
+// DetectModalClass stays the thin single-snapshot wrapper. snap is still needed
+// for the raw-color picker-highlight check (snapHasPickerHighlight) and the
+// slash-picker chrome check, which read color bytes the grid discards.
+func detectModalClassWithGrid(g *Grid, snap []byte) ModalClass {
 	switch {
 	case gridContains(g, anchorMCPSpaced) && snapHasPickerHighlight(snap):
 		return ModalClassMCP

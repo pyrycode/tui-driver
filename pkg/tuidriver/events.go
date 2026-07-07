@@ -431,16 +431,30 @@ type ptyState struct {
 	stalled bool
 }
 
-// classify reduces snap to the independent PTY-state axes the merge
-// loop tracks. Each predicate strips ANSI internally; the snap is
-// bounded by DefaultBufferCap (4 KB) so the cost of stripping per
-// tick is negligible.
+// gridForClassify builds the single Grid one classify tick renders from. A
+// package var bound to NewGrid so a test can wrap it to assert classify renders
+// the snapshot exactly once per tick (#225 TestClassifyRendersGridOncePerTick);
+// production never rebinds it. Before #225 classify called five exported
+// predicates that each rebuilt their own Grid, rendering the same 4 KB snapshot
+// through the terminal emulator five times per tick, 20 ticks per second, for
+// the whole run.
+var gridForClassify = NewGrid
+
+// classify reduces snap to the independent PTY-state axes the merge loop
+// tracks. It renders the snapshot once (gridForClassify) and threads that one
+// Grid into the grid-accepting variant of each predicate — isIdleGrid,
+// busyInRegion, detectModalClassWithGrid, mcpBannerMatchInRegion, and
+// hasNetworkFailureGrid — so a tick renders once, not once per axis. The
+// exported single-snapshot predicates (IsIdle, DetectModalClass, …) stay as thin
+// wrappers over these same variants, so non-tick callers and the public API are
+// unchanged.
 func classify(snap []byte) ptyState {
+	g := gridForClassify(snap, 0, 0)
 	return ptyState{
-		idle:           IsIdle(snap),
-		thinking:       IsThinking(snap),
-		modal:          DetectModalClass(snap),
-		mcpFailure:     HasMcpFailureBanner(snap),
-		networkFailure: HasNetworkFailure(snap),
+		idle:           isIdleGrid(g),
+		thinking:       busyInRegion(g),
+		modal:          detectModalClassWithGrid(g, snap),
+		mcpFailure:     mcpBannerMatchInRegion(g) != nil,
+		networkFailure: hasNetworkFailureGrid(g),
 	}
 }
