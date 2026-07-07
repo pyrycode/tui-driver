@@ -158,9 +158,12 @@ func isASCIILetter(b byte) bool {
 
 // snapHasPickerHighlight reports whether snap paints any foreground in one of
 // claude's picker-highlight shades (pickerHighlightedRGBs). This is the "chrome"
-// signal for slash-picker classification (#151): a real picker always paints its
-// selected row in a highlight color, whereas a benign absolute path or a lone
-// command-shaped line at idle carries no such highlight.
+// half of slash-picker classification (#151), ANDed with the bottom-region
+// `/`-row location (gridHasPickerRow). On its own it is weak: index 153 is a
+// general light blue claude also paints on paths, links and markers, so it
+// appears in a large fraction of frames (#237). The region-scoped `/`-row is the
+// signal that carries the discrimination; the highlight only rejects a plain
+// unstyled `/`-line at idle.
 //
 // It mirrors pickerRowOpenColor's foreground-SGR walk but does NOT stop at the
 // first `/`: it scans the whole snapshot for any highlighted foreground.
@@ -186,13 +189,35 @@ func snapHasPickerHighlight(snap []byte) bool {
 	return false
 }
 
-// gridHasPickerRow reports whether any on-screen rendered row begins with a
-// picker row start (`/<letter>` after optional leading whitespace, via
-// pickerRowStartRe). Location only: it reads from #150's Grid, so rows that
-// have scrolled off into raw history don't count. Grid rows are StripANSI'd and
-// carry no color, so highlight chrome is checked separately (see isSlashPicker).
+// pickerRegionRows bounds how far up from the bottom of the rendered screen the
+// picker-row location signal may match (#237). The slash-command picker is an
+// input-line phenomenon: the user types `/` at the prompt and claude paints the
+// command list from there, a near-full-screen overlay whose rows reach the last
+// rendered line. In both committed fixtures the bottom-most `/`-row sits within
+// two rows of the bottom, and a single-match filtered picker is the last row
+// itself; even a single match whose description wraps a couple of continuation
+// lines keeps its `/`-row within ~three rows of the bottom. A stray `/`-line in
+// the scrolled transcript body — an absolute path, a markdown link, a command
+// name in a diff — renders far above this window, so scoping the match here
+// rejects it while a genuine picker still classifies. Set to statusRegionRows'
+// depth (6): the picker shares the input-line locus the idle/busy axis watches,
+// and the same bottom-region scoping guards the status banners (bannerRegionRows)
+// and the permission overlay (permissionRegionRows). Six gives 2x slack over the
+// ≤3-row real-picker depth while excluding the transcript tail above the prompt;
+// a corpus-replay sweep (#227) showed windows below 6 trim only a further cast or
+// two of residual, not worth narrowing the real-picker margin.
+const pickerRegionRows = 6
+
+// gridHasPickerRow reports whether a rendered row within the bottom
+// pickerRegionRows begins with a picker row start (`/<letter>` after optional
+// leading whitespace, via pickerRowStartRe). Location only, and region-scoped
+// two ways: it reads from #150's Grid so rows scrolled off into raw history
+// don't count, and only the bottom input window so a `/`-line in the on-screen
+// transcript body (a path, a link, a command name in a diff) can't forge the
+// picker (#237). Grid rows are StripANSI'd and carry no color, so highlight
+// chrome is checked separately (see isSlashPicker).
 func gridHasPickerRow(g *Grid) bool {
-	for _, row := range g.Rows() {
+	for _, row := range g.LastRows(pickerRegionRows) {
 		if pickerRowStartRe.MatchString(row) {
 			return true
 		}
@@ -205,13 +230,16 @@ func gridHasPickerRow(g *Grid) bool {
 // when no specific modal anchor matched. Two independent signals of different
 // fabric, ANDed:
 //
-//  1. Grid-region location — at least one on-screen grid row begins `/<letter>`
-//     (off-screen `/`-lines in raw history are excluded by the rendered grid).
+//  1. Bottom-region location — an on-screen grid row within the bottom input
+//     window (pickerRegionRows) begins `/<letter>`. Off-screen `/`-lines in raw
+//     history are excluded by the rendered grid, and a `/`-line up in the
+//     transcript body is excluded by the region scope (#237).
 //  2. Chrome — the snapshot carries a picker highlight color.
 //
-// Requiring both stops a benign on-screen absolute path (/Users/x/file.go) from
-// phantom-pickering, while a genuine single-match filtered picker (one `/`-row
-// painted in the highlight shade) still classifies.
+// Requiring both stops a benign on-screen absolute path (/Users/x/file.go) in
+// the transcript body from phantom-pickering, while a genuine single-match
+// filtered picker (one `/`-row at the input line, painted in the highlight
+// shade) still classifies.
 func isSlashPicker(snap []byte) bool {
 	return isSlashPickerWithGrid(NewGrid(snap, 0, 0), snap)
 }
