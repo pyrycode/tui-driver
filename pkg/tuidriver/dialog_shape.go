@@ -44,13 +44,15 @@ func gridHasSelectionDialog(g *Grid) bool {
 // unknown, the idle predicate matched the ❯ the dialog painted, and the runner
 // delivered its first prompt into the dialog and hung opaquely. The original
 // architecture called for a detect-unknown-and-bail layer; it was never built,
-// and Readiness.UnknownModal previously rode only the known class set. This adds
+// and the readiness gate previously rode only the known class set. This adds
 // the missing structural layer: no per-dialog anchor, so it survives a claude
 // update that introduces a brand-new dialog.
 //
-// The library only reports. A consumer reads this via Readiness.UnknownModal and
-// decides policy — typically bail rather than deliver a prompt into an
-// unrecognised dialog. Returns false when a known class matches (that class is
+// The library only reports. WaitReady consumes this so a novel startup dialog
+// surfaces as an *UnexpectedModalError (#173) rather than an ignorable flag; a
+// mid-run consumer can also call it directly and decide policy — typically bail
+// rather than deliver a prompt into an unrecognised dialog. Returns false when a
+// known class matches (that class is
 // the consumer's own to handle) and when no dialog shape is present (the common
 // idle screen).
 func HasUnknownDialog(snap []byte) bool {
