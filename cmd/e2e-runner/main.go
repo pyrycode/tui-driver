@@ -70,6 +70,18 @@ type Check struct {
 	// returns its extra fields directly. Binary / Args / SuccessMarker are
 	// ignored when Run is set.
 	Run func(ctx context.Context) (status string, extra map[string]any)
+	// NonGating marks an informational check whose non-pass status is recorded
+	// in the report but does NOT fail the overall run. Use for a throwaway
+	// diagnostic that is worth running for its artifact but should not gate the
+	// suite (e.g. probe-first-prompt-hang, #181).
+	NonGating bool
+}
+
+// gateFailed reports whether a check's result should redden the overall gate.
+// A NonGating check never gates: its non-pass status still lands in the report,
+// but the run stays green on it (#181).
+func gateFailed(c Check, status string) bool {
+	return status != "pass" && !c.NonGating
 }
 
 // CheckResult is the per-check entry surfaced into the report. Extra is
@@ -169,13 +181,15 @@ func main() {
 				Status:     "timeout",
 				DurationMs: 0,
 			})
-			allPassed = false
+			if gateFailed(c, "timeout") {
+				allPassed = false
+			}
 			continue
 		}
 		fmt.Fprintf(os.Stderr, "e2e-runner: running %s\n", c.Name)
 		r := runCheck(parentCtx, c, *binDir)
 		fmt.Fprintf(os.Stderr, "e2e-runner: %s -> %s (%dms)\n", r.Name, r.Status, r.DurationMs)
-		if r.Status != "pass" {
+		if gateFailed(c, r.Status) {
 			allPassed = false
 		}
 		if r.Name == "claude-version-lock" && r.Status != "pass" {
@@ -303,11 +317,24 @@ func buildChecks(runVersionLock func(ctx context.Context) (string, map[string]an
 			SuccessMarker: successSuccess,
 		},
 		{
-			Name:    "probe-first-prompt-hang",
-			Kind:    "probe",
-			Binary:  "probe-first-prompt-hang",
-			Args:    commonArgs,
-			Timeout: probeCheckTimeout,
+			// De-gated (#181, #177 AC4): a throwaway first-prompt-timing
+			// diagnostic, not a library regression check. On claude 2.1.199 it
+			// does not reach a clean end_turn — a run 2026-07-07 hit a false idle
+			// ~0.25s in, sent its prompt before claude was ready, the session
+			// JSONL never appeared, and it exited non-zero at its internal 30s
+			// sessionFileWait. It is also environment-sensitive (clean shell vs a
+			// nested Claude Code session render differently, #181). So it always
+			// reddened the gate for no library signal. NonGating keeps it running
+			// for its recording artifact while its status stays informational.
+			// Re-gate (drop NonGating, add SuccessMarker) only once it reaches a
+			// clean end_turn against the pinned claude; consider removing it
+			// entirely if the 30s cost is not worth the artifact.
+			Name:      "probe-first-prompt-hang",
+			Kind:      "probe",
+			Binary:    "probe-first-prompt-hang",
+			Args:      commonArgs,
+			Timeout:   probeCheckTimeout,
+			NonGating: true,
 			OnFailure: func(stdout, stderr string) map[string]any {
 				m := probeOutDirRe.FindStringSubmatch(stderr)
 				if len(m) < 2 {
