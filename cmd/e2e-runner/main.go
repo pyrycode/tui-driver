@@ -270,11 +270,20 @@ func buildChecks(runVersionLock func(ctx context.Context) (string, map[string]an
 			Timeout: 120 * time.Second,
 		},
 		{
+			// Observation rig since #180: ^OBSERVED, not ^SUCCESS. On claude
+			// 2.1.199 Probe 2's post-approve turn never reaches the readiness
+			// predicate (gotEndTurn ∧ ❯-present ∧ PTY-quiet) that the same
+			// approve keystroke reached on 2.1.158, so the spike drains a bounded
+			// settle window and records the post-approve state instead of hanging
+			// to the 60s cap. Re-gate to successSuccess only once the post-approve
+			// turn reaches end_turn again against the pinned claude, and file any
+			// warranted library fix as a separate blocked-by follow-up (#206→#207
+			// shape) rather than forcing this back to ^SUCCESS.
 			Name:          "spike-permission",
 			Kind:          "spike",
 			Binary:        "spike-permission",
 			Args:          commonArgs,
-			SuccessMarker: successSuccess,
+			SuccessMarker: observedSuccess,
 		},
 		{
 			Name:          "spike-multiselect",

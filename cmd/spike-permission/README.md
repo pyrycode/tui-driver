@@ -42,7 +42,46 @@ flags. Total wall ~24–27 s per run. Headline findings:
   is false-positive-free at idle (`has_modal=false`).
 - **Session is fully usable after auto-respond.** Probe 2 produces a
   normal `assistant(end_turn)` and a `SUCCESS:` extraction in ~5–8 s
-  after approve. Same shape as a non-modal turn.
+  after approve. Same shape as a non-modal turn. (This was the 2.1.158
+  behaviour; see the 2.1.199 note below for what changed.)
+
+## 2.1.199 observation rig (#180)
+
+On claude 2.1.199, Probe 2's post-approve turn no longer reaches the
+readiness predicate (`gotEndTurn ∧ ❯-present ∧ PTY-quiet`) that the same
+`1\r` keystroke reached on 2.1.158, so the old `for !check()` loop hung to
+the runner's 60 s cap and reddened `make e2e`. The README's 2.1.158
+`SUCCESS:` behaviour above is now historical.
+
+Probe 2 is therefore an **observation rig**, the same posture as
+`spike-multiselect` / `probe-cwd-encoding` (#206). After the approve
+keystroke it drains a **bounded settle window** (`autoRespondSettleWindow`,
+8 s), records the state it reached, and exits 0. It does **not** change the
+modal matcher, the approve keystroke, or any readiness predicate; it records
+what it sees and never asserts a completion it did not reach.
+
+**Output.** One `^OBSERVED:` line (the e2e-runner gates `spike-permission`
+on `^OBSERVED`, not `^SUCCESS`, since #180):
+
+```
+OBSERVED: spike-permission post-approve modal_cleared=<bool> end_turn=<bool> idle_present=<bool> pty_quiet=<bool> approve_keystroke=<hex> snapshot=<path>
+```
+
+The fields distinguish the failure modes from the artifact alone:
+`modal_cleared=false` → the keystroke was not accepted; `modal_cleared=true,
+end_turn=false` → no `end_turn` signal within the window; `end_turn=true`
+with `idle_present`/`pty_quiet` false → completed but the readiness predicate
+was unmet. The post-approve PTY snapshot and the OBSERVED block are persisted
+durably under an `outDir` (printed as `probe=2 outDir=…`), not a bare
+ephemeral tempfile (#206 lesson).
+
+**Re-gate condition.** Restore `^SUCCESS` gating (revert the e2e-runner
+`SuccessMarker` to `successSuccess` and the probe to the readiness-loop) only
+once the post-approve turn reaches `end_turn` again against the pinned claude.
+If the recorded observation reveals a genuine library/consumer-facing
+regression in the approve-keystroke or `end_turn` detection, file a separate
+`blocked-by` follow-up to apply the warranted fix (the #206 → #207 split), and
+do NOT force this spike back to `^SUCCESS` to paper over it.
 
 ## What it does
 

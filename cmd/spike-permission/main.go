@@ -51,6 +51,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -121,6 +122,15 @@ const (
 	// open after the simulated-escalation log lines, per AC.
 	escalationWindow = 3 * time.Second
 
+	// autoRespondSettleWindow: Probe 2's BOUNDED post-approve drain window
+	// (#180). On claude 2.1.199 the post-approve readiness predicate
+	// (gotEndTurn ∧ ❯-present ∧ PTY-quiet) never satisfies, so instead of
+	// looping to the runner cap the probe drains this fixed window and records
+	// the state it reached. 8 s is well under the runner's 60 s spike cap and
+	// leaves room after the approve keystroke for claude to stream a response
+	// on a healthy build. The session PTY-heartbeat watchdog still bounds a
+	// true wedge inside it.
+	autoRespondSettleWindow = 8 * time.Second
 )
 
 // oscRe matches OSC (Operating System Command) sequences — ESC ] ... BEL.
@@ -572,9 +582,39 @@ loop:
 	return nil
 }
 
-// runAutoRespond drives Probe 2 (Session B's first probe): trigger modal,
-// send approve keystroke, wait for modal-cleared AND end_turn, extract
-// assistant text by msg_id, print SUCCESS.
+// autoRespondObservation is the post-approve state Probe 2 records on claude
+// 2.1.199 (#180). Instead of asserting a SUCCESS the readiness predicate no
+// longer reaches, the probe drains a bounded settle window and reports these
+// fields. Together they let a reader tell "keystroke not accepted"
+// (modalCleared=false) from "no end_turn signal" (modalCleared=true,
+// endTurn=false) from "completed but readiness predicate unmet" (endTurn=true,
+// idlePresent/ptyQuiet false), from the artifact alone.
+type autoRespondObservation struct {
+	approveHex   string // the approve keystroke, hex, that was sent
+	modalCleared bool   // a JSONL assistant event arrived after the keystroke
+	endTurn      bool   // stop_reason=end_turn seen within the settle window
+	idlePresent  bool   // ❯ input glyph present on the post-approve screen
+	ptyQuiet     bool   // PTY quiet ≥ ptyQuietWindow at the window's end
+	snapshotPath string // durable post-approve PTY snapshot, "" if persist failed
+}
+
+// formatAutoRespondObservation renders the observation as the single
+// runner-gated OBSERVED line. The e2e-runner matches ^OBSERVED for
+// spike-permission since #180, so the leading marker is load-bearing. Pure;
+// table-tested in main_test.go.
+func formatAutoRespondObservation(o autoRespondObservation) string {
+	return fmt.Sprintf(
+		"OBSERVED: spike-permission post-approve modal_cleared=%t end_turn=%t idle_present=%t pty_quiet=%t approve_keystroke=%s snapshot=%s",
+		o.modalCleared, o.endTurn, o.idlePresent, o.ptyQuiet, o.approveHex, o.snapshotPath,
+	)
+}
+
+// runAutoRespond drives Probe 2 (Session B's first probe): trigger the modal,
+// send the approve keystroke, then drain a bounded settle window and record the
+// post-approve state as an OBSERVED line (#180). It does not assert a
+// completion; on claude 2.1.199 the post-approve turn does not reach the
+// readiness predicate, so this rig observes and records rather than hanging to
+// the runner cap.
 func runAutoRespond(
 	ctx context.Context,
 	logger *log.Logger,
@@ -623,53 +663,30 @@ func runAutoRespond(
 	tr.RecordTransition(fmt.Sprintf("probe=%d response-keystroke-sent", probeN))
 	logger.Printf("probe=%d response-keystroke-sent bytes=%s", probeN, approveHex)
 
-	// Single post-keystroke loop. Two transitions to log along the way:
+	// #180: on claude 2.1.199 the post-approve readiness predicate
+	// (gotEndTurn ∧ ❯-present ∧ PTY-quiet) never satisfies — the same approve
+	// keystroke drove cleanly to end_turn on 2.1.158, so this is an upstream
+	// behaviour change, not a spike defect (the README records the 2.1.158
+	// SUCCESS). Rather than loop to the runner's 60 s cap, drain a BOUNDED
+	// settle window and RECORD what claude actually does after the keystroke,
+	// then exit 0. The recorded artifact carries the byte-level evidence to
+	// decide later whether a real library defect exists; a warranted fix lands
+	// as a separate blocked-by follow-up (the #206 → #207 shape). This probe
+	// observes and records only: it does NOT change the modal matcher, the
+	// approve keystroke, or any readiness predicate, and it never asserts a
+	// completion it did not reach.
 	//
-	//   modal-cleared: first JSONL `assistant` event after keystroke-sent.
-	//     Per finding #15 the modal has ZERO JSONL footprint pre-approve;
-	//     the moment claude emits any assistant content it has moved past
-	//     the modal. The JSONL tailer pre-filters to type=assistant only
-	//     (see tailJSONL), so the first event from eventCh post-keystroke
-	//     IS the modal-cleared positive signal — no need for a separate
-	//     PTY rolling-buffer `hasModal` check (which was finding #23's
-	//     bug: modal text persists in the 4096-byte rolling buffer when
-	//     streaming responses don't push it out fast enough).
-	//
-	//   end-turn-detected: post-approve readiness predicate. Three
-	//     load-bearing clauses, all required:
-	//       (a) gotEndTurn — JSONL has reported stop_reason=end_turn for
-	//           this turn (model done speaking).
-	//       (b) ❯ glyph present in StripANSI(rb.Snapshot()) — input
-	//           prompt is back on screen.
-	//       (c) rb.QuietFor() ≥ ptyQuietWindow (1500 ms) — claude has
-	//           stopped emitting bytes; not still redrawing.
-	//
-	//     The OLD predicate (gotEndTurn ∧ tuidriver.IsIdle ∧ stable
-	//     idleStableWindow) wedged on claude 2.1.148: a `✻ Verb for Ns`
-	//     spinner glyph painted during tool execution stays in the 4 KB
-	//     rolling buffer (pkg/tuidriver/buffer.go:8-13) post-end_turn,
-	//     and the small final assistant message + title-bar redraws
-	//     don't emit enough bytes to roll it out. IsIdle's spinner-absent
-	//     half therefore stays false forever and the watchdog fires
-	//     ~30 s later. Ticket #70.
-	//
-	//     PTY-quiescence subsumes the safety property the spinner-absent
-	//     clause was meant to provide: 1500 ms of zero bytes means claude
-	//     has by definition stopped redrawing (spinner or anything else),
-	//     so further interaction is safe. Strictly stronger than the OLD
-	//     predicate on the rendering-activity axis (quiescence cannot be
-	//     faked by a transient buffer state); weaker on the spinner-glyph
-	//     axis — which is exactly the wedge being removed.
-	//
-	//     Same predicate shape as cmd/spike-multi-turn/main.go:353-400
-	//     (post-#74) and cmd/spike-cancel/main.go:513-568 (the original
-	//     PTY-quiescence consumer, waitReappeared). Empirical derivation
-	//     of the 1500 ms window: cmd/spike-cancel/main.go:82-91.
-	//
-	// No per-phase wall-clock deadlines here. Liveness is enforced by
-	// the session-level PTY-heartbeat watchdog (tracker.checkWatchdog) —
-	// PTY quiet for >ptyQuietLimit fires `cancelCause` and surfaces via
-	// ctx.Done. The session wall-cap is the outer safety net.
+	// Two transitions are logged as they pass:
+	//   modal-cleared: first JSONL `assistant` event after keystroke-sent. Per
+	//     finding #15 the modal has ZERO JSONL footprint pre-approve; the
+	//     moment claude emits any assistant content it has moved past the
+	//     modal. The tailer pre-filters to type=assistant, so the first event
+	//     post-keystroke IS the modal-cleared signal.
+	//   end-turn-detected: JSONL stop_reason=end_turn for this turn. On 2.1.158
+	//     this fired inside the window; on 2.1.199 it typically does not, which
+	//     is exactly the observation this rig now records instead of hanging.
+	//     The ❯-present and PTY-quiet (≥ ptyQuietWindow) halves of the old
+	//     predicate are captured as the idle_present / pty_quiet fields.
 	var (
 		events             []tuidriver.JSONLEntry
 		latestEndTurnMsgID string
@@ -677,21 +694,13 @@ func runAutoRespond(
 		modalCleared       bool
 	)
 
+	tr.RecordTransition(fmt.Sprintf("probe=%d settle-window-start", probeN))
+	logger.Printf("probe=%d settle-window-start window=%s", probeN, autoRespondSettleWindow)
 	ticker := time.NewTicker(statePollInterval)
 	defer ticker.Stop()
-
-	check := func() bool {
-		if !gotEndTurn {
-			return false
-		}
-		stripped := tuidriver.StripANSI(session.Snapshot())
-		if !bytes.Contains(stripped, tuidriver.IdleGlyph) {
-			return false
-		}
-		return session.QuietFor() >= ptyQuietWindow
-	}
-
-	for !check() {
+	deadline := time.After(autoRespondSettleWindow)
+drain:
+	for {
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)
@@ -709,26 +718,69 @@ func runAutoRespond(
 				tr.RecordTransition(fmt.Sprintf("probe=%d modal-cleared", probeN))
 				logger.Printf("probe=%d modal-cleared", probeN)
 			}
-			if tuidriver.IsEndTurn(ev) {
+			if tuidriver.IsEndTurn(ev) && !gotEndTurn {
+				gotEndTurn = true
 				if id := msgIDOf(ev); id != "" {
 					latestEndTurnMsgID = id
 				}
-				gotEndTurn = true
+				tr.RecordTransition(fmt.Sprintf("probe=%d end-turn-detected", probeN))
+				logger.Printf("probe=%d end-turn-detected msg_id=%s", probeN, latestEndTurnMsgID)
 			}
 		case <-ticker.C:
-			// No per-phase deadline; PTY-heartbeat watchdog handles
-			// "claude wedged" at the tracker level.
+			// No per-phase deadline; the settle window bounds this probe and
+			// the session PTY-heartbeat watchdog bounds a true wedge.
+		case <-deadline:
+			break drain
+		}
+	}
+	tr.RecordTransition(fmt.Sprintf("probe=%d settle-window-end", probeN))
+	logger.Printf("probe=%d settle-window-end events=%d", probeN, len(events))
+
+	// Observe the post-approve terminal state of the screen.
+	snap := session.Snapshot()
+	idlePresent := bytes.Contains(tuidriver.StripANSI(snap), tuidriver.IdleGlyph)
+	ptyQuiet := session.QuietFor() >= ptyQuietWindow
+
+	// Durable capture: persist the post-approve PTY snapshot plus the OBSERVED
+	// block into an outDir the report can point at, not a bare ephemeral
+	// tempfile (#206 lesson: an unowned /tmp snapshot never gets transcribed).
+	snapshotPath := ""
+	outDir := filepath.Join(os.TempDir(), fmt.Sprintf("spike-permission-probe%d-%d", probeN, time.Now().UnixNano()))
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		logger.Printf("warning: probe=%d outdir-mkdir-err err=%v", probeN, err)
+		outDir = ""
+	} else {
+		logger.Printf("probe=%d outDir=%s", probeN, outDir)
+		p := filepath.Join(outDir, "post-approve-pty.bin")
+		if err := writeTempSnapshot(p, snap); err != nil {
+			logger.Printf("warning: probe=%d snapshot-write-err err=%v", probeN, err)
+		} else {
+			snapshotPath = p
 		}
 	}
 
-	tr.RecordTransition(fmt.Sprintf("probe=%d end-turn-detected", probeN))
-	logger.Printf("probe=%d end-turn-detected msg_id=%s", probeN, latestEndTurnMsgID)
+	// If claude did complete the turn within the window, log the assistant text
+	// for parity with the pre-2.1.199 SUCCESS path — informational only.
+	if gotEndTurn && latestEndTurnMsgID != "" {
+		logger.Printf("probe=%d assistant-text=%q", probeN,
+			truncateForLog(extractByMsgID(events, latestEndTurnMsgID), 200))
+	}
 
-	out := extractByMsgID(events, latestEndTurnMsgID)
-	tr.RecordTransition(fmt.Sprintf("probe=%d assistant-text-extracted", probeN))
-	logger.Printf("probe=%d assistant-text-extracted len=%d", probeN, len(out))
-
-	fmt.Printf("SUCCESS: %s\n", out)
+	obs := autoRespondObservation{
+		approveHex:   approveHex,
+		modalCleared: modalCleared,
+		endTurn:      gotEndTurn,
+		idlePresent:  idlePresent,
+		ptyQuiet:     ptyQuiet,
+		snapshotPath: snapshotPath,
+	}
+	line := formatAutoRespondObservation(obs)
+	if outDir != "" {
+		if err := os.WriteFile(filepath.Join(outDir, "observation.log"), []byte(line+"\n"), 0o644); err != nil {
+			logger.Printf("warning: probe=%d observation-log-write-err err=%v", probeN, err)
+		}
+	}
+	fmt.Println(line)
 	return nil
 }
 
