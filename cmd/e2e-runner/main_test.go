@@ -360,3 +360,26 @@ func TestEvaluateClaudeVersionLock(t *testing.T) {
 		})
 	}
 }
+
+func TestGateFailed(t *testing.T) {
+	tests := []struct {
+		name      string
+		nonGating bool
+		status    string
+		want      bool
+	}{
+		{name: "gating pass", nonGating: false, status: "pass", want: false},
+		{name: "gating fail", nonGating: false, status: "fail", want: true},
+		{name: "gating timeout", nonGating: false, status: "timeout", want: true},
+		{name: "non-gating pass", nonGating: true, status: "pass", want: false},
+		{name: "non-gating fail does not gate", nonGating: true, status: "fail", want: false},
+		{name: "non-gating timeout does not gate", nonGating: true, status: "timeout", want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := gateFailed(Check{NonGating: tc.nonGating}, tc.status); got != tc.want {
+				t.Errorf("gateFailed(NonGating=%t, %q) = %t, want %t", tc.nonGating, tc.status, got, tc.want)
+			}
+		})
+	}
+}
