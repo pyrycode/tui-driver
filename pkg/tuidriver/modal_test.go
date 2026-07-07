@@ -73,7 +73,15 @@ func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 			ModalClassUnknown,
 		},
 		{"ask-user spaced", []byte("...Enter to select..."), ModalClassAskUserQuestion},
-		{"trust-folder spaced", []byte("...Quick safety check..."), ModalClassTrustFolder},
+		{
+			// #219: trust now needs the dialog shape (header + a pointer-marked
+			// option row), not the header phrase alone. A structurally complete
+			// grid still classifies; the header-alone forgery is pinned Unknown
+			// by TestDetectModalClassTrustRequiresDialogStructure.
+			"trust-folder dialog",
+			[]byte("Quick safety check: Is this a project you trust?\r\n❯ 1. Yes\r\n  2. No\r\n"),
+			ModalClassTrustFolder,
+		},
 		{"permission spaced", []byte("...Do you want to proceed..."), ModalClassPermission},
 		{"model-select spaced", []byte("...Select model..."), ModalClassModelSelect},
 		{"permissions-config + Allow tab", []byte("Permissions header...Allow rules"), ModalClassPermissionsConfig},
@@ -330,5 +338,58 @@ func TestDetectModalClassMCPAnchorScrolledOffNotModal(t *testing.T) {
 	}
 	if got := DetectModalClass(snap); got != ModalClassMCP {
 		t.Errorf("mcp-snapshot.bin positive control: DetectModalClass = %q, want MCP", got)
+	}
+}
+
+// TestDetectModalClassTrustRequiresDialogStructure is the #219 content-forgery
+// regression for the trust-folder class. The trust header ("Quick safety check")
+// is a full-panel anchor with no bottom-region scope, so a bare grid-wide match
+// forges the modal from any on-screen line that quotes it — a ticket body or a
+// source-file read. Because the runner treats a mid-run trust detection as
+// fatal, that forgery aborted real runs (ticket 217; the 2026-07-06 developer
+// abort). The fix requires the dialog's structural co-signal: a pointer-marked
+// numbered option row within a few rows below the header. Prose does not
+// reproduce that shape.
+//
+// The genuine dialog is pinned by TestDetectModalClassRealFixtures
+// (trust-folder-snapshot.bin) and TestHasTrustModalDetectsRealFixture. \r\n so
+// vt10x renders flat rows (the #150 grid fixture lesson).
+func TestDetectModalClassTrustRequiresDialogStructure(t *testing.T) {
+	// (a) Transcript-echo: the header quoted in prose, no dialog-shaped option
+	// row below it. A naive whole-grid match WOULD forge trust here.
+	echo := []byte("assistant: the folder-trust prompt reads \"Quick safety check: Is\r\n" +
+		"this a project you created or one you trust?\" and offers yes or no.\r\n")
+	if !strings.Contains(string(echo), "Quick safety check") {
+		t.Fatal("fixture lost the header phrase — the forgery contrast is void")
+	}
+	if got := DetectModalClass(echo); got != ModalClassUnknown {
+		t.Errorf("transcript-echo forgery: DetectModalClass = %q, want Unknown", got)
+	}
+
+	// (b) Source-read with a line-number gutter, as an agent reading
+	// permission.go would render it.
+	source := []byte("52\t// anchorTrustHeaderSpaced is the trust-folder header line\r\n" +
+		"54\tvar anchorTrustHeaderSpaced = []byte(\"Quick safety check\")\r\n")
+	if !strings.Contains(string(source), "Quick safety check") {
+		t.Fatal("fixture lost the header phrase — the forgery contrast is void")
+	}
+	if got := DetectModalClass(source); got != ModalClassUnknown {
+		t.Errorf("source-read forgery: DetectModalClass = %q, want Unknown", got)
+	}
+
+	// (c) A numbered list quoting the header but WITHOUT the pointer marker is
+	// still content, not a dialog — the ❯ is the load-bearing signal.
+	numbered := []byte("Steps for the Quick safety check flow:\r\n" +
+		"1. Read the header\r\n" +
+		"2. Pick an option\r\n")
+	if got := DetectModalClass(numbered); got != ModalClassUnknown {
+		t.Errorf("unmarked-numbered forgery: DetectModalClass = %q, want Unknown", got)
+	}
+
+	// Positive control: the genuine dialog shape still classifies.
+	live := []byte("Quick safety check: Is this a project you created or one you trust?\r\n" +
+		"❯ 1. Yes, I trust this folder\r\n  2. No, I selected this folder by mistake\r\n(Esc to cancel)\r\n")
+	if got := DetectModalClass(live); got != ModalClassTrustFolder {
+		t.Errorf("genuine trust dialog: DetectModalClass = %q, want TrustFolder", got)
 	}
 }
