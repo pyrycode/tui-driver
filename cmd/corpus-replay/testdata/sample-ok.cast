@@ -1,0 +1,4 @@
+{"version":2,"width":120,"height":40}
+[0.10,"o","❯ ready\r\n"]
+[0.20,"o","Quick safety check\r\n❯ 1. Yes, I trust this folder\r\n  2. No, cancel\r\n"]
+[0.30,"o","log line quoting Quick safety check in prose only\r\n❯ input\r\n"]
