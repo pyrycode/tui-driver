@@ -25,8 +25,9 @@ type Readiness struct {
 	// false.
 	FailedMcpCount int
 
-	// NetworkFailure is true when a network-unreachable anchor
-	// (FailedToOpenSocket) is present at idle: the claude API is unreachable.
+	// NetworkFailure is true when claude's network-unreachable status line
+	// ("Unable to connect to API") is present in the status region at idle: the
+	// claude API is unreachable. Advisory; claude retries it itself.
 	NetworkFailure bool
 
 	// UnknownModal is true when a recognized modal class is up at idle that no
