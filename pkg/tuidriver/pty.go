@@ -200,5 +200,23 @@ func (s *Session) Resize(rows, cols uint16) error {
 	if err := pty.Setsize(s.pty, &pty.Winsize{Rows: rows, Cols: cols}); err != nil {
 		return fmt.Errorf("tuidriver: resize to %dx%d: %w", rows, cols, err)
 	}
+	// Record the new size so detection renders at it (#226). Only on success:
+	// a failed Setsize left the PTY at its previous size, so the tracked dims
+	// must stay there too.
+	s.sizeMu.Lock()
+	s.curCols, s.curRows = int(cols), int(rows)
+	s.sizeMu.Unlock()
 	return nil
+}
+
+// gridDims returns the session's current terminal size as (cols, rows) — the
+// dimensions detection should render at, matching the NewGrid / classify
+// argument order. It is the seam the per-tick classifier (mergeEvents) reads so
+// a resized interactive session's bytes are rendered at the size claude drew
+// them for, instead of the fixed 120x40 default. A session that never calls
+// Resize returns the StartPTY default seeded in Spawn.
+func (s *Session) gridDims() (cols, rows int) {
+	s.sizeMu.Lock()
+	defer s.sizeMu.Unlock()
+	return s.curCols, s.curRows
 }
