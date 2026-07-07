@@ -40,8 +40,10 @@ func TestWaitReady(t *testing.T) {
 			want: Readiness{Idle: true, McpFailure: true, FailedMcpCount: 2},
 		},
 		{
+			// #220: the network anchor is now claude's real 2.1.199 status
+			// line, "Unable to connect to API", matched in the status region.
 			name: "network failure at idle",
-			snap: append([]byte("FailedToOpenSocket "), idle...),
+			snap: append([]byte("Unable to connect to API (ConnectionRefused) "), idle...),
 			want: Readiness{Idle: true, NetworkFailure: true},
 		},
 		{
