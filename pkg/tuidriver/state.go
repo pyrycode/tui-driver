@@ -45,6 +45,10 @@ var SpinnerGlyphAlt = []byte("\xe2\x9c\xb3")
 // common frame, with ✶ (U+2736) and ✽ (U+273D) also unrecognised. SpinnerGlyph
 // and SpinnerGlyphAlt stay as named exports; this superset is what busyInRegion
 // iterates. Additive: no existing glyph or its calibration changes.
+//
+// ⚠️ Adding a spinner frame here (or changing InterruptHint)? Add it to the #221
+// negative regression suite (anchor_forgery_test.go) so a body quotation of it
+// stays non-firing on the busy axis.
 var spinnerGlyphs = [][]byte{
 	SpinnerGlyph,           // ✻ U+273B
 	SpinnerGlyphAlt,        // ✳ U+2733

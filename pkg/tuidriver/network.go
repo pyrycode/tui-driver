@@ -21,6 +21,9 @@ import "strings"
 // Scope: network-unreachability only. An authentication failure renders a
 // different line, "API Error: 401 …", owned by the dispatcher's own 401 retry
 // and disjoint from this phrase — this detector deliberately does not cover it.
+//
+// ⚠️ Adding a phrase here? Add it to the #221 negative regression suite
+// (anchor_forgery_test.go) so a transcript quotation of it stays non-firing.
 var networkFailureAnchors = []string{
 	"Unable to connect to API",
 }
