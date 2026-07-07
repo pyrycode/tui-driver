@@ -252,6 +252,14 @@ func TestDetectModalClassRealFixtures(t *testing.T) {
 		{"picker-truecolor-snapshot.bin", ModalClassSlashPicker},
 		{"permission-snapshot.bin", ModalClassPermission},
 		{"trust-folder-snapshot.bin", ModalClassTrustFolder},
+		// #222: real-screen fixtures captured live off claude 2.1.199 via
+		// spike-multiselect (/model, /permissions) and spike-ask-user. These
+		// three classes had no rendered fixture before — ask-user's only .bin was
+		// a JSONL dump that classifies Unknown (still used by ask_user_test.go for
+		// parsing), and model-select/permissions-config had none.
+		{"ask-user-question-screen-snapshot.bin", ModalClassAskUserQuestion},
+		{"model-select-snapshot.bin", ModalClassModelSelect},
+		{"permissions-config-snapshot.bin", ModalClassPermissionsConfig},
 	}
 	for _, tc := range cases {
 		t.Run(tc.fixture, func(t *testing.T) {
@@ -266,10 +274,14 @@ func TestDetectModalClassRealFixtures(t *testing.T) {
 	}
 }
 
-// #152: three classes have no usable real .bin fixture (ask-user-question's is a
-// JSONL dump that DetectModalClass returns Unknown for; model-select and
-// permissions-config have none). Cover them with synthetic multi-row grids built
-// with \r\n so vt10x renders flat rows.
+// TestDetectModalClassSyntheticGridFixtures keeps hand-built grids for the three
+// classes that were fixture-less before #222 (ask-user-question's only .bin was
+// a JSONL dump that classifies Unknown; model-select and permissions-config had
+// none). #222 captured real-screen fixtures for all three — asserted in
+// TestDetectModalClassRealFixtures — so these synthetic grids are now redundant
+// controls, retained because they pin the anchor against a minimal hand-built
+// screen independent of a captured fixture's incidental chrome. Built with \r\n
+// so vt10x renders flat rows.
 func TestDetectModalClassSyntheticGridFixtures(t *testing.T) {
 	cases := []struct {
 		name string
