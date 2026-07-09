@@ -73,13 +73,52 @@ type sample struct {
 const (
 	sourceGap   = "gap"
 	sourceFinal = "final"
+	sourceFire  = "fire"
 )
+
+// detector is one structural screen predicate. Copied verbatim from
+// cmd/corpus-replay/main.go (a package main cannot import another's helpers, the
+// same reason #255 copied tagFromName/segmentOf) so the -fires source samples the
+// exact frames corpus-replay's fire report keys on.
+type detector struct {
+	name string
+	fire func(snap []byte) bool
+}
+
+// flatDetectors are the non-modal-class predicates; the modal classes are folded
+// in by activeKeys as "modal:<class>" keys. Copied verbatim from corpus-replay.
+var flatDetectors = []detector{
+	{"idle", tuidriver.IsIdle},
+	{"thinking", tuidriver.IsThinking},
+	{"mcp-failure", tuidriver.HasMcpFailureBanner},
+	{"network-failure", tuidriver.HasNetworkFailure},
+	{"unknown-dialog", tuidriver.HasUnknownDialog},
+}
+
+// activeKeys returns the set of detector keys active for snap: every flat
+// detector that fired, plus "modal:<class>" when DetectModalClass returns a
+// class. Copied verbatim from corpus-replay so the -fires source's key vocabulary
+// matches its fire report exactly. The keys are detector identifiers, not claude
+// screen anchors, so listing them does not violate the screen-literal discipline.
+func activeKeys(snap []byte) map[string]bool {
+	keys := map[string]bool{}
+	for _, d := range flatDetectors {
+		if d.fire(snap) {
+			keys[d.name] = true
+		}
+	}
+	if mc := tuidriver.DetectModalClass(snap); mc != tuidriver.ModalClassUnknown {
+		keys["modal:"+string(mc)] = true
+	}
+	return keys
+}
 
 func main() {
 	dir := flag.String("dir", "", "directory of .cast recordings to sample (required)")
 	out := flag.String("out", "", "output JSONL file for distinct stable screens (required)")
 	gap := flag.Duration("gap", 500*time.Millisecond, "minimum inter-event quiet gap that marks a stable screen")
 	final := flag.Bool("final", false, "also emit each cast's final rendered frame as a sample (source \"final\")")
+	fires := flag.Bool("fires", false, "also emit a sample at each event where a structural detector newly fires (source \"fire\" plus the detector key)")
 	flag.Parse()
 
 	if *dir == "" || *out == "" {
@@ -98,7 +137,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	distinct, casts, events, gaps, err := collect(paths, gap.Seconds(), *final)
+	distinct, casts, events, gaps, err := collect(paths, gap.Seconds(), *final, *fires)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "corpus-sampler: %v\n", err)
 		os.Exit(1)
@@ -136,10 +175,10 @@ func castPaths(dir string) ([]string, error) {
 // scan is skipped with a stderr note and NOT counted in casts — one bad cast
 // never aborts a 1900-cast run. Determinism follows from sorted castPaths +
 // in-order events + first-occurrence-wins.
-func collect(paths []string, gap float64, final bool) (distinct []sample, casts, events, gaps int, err error) {
+func collect(paths []string, gap float64, final, fires bool) (distinct []sample, casts, events, gaps int, err error) {
 	idx := map[string]int{} // hash -> position in distinct
 	for _, p := range paths {
-		samples, ev, gp, serr := sampleCast(p, gap, final)
+		samples, ev, gp, serr := sampleCast(p, gap, final, fires)
 		if serr != nil {
 			fmt.Fprintf(os.Stderr, "corpus-sampler: skip %s: %v\n", filepath.Base(p), serr)
 			continue
@@ -195,7 +234,16 @@ func mergeSources(a, b []string) []string {
 // consecutive "o". When final is set and the cast had >=1 output event, one more
 // sample (source "final") is appended for the ending frame — the buffer rendered
 // after the last output event. The returned gap count excludes that final sample.
-func sampleCast(path string, gap float64, final bool) (samples []sample, events, gaps int, err error) {
+//
+// When fires is set, after appending each event's bytes the buffer's post-append
+// snapshot is classified through activeKeys (the same after-append snapshot
+// corpus-replay classifies, so the fire moments align with its report). Each
+// detector key that is newly active this event — active now but not on the
+// previous event — yields one fire sample (Event=idx, source "fire" plus the
+// sorted newly-fired keys). Emitting on the fire edge keeps each sample's
+// Event/TS at the onset moment; dedupe collapses repeats by hash regardless. The
+// returned gap count excludes fire samples.
+func sampleCast(path string, gap float64, final, fires bool) (samples []sample, events, gaps int, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, 0, 0, err
@@ -212,6 +260,7 @@ func sampleCast(path string, gap float64, final bool) (samples []sample, events,
 	header := true
 	idx := 0
 	var prevTS float64
+	prev := map[string]bool{} // previous event's active-key set, for fire-edge detection
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {
@@ -251,6 +300,40 @@ func sampleCast(path string, gap float64, final bool) (samples []sample, events,
 		}
 		buf.Append(data)
 		full.Write(data)
+		if fires {
+			// Classify the post-append snapshot — the same frame corpus-replay
+			// classifies (replay:291-294) — and emit on the fire edge: keys active
+			// now but not on the previous event. Event=idx is the event at which
+			// the detector fired (distinct from the gap sample's idx-1). activeKeys
+			// returns a map, so the newly-fired keys and the whole Source slice must
+			// be sorted before storing — collect keeps the first occurrence's Source
+			// as-is, so an unsorted slice would break byte-identity across re-runs.
+			snap := buf.Snapshot()
+			cur := activeKeys(snap)
+			var newKeys []string
+			for k := range cur {
+				if !prev[k] {
+					newKeys = append(newKeys, k)
+				}
+			}
+			if len(newKeys) > 0 {
+				sort.Strings(newKeys)
+				grid := tuidriver.Render(snap, cols, rows)
+				src := append([]string{sourceFire}, newKeys...)
+				sort.Strings(src)
+				samples = append(samples, sample{
+					Grid:   grid,
+					Hash:   hashGrid(normalize(grid)),
+					Cast:   name,
+					Event:  idx,
+					TS:     ts,
+					Cols:   cols,
+					Rows:   rows,
+					Source: src,
+				})
+			}
+			prev = cur
+		}
 		prevTS = ts
 		idx++
 	}
