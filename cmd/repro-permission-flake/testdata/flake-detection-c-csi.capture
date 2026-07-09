@@ -1,0 +1,4 @@
+0	probe=1 probe-start kind="observe" prompt="edit a file"
+500	probe=1 prompt-written
+4000	Do[1Cyou[1Cwant[1Cto[1Cproceed?
+31000	spike failed: session A: probe 1: probe 1: modal not detected within 30s

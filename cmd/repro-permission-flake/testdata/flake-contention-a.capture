@@ -1,0 +1,6 @@
+0	probe=1 probe-start kind="observe" prompt="run ls"
+500	probe=1 prompt-written
+1000	thinking (dot dot dot)
+1500	thinking (dot dot dot)
+2000	thinking (dot dot dot)
+2500	spike failed: session A: probe 1: probe 1: modal not detected within 30s
