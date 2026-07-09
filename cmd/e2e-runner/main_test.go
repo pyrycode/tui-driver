@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -8,62 +9,16 @@ import (
 	"testing"
 )
 
-func TestParseSnapshotResults(t *testing.T) {
-	tests := []struct {
-		name   string
-		stdout string
-		want   map[string]any
-	}{
-		{
-			name:   "single match",
-			stdout: "SNAPSHOT mcp match\n",
-			want: map[string]any{
-				"snapshots": []map[string]any{
-					{"file": "pkg/tuidriver/testdata/mcp-snapshot.json", "result": "match"},
-				},
-			},
-		},
-		{
-			name:   "single diff",
-			stdout: "SNAPSHOT mcp diff\n",
-			want: map[string]any{
-				"snapshots": []map[string]any{
-					{"file": "pkg/tuidriver/testdata/mcp-snapshot.json", "result": "diff"},
-				},
-			},
-		},
-		{
-			name:   "empty stdout",
-			stdout: "",
-			want:   nil,
-		},
-		{
-			name:   "no SNAPSHOT lines amid noise",
-			stdout: "some other log line\nanother line\n",
-			want:   nil,
-		},
-		{
-			name: "mcp line amid noise",
-			stdout: "2026-05-19 14:00:00 starting\n" +
-				"intermediate log\n" +
-				"SNAPSHOT mcp diff\n" +
-				"final log line\n" +
-				"done\n",
-			want: map[string]any{
-				"snapshots": []map[string]any{
-					{"file": "pkg/tuidriver/testdata/mcp-snapshot.json", "result": "diff"},
-				},
-			},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := parseSnapshotResults(tc.stdout, "")
-			if !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("parseSnapshotResults(...) = %#v, want %#v", got, tc.want)
-			}
-		})
+// TestBuildChecksExcludesSnapshotDrift pins #252's retirement of the last
+// snapshot-drift fixture: the runner's check list must contain no
+// snapshot-drift entry (by name or by the deleted e2e-snapshot-check binary).
+// A deterministic, claude-free guard against an accidental re-add.
+func TestBuildChecksExcludesSnapshotDrift(t *testing.T) {
+	checks := buildChecks(func(context.Context) (string, map[string]any) { return "pass", nil })
+	for _, c := range checks {
+		if c.Name == "snapshot-drift" || c.Binary == "e2e-snapshot-check" {
+			t.Errorf("buildChecks returned a retired snapshot-drift check: %+v", c)
+		}
 	}
 }
 
