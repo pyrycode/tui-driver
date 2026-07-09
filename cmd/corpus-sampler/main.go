@@ -61,12 +61,25 @@ type sample struct {
 	Tag     string  `json:"tag"`     // tagFromName: "ok" | "err" | "untagged"
 	Segment string  `json:"segment"` // segmentOf: "prod" | "e2e" | "unknown"
 	Seen    int     `json:"seen"`    // total occurrences across the run (first = 1)
+	// Source is the set of rules that found this screen (e.g. "gap", "final"),
+	// always serialized as a sorted, distinct JSON array — one screen can be
+	// found by more than one source. Follow-up sources (#273/#274) add values
+	// here, not new fields.
+	Source []string `json:"source"`
 }
+
+// source names. Multi-valued from the start so #273 (-fires) / #274 (-midstream)
+// layer on by adding values, not new machinery.
+const (
+	sourceGap   = "gap"
+	sourceFinal = "final"
+)
 
 func main() {
 	dir := flag.String("dir", "", "directory of .cast recordings to sample (required)")
 	out := flag.String("out", "", "output JSONL file for distinct stable screens (required)")
 	gap := flag.Duration("gap", 500*time.Millisecond, "minimum inter-event quiet gap that marks a stable screen")
+	final := flag.Bool("final", false, "also emit each cast's final rendered frame as a sample (source \"final\")")
 	flag.Parse()
 
 	if *dir == "" || *out == "" {
@@ -85,7 +98,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	distinct, casts, events, gaps, err := collect(paths, gap.Seconds())
+	distinct, casts, events, gaps, err := collect(paths, gap.Seconds(), *final)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "corpus-sampler: %v\n", err)
 		os.Exit(1)
@@ -123,10 +136,10 @@ func castPaths(dir string) ([]string, error) {
 // scan is skipped with a stderr note and NOT counted in casts — one bad cast
 // never aborts a 1900-cast run. Determinism follows from sorted castPaths +
 // in-order events + first-occurrence-wins.
-func collect(paths []string, gap float64) (distinct []sample, casts, events, gaps int, err error) {
+func collect(paths []string, gap float64, final bool) (distinct []sample, casts, events, gaps int, err error) {
 	idx := map[string]int{} // hash -> position in distinct
 	for _, p := range paths {
-		samples, ev, gp, serr := sampleCast(p, gap)
+		samples, ev, gp, serr := sampleCast(p, gap, final)
 		if serr != nil {
 			fmt.Fprintf(os.Stderr, "corpus-sampler: skip %s: %v\n", filepath.Base(p), serr)
 			continue
@@ -137,6 +150,9 @@ func collect(paths []string, gap float64) (distinct []sample, casts, events, gap
 		for _, s := range samples {
 			if pos, ok := idx[s.Hash]; ok {
 				distinct[pos].Seen++
+				// Union the finder into the kept entry: one screen can be found
+				// by more than one source. Seen still counts total occurrences.
+				distinct[pos].Source = mergeSources(distinct[pos].Source, s.Source)
 				continue
 			}
 			s.Seen = 1
@@ -147,14 +163,39 @@ func collect(paths []string, gap float64) (distinct []sample, casts, events, gap
 	return distinct, casts, events, gaps, nil
 }
 
+// mergeSources returns the sorted union of source sets a and b with duplicates
+// removed. Source sets are tiny (a handful of values at most), so the linear
+// membership scan is fine. Sorting makes the serialized array order independent
+// of which source found the screen first, so re-runs stay byte-identical.
+func mergeSources(a, b []string) []string {
+	out := append([]string(nil), a...)
+	for _, s := range b {
+		found := false
+		for _, v := range out {
+			if v == s {
+				found = true
+				break
+			}
+		}
+		if !found {
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // sampleCast walks one cast and returns its stable-screen samples (Tag/Segment
 // already stamped; Seen left 0 — collect owns dedupe), plus the cast's
 // output-event count and gap count. For consecutive output events i-1 and i with
 // ts[i]-ts[i-1] >= gap, it renders the buffer holding events [0 … i-1] — i.e.
-// BEFORE appending event i — and emits one sample for the frame event i-1
-// painted (Event=i-1, TS=ts[i-1]). Non-"o" events are skipped for both gap
-// timing and the buffer, so "consecutive output events" means consecutive "o".
-func sampleCast(path string, gap float64) (samples []sample, events, gaps int, err error) {
+// BEFORE appending event i — and emits one gap sample for the frame event i-1
+// painted (Event=i-1, TS=ts[i-1], source "gap"). Non-"o" events are skipped for
+// both gap timing and the buffer, so "consecutive output events" means
+// consecutive "o". When final is set and the cast had >=1 output event, one more
+// sample (source "final") is appended for the ending frame — the buffer rendered
+// after the last output event. The returned gap count excludes that final sample.
+func sampleCast(path string, gap float64, final bool) (samples []sample, events, gaps int, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, 0, 0, err
@@ -197,14 +238,16 @@ func sampleCast(path string, gap float64) (samples []sample, events, gaps int, e
 			// render the buffer as it stood after idx-1, before appending idx.
 			grid := tuidriver.Render(buf.Snapshot(), cols, rows)
 			samples = append(samples, sample{
-				Grid:  grid,
-				Hash:  hashGrid(normalize(grid)),
-				Cast:  name,
-				Event: idx - 1,
-				TS:    prevTS,
-				Cols:  cols,
-				Rows:  rows,
+				Grid:   grid,
+				Hash:   hashGrid(normalize(grid)),
+				Cast:   name,
+				Event:  idx - 1,
+				TS:     prevTS,
+				Cols:   cols,
+				Rows:   rows,
+				Source: []string{sourceGap},
 			})
+			gaps++
 		}
 		buf.Append(data)
 		full.Write(data)
@@ -215,13 +258,31 @@ func sampleCast(path string, gap float64) (samples []sample, events, gaps int, e
 		return nil, 0, 0, err
 	}
 
+	// The final frame captures how the run ended, which the quiet-gap rule misses
+	// when the last events arrive in a burst. buf now holds every output event, so
+	// its render is the ending screen painted by the last output event (idx-1).
+	// A cast with zero output events (idx == 0) has no ending frame to emit.
+	if final && idx >= 1 {
+		grid := tuidriver.Render(buf.Snapshot(), cols, rows)
+		samples = append(samples, sample{
+			Grid:   grid,
+			Hash:   hashGrid(normalize(grid)),
+			Cast:   name,
+			Event:  idx - 1,
+			TS:     prevTS,
+			Cols:   cols,
+			Rows:   rows,
+			Source: []string{sourceFinal},
+		})
+	}
+
 	tag := tagFromName(name)
 	segment := segmentOf(full.String())
 	for i := range samples {
 		samples[i].Tag = tag
 		samples[i].Segment = segment
 	}
-	return samples, idx, len(samples), nil
+	return samples, idx, gaps, nil
 }
 
 // parseOutputEventTS forks corpus-replay's parseOutputEvent to also return the
