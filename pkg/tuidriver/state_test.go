@@ -175,6 +175,75 @@ func TestIsThinkingRealisticLayoutPinsRegion(t *testing.T) {
 	}
 }
 
+func TestIsThinkingDotSpinnerFixture(t *testing.T) {
+	// AC 2 — the plain dot-frame spinner is a SIXTH thinking frame the five
+	// sparkle glyphs miss. This is a real frame extracted from a live recording
+	// (#243), observed evidence rather than a self-descriptive pin: its leading
+	// glyph is the middle dot (U+00B7), not a sparkle, and no "esc to interrupt"
+	// hint is on screen — so the dotSpinnerRe arm is the only thing that can
+	// classify it busy. Fails RED before that arm, GREEN after.
+	snap := loadFixture(t, "dot-spinner-snapshot.bin")
+	if !IsThinking(snap) {
+		t.Errorf("IsThinking(dot-spinner fixture) = false, want true")
+	}
+	if IsIdle(snap) {
+		t.Errorf("IsIdle(dot-spinner fixture) = true, want false")
+	}
+}
+
+func TestIsThinkingDotFrameRealisticLayout(t *testing.T) {
+	// Non-vacuity guard for the dot-frame arm, independent of the .bin fixture:
+	// the dot-frame row (dot at row start, verb, ellipsis) in the spinner
+	// position of a realistic thinking layout reads busy and NOT idle. Mirrors
+	// TestIsThinkingRealisticLayoutPinsRegion with the dot frame in place of ✻.
+	// Leading dot as a UTF-8 byte escape (\xc2\xb7 = U+00B7) so the matched anchor
+	// never renders in source — the spinnerGlyphs idiom. The parenthetical carries
+	// an in-line dot separator too, proving the ^-anchor keys on the LEADING dot.
+	const dot = "\xc2\xb7" // U+00B7 MIDDLE DOT
+	snap := gridRows(
+		"transcript line",
+		"transcript line",
+		"assistant working on the turn",
+		dot+" Simmering… (7s "+dot+" thinking with xhigh effort)", // dot frame at spinner position (-5)
+		"╭────────────────╮",                                      // input box top border (-4)
+		"❯",                                                       // redrawn input line (-3)
+		"╰────────────────╯",                                      // input box bottom border (-2)
+		"  ? for shortcuts",                                       // hint bar (-1)
+	)
+	if !IsThinking(snap) {
+		t.Errorf("IsThinking(dot-frame layout) = false, want true")
+	}
+	if IsIdle(snap) {
+		t.Errorf("IsIdle(dot-frame layout) = true, want false")
+	}
+}
+
+func TestIsThinkingDotSeparatorInRegionNotBusy(t *testing.T) {
+	// The dot must LEAD the row, not merely appear in it. A middle dot used as a
+	// mid-row separator inside the bottom status region — the exact chrome claude
+	// paints ("…failed · /mcp", the class-C spinner's "(Ns · …)") — must NOT read
+	// as busy; only dotSpinnerRe's row-start anchor separates the two. The screen
+	// is otherwise a committed idle layout (❯ in region, no spinner), so it must
+	// still read IsIdle == true: the new arm does not over-fire on a separator.
+	const dot = "\xc2\xb7" // U+00B7 MIDDLE DOT
+	snap := gridRows(
+		"transcript line",
+		"assistant finished the turn",
+		"2 MCP servers failed "+dot+" /mcp", // dot as a mid-row banner separator
+		"summary "+dot+" detail…",           // dot mid-row with an ellipsis, still not leading
+		"╭────────────────╮",
+		"❯ ready for the next prompt",
+		"╰────────────────╯",
+		"  ? for shortcuts",
+	)
+	if IsThinking(snap) {
+		t.Errorf("IsThinking(mid-row dot separator) = true, want false")
+	}
+	if !IsIdle(snap) {
+		t.Errorf("IsIdle(mid-row dot separator) = false, want true")
+	}
+}
+
 func TestIsThinkingInterruptHintDrivesBusy(t *testing.T) {
 	// AC #3 — the "esc to interrupt" hint alone, with NO spinner glyph anywhere,
 	// classifies busy through the same region-scoped grid path as the spinner.
