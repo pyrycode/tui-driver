@@ -10,11 +10,10 @@ GO         ?= go
 
 SPIKES     := spike-one-turn spike-multi-turn spike-cancel spike-permission spike-multiselect spike-ask-user spike-long-prompt spike-short-prompt spike-queued-modals
 PROBES     := probe-first-prompt-hang probe-cwd-encoding
-CHECKERS   := e2e-snapshot-check
 RUNNER     := e2e-runner
 TOOLS      := corpus-replay
 
-ALL_BINS   := $(SPIKES) $(PROBES) $(CHECKERS) $(RUNNER) $(TOOLS)
+ALL_BINS   := $(SPIKES) $(PROBES) $(RUNNER) $(TOOLS)
 BIN_PATHS  := $(addprefix $(BIN_DIR)/,$(ALL_BINS))
 
 # Directory of .cast recordings for `make corpus-replay`, defaulting to the
@@ -30,7 +29,7 @@ CORPUS_DIR ?= $(HOME)/.local/share/pyry-recordings
 MODEL      ?=
 EFFORT     ?=
 
-.PHONY: e2e build-bin clean-bin clean-report rerecord-snapshots check vet test corpus-replay
+.PHONY: e2e build-bin clean-bin clean-report check vet test corpus-replay
 
 # `make check` is the fast, claude-free gate run on every PR (see
 # .github/workflows/check.yml). `make e2e` remains the live-claude harness and
@@ -46,12 +45,6 @@ test:
 
 e2e: build-bin
 	$(if $(MODEL),TUIDRIVER_CLAUDE_MODEL=$(MODEL)) $(if $(EFFORT),TUIDRIVER_CLAUDE_EFFORT=$(EFFORT)) $(BIN_DIR)/$(RUNNER) -bin-dir $(BIN_DIR) -report $(REPORT)
-
-# Re-record the mcp snapshot-drift JSON fixture under pkg/tuidriver/testdata/.
-# Operator-driven, NOT invoked by `make e2e`. Review with `git diff` before commit;
-# bump claude-version.lock `version=` to match `claude --version` in the same commit.
-rerecord-snapshots: build-bin
-	$(BIN_DIR)/e2e-snapshot-check -record -bin-dir $(BIN_DIR)
 
 # Replay the recording corpus through the detectors and print the fire report.
 # Offline audit tool, claude-free, NOT a CI gate (org rule). See

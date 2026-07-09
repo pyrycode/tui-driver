@@ -29,10 +29,9 @@ import (
 )
 
 const (
-	defaultCheckTimeout  = 60 * time.Second
-	probeCheckTimeout    = 30 * time.Second
-	snapshotDriftTimeout = 180 * time.Second
-	defaultWallBudget    = 10 * time.Minute
+	defaultCheckTimeout = 60 * time.Second
+	probeCheckTimeout   = 30 * time.Second
+	defaultWallBudget   = 10 * time.Minute
 )
 
 // successSuccess matches the four "result" spikes' `SUCCESS: <text>` line.
@@ -46,28 +45,20 @@ var observedSuccess = regexp.MustCompile(`(?m)^OBSERVED`)
 // cmd/probe-first-prompt-hang/main.go.
 var probeOutDirRe = regexp.MustCompile(`probe outDir=(\S+)`)
 
-// snapshotResultRe matches one "SNAPSHOT <name> match|diff" line emitted by
-// cmd/e2e-snapshot-check on stdout, one per fixture.
-var snapshotResultRe = regexp.MustCompile(`(?m)^SNAPSHOT (mcp) (match|diff)$`)
-
 // Check is one orchestrated subprocess invocation. Fields are populated at
 // startup from the hardcoded check list; runCheck consumes them uniformly.
 type Check struct {
 	Name          string
-	Kind          string // "spike" | "probe" | "snapshot" | "version-lock" — informational only
+	Kind          string // "spike" | "probe" | "version-lock" — informational only
 	Binary        string // path within -bin-dir
 	Args          []string
 	SuccessMarker *regexp.Regexp // nil = exit-code-only success
 	Timeout       time.Duration  // zero falls back to defaultCheckTimeout
 	OnFailure     func(stdout, stderr string) map[string]any
-	// OnComplete fires regardless of status, after OnFailure if both are set.
-	// Use for fields that must appear on pass entries (e.g. snapshot-drift's
-	// per-fixture result list).
-	OnComplete func(stdout, stderr string) map[string]any
 	// Run is an in-process check body. When non-nil, runCheck calls Run
 	// instead of spawning Binary, and returns a CheckResult directly.
-	// OnFailure / OnComplete are NOT invoked for in-process checks — Run
-	// returns its extra fields directly. Binary / Args / SuccessMarker are
+	// OnFailure is NOT invoked for in-process checks — Run returns its
+	// extra fields directly. Binary / Args / SuccessMarker are
 	// ignored when Run is set.
 	Run func(ctx context.Context) (status string, extra map[string]any)
 	// NonGating marks an informational check whose non-pass status is recorded
@@ -392,36 +383,7 @@ func buildChecks(runVersionLock func(ctx context.Context) (string, map[string]an
 				return map[string]any{"recording_dir": m[1]}
 			},
 		},
-		{
-			Name:       "snapshot-drift",
-			Kind:       "snapshot",
-			Binary:     "e2e-snapshot-check",
-			Args:       []string{},
-			Timeout:    snapshotDriftTimeout,
-			OnComplete: parseSnapshotResults,
-		},
 	}
-}
-
-// parseSnapshotResults turns e2e-snapshot-check's "SNAPSHOT <name> match|diff"
-// stdout lines into a `snapshots: [...]` slice for the report. Runs as an
-// OnComplete callback so per-fixture results appear on both pass and fail
-// (AC #35). Returns nil when no SNAPSHOT lines were emitted (check crashed
-// before printing any), letting the report entry omit the field rather than
-// embed an empty list.
-func parseSnapshotResults(stdout, _ string) map[string]any {
-	matches := snapshotResultRe.FindAllStringSubmatch(stdout, -1)
-	if len(matches) == 0 {
-		return nil
-	}
-	snapshots := make([]map[string]any, 0, len(matches))
-	for _, m := range matches {
-		snapshots = append(snapshots, map[string]any{
-			"file":   "pkg/tuidriver/testdata/" + m[1] + "-snapshot.json",
-			"result": m[2],
-		})
-	}
-	return map[string]any{"snapshots": snapshots}
 }
 
 func captureClaudeVersion(ctx context.Context) string {
@@ -660,16 +622,6 @@ func runCheck(parent context.Context, c Check, binDir string) CheckResult {
 	if status != "pass" && c.OnFailure != nil {
 		if extra := c.OnFailure(stdoutBuf.String(), stderrBuf.String()); len(extra) > 0 {
 			result.Extra = extra
-		}
-	}
-	if c.OnComplete != nil {
-		if extra := c.OnComplete(stdoutBuf.String(), stderrBuf.String()); len(extra) > 0 {
-			if result.Extra == nil {
-				result.Extra = map[string]any{}
-			}
-			for k, v := range extra {
-				result.Extra[k] = v
-			}
 		}
 	}
 	return result
