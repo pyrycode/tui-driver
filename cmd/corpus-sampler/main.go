@@ -123,7 +123,27 @@ func main() {
 	final := flag.Bool("final", false, "also emit each cast's final rendered frame as a sample (source \"final\")")
 	fires := flag.Bool("fires", false, "also emit a sample at each event where a structural detector newly fires (source \"fire\" plus the detector key)")
 	midstream := flag.Int("midstream", 0, "also emit up to N deterministically chosen mid-stream frames per cast (source \"midstream\")")
+	promoteMode := flag.Bool("promote", false, "promote mode: write a sampled screen to a committed fixture + manifest entry (needs -in, -hash, -dir)")
+	in := flag.String("in", "", "promote mode: sampler JSONL to read the screen's provenance from")
+	hash := flag.String("hash", "", "promote mode: normalized-grid hash of the screen to promote")
+	outdir := flag.String("outdir", filepath.Join("pkg", "tuidriver", "testdata", "corpus"), "promote mode: target corpus fixture directory")
 	flag.Parse()
+
+	// Promote mode reconstructs one screen's raw snapshot from the recordings and
+	// writes a fixture + manifest entry; it reuses -dir (recordings) but not the
+	// sampling path's -out/-gap/-final/-fires/-midstream. Disjoint from sampling.
+	if *promoteMode {
+		if *in == "" || *hash == "" || *dir == "" {
+			fmt.Fprintln(os.Stderr, "corpus-sampler -promote: -in, -hash, and -dir are required")
+			flag.Usage()
+			os.Exit(2)
+		}
+		if err := promote(*in, *hash, *dir, *outdir); err != nil {
+			fmt.Fprintf(os.Stderr, "corpus-sampler: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *dir == "" || *out == "" {
 		fmt.Fprintln(os.Stderr, "corpus-sampler: -dir and -out are required")

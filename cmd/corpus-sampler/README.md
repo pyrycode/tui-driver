@@ -30,6 +30,12 @@ go run ./cmd/corpus-sampler -dir /path/to/casts -out screens.jsonl -fires
 go run ./cmd/corpus-sampler -dir /path/to/casts -out screens.jsonl -midstream 5
 ```
 
+To promote a sampled screen to a committed fixture + manifest entry:
+
+```sh
+go run ./cmd/corpus-sampler -promote -in screens.jsonl -hash <hex> -dir /path/to/casts
+```
+
 Flags:
 
 - `-dir` (required): directory of `.cast` files.
@@ -58,6 +64,57 @@ Flags:
   between output bursts, where the quiet-gap rule rarely fires (the #243
   dot-spinner frame is the motivating case — it went uncounted in the original
   glyph census because it appears mid-stream, not at a quiet wait-state).
+
+## Promote mode (`-promote`)
+
+`-promote` turns one triaged screen into a permanent regression: a committed
+raw-snapshot fixture under `pkg/tuidriver/testdata/corpus/` plus an entry in
+`testdata/corpus/manifest.json` recording the expected per-axis classification
+(modal class, busy, idle, and the mcp-/network-failure and unknown-dialog
+banners) and provenance (cast, event index, hash). A single table-driven test
+(`pkg/tuidriver/corpus_fixtures_test.go`) then classifies every manifest entry
+through the same detector path the existing `testdata/*.bin` fixtures use — a new
+fixture needs zero new test code.
+
+The sampler JSONL stores only the *rendered* grid + its hash, never the raw
+buffer bytes the detectors take, so promote **reconstructs** the raw snapshot by
+replaying the source cast to the recorded event index and taking the buffer
+snapshot — hence it needs `-dir` (the recordings) as well as `-in` (the JSONL).
+It verifies the reconstruction against the recorded hash before writing anything,
+so a stale recordings dir aborts cleanly.
+
+Flags (promote mode):
+
+- `-promote`: select promote mode.
+- `-in` (required): the sampler JSONL to read the screen's provenance from.
+- `-hash` (required): the normalized-grid hash of the screen to promote (the
+  `hash` field of an `-out` line).
+- `-dir` (required): the recordings directory holding the source cast.
+- `-outdir` (default `pkg/tuidriver/testdata/corpus`): target fixture directory,
+  so a bare run from the repo root writes into the tree you then `git add`.
+
+Re-running promote for a hash already in the manifest is a no-op: the fixture is
+rewritten byte-identical and the manifest is left untouched, so a
+human-confirmed axis value is never clobbered.
+
+### ⚠️ Mandatory human review before committing a promoted fixture
+
+The promoter **pre-fills** each axis with the detector's *current* verdict as a
+convenience, but the committed value is the **human's confirmed call** — that is
+the review step. Before `git add`-ing a promoted fixture, a human MUST eyeball
+it for:
+
+- **Privacy** — a raw snapshot can contain paths or prompt content from the
+  source recording. Do not commit anything that should not be public.
+- **Anchor content** — the fixture embeds detection-anchor literals by design
+  (exactly like the existing committed fixtures). The test harness references
+  fixtures by path and never prints their bytes for this reason.
+
+The seed screens are chosen so detector and human agree, so `make check` stays
+green. Promoting a *disagreement* screen (an independent label vs. the detector
+verdict — the tool's eventual purpose) would legitimately turn the suite **red**
+as a documented detector bug; recording the human's call and pinning it is how
+that gets tracked, and is out of scope for the seed set.
 
 Each `-out` line carries full provenance: the raw rendered grid, its
 normalized-grid hash, cast filename, output-event index, timestamp, cols, rows,

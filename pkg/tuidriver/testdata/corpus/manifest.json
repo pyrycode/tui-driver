@@ -1,0 +1,28 @@
+[
+  {
+    "fixture": "b83fb1d7948be2a6428419c038012db5a07d090904504c600a0ca9bde2e6cd22.bin",
+    "modalClass": "ask-user-question",
+    "busy": false,
+    "idle": true,
+    "mcpFailure": false,
+    "networkFailure": false,
+    "unknownDialog": false,
+    "cast": "ask-user-seed-ok.cast",
+    "event": 0,
+    "hash": "b83fb1d7948be2a6428419c038012db5a07d090904504c600a0ca9bde2e6cd22",
+    "note": "seed: hand-eyeballed ask-user-question modal; idle also true since the ❯-option row sits in the status region (axes independent)"
+  },
+  {
+    "fixture": "c5e78c3f3a1c6064308901cfd61ae4e3e2574b440f413efbe2933cb21a8624d0.bin",
+    "modalClass": "",
+    "busy": false,
+    "idle": true,
+    "mcpFailure": false,
+    "networkFailure": false,
+    "unknownDialog": false,
+    "cast": "idle-seed-ok.cast",
+    "event": 0,
+    "hash": "c5e78c3f3a1c6064308901cfd61ae4e3e2574b440f413efbe2933cb21a8624d0",
+    "note": "seed: hand-eyeballed plain-idle screen at the ❯ input prompt, no modal"
+  }
+]
