@@ -38,6 +38,12 @@ window the live detector sees), runs the classifier at the stride, and records:
 
 - **structural detector fires** — idle, thinking, each modal class, the
   mcp-failure and network-failure banners, the unknown-dialog shape;
+- **transition edges** — how many times each detector key's membership flips
+  between consecutive sampled ticks within a cast (a modal class shown/hidden
+  repeatedly, a busy axis flapping). A real dialog fires once and stays at an
+  edge count of 1; content forgeries and animation gaps climb past it. Printed
+  as a per-key total table plus a top-5-per-bucket flappers list naming the
+  specific cast and detector (#247);
 - **anchor-in-content** — whether a detection anchor literal appeared in the
   run's content at all, whether or not the structural detector classified;
 - the **`-ok` / `-err`** tag and a **prod / e2e / unknown** segment (the corpus
