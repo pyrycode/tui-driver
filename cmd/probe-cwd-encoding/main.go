@@ -62,6 +62,23 @@ const (
 
 	shutdownGrace = 3 * time.Second
 
+	// settleWindow is how long the PTY must stay quiet (no new bytes) before a
+	// target state counts as "settled". It re-anchors the throwaway-prompt send
+	// off the bare-❯ false idle that appears ~0.25s into startup while claude is
+	// still rendering (#251/#263): requiring quiescence waits past that render
+	// burst so the keystroke lands on a genuinely ready claude. Must exceed the
+	// inter-render gap during startup/trust transitions yet stay far under
+	// sessionFileWait/wallTimeout. This is the tuning lever the operator adjusts
+	// across the #263 live `make e2e` runs (same posture as the e2e-runner spike
+	// timeouts); document the value that reaches 10-in-a-row.
+	settleWindow = 1 * time.Second
+
+	// trustModalWait bounds phase 1's wait for the (normally guaranteed) trust
+	// modal to appear and settle before falling back to the quiescent-idle path,
+	// so a rare auto-trusted cwd does not hang to wallTimeout. Under wallTimeout
+	// with room for the post-trust settle plus the 30s sessionFileWait.
+	trustModalWait = 15 * time.Second
+
 	// promptText is any trivial input — we only need claude to create the
 	// session JSONL (which materialises the projects-dir), not to finish a turn.
 	promptText = "hi\r"
@@ -160,32 +177,64 @@ func run(trustFolderPolicy string) error {
 		cancelCause(errors.New("shutdown"))
 	}()
 
-	// Wait for the idle prompt.
-	if err := tuidriver.WaitUntil(rootCtx, func() bool {
-		return tuidriver.IsIdle(session.Snapshot())
-	}); err != nil {
-		return fmt.Errorf("wait idle: %w", err)
-	}
-	logger.Printf("idle-detected")
+	// Re-anchor (#263): replace the two edge-triggered IsIdle/HasTrustModal
+	// checks with a level-triggered "settled" gate — a target state must hold
+	// AND the PTY must have been quiet for settleWindow. The bare ❯ that appears
+	// ~0.25s into startup is a transient produced WHILE claude is still rendering
+	// (#251 false idle); requiring quiescence waits past that render burst so the
+	// throwaway prompt lands on a genuinely ready claude. Prefer a semantic
+	// anchor (the trust modal) where one exists; fall back to bare quiescence
+	// only where none does.
+	readinessSignal := "trust-modal-settled"
 
-	// Trust modal. A brand-new temp cwd is never trusted, so claude ALWAYS
-	// shows this here — more deterministic than the repo-root case.
-	if tuidriver.HasTrustModal(session.Snapshot()) {
+	// Phase 1: wait for the trust modal, settled. A brand-new temp cwd is never
+	// trusted, so claude ALWAYS shows this — its appearance means the startup
+	// render finished and an interactive dialog is up (a stronger signal than a
+	// bare idle). Bounded by trustModalWait so a rare auto-trusted cwd falls back
+	// to the quiescent-idle path instead of hanging to the wall timeout.
+	trustCtx, cancelTrust := context.WithTimeout(rootCtx, trustModalWait)
+	trustErr := tuidriver.WaitUntil(trustCtx, settledPredicate(session, settleWindow, tuidriver.HasTrustModal))
+	cancelTrust()
+
+	trustModalSeen := trustErr == nil
+	switch {
+	case trustModalSeen:
+		logger.Printf("trust-modal-settled elapsed=%s quiet=%s",
+			time.Since(startedAt).Round(time.Millisecond), settleWindow)
+	case rootCtx.Err() != nil:
+		// The wall timeout / shutdown collapsed the whole run — a real failure,
+		// not the auto-trust fallback. Surface rootCtx's cause.
+		return fmt.Errorf("wait settled trust modal: %w", context.Cause(rootCtx))
+	default:
+		// trustModalWait elapsed with no modal — an auto-trusted cwd. Fall back
+		// to the quiescent-idle send path (weaker: no semantic anchor).
+		readinessSignal = "quiescent-idle-fallback"
+		logger.Printf("trust-modal-absent-within=%s falling-back-to-quiescent-idle", trustModalWait)
+	}
+
+	// Phase 2: answer trust per policy — reached only once the modal is genuinely
+	// settled, so -trust-folder=fail no longer races the false idle.
+	if trustModalSeen {
 		if trustFolderPolicy == "fail" {
 			return fmt.Errorf("claude shows the trust-folder dialog for the fresh cwd — pass -trust-folder=accept")
 		}
 		if err := session.AcceptTrust(); err != nil {
 			return fmt.Errorf("write trust-accept keystroke: %w", err)
 		}
-		logger.Printf("trust-folder-accepted")
-		if err := tuidriver.WaitUntil(rootCtx, func() bool {
-			snap := session.Snapshot()
-			return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
-		}); err != nil {
-			return fmt.Errorf("wait for idle post-trust-accept: %w", err)
-		}
-		logger.Printf("idle-detected-post-trust")
+		logger.Printf("trust-accepted elapsed=%s", time.Since(startedAt).Round(time.Millisecond))
 	}
+
+	// Phase 3: wait for a settled post-trust idle, then send. This is the actual
+	// send-readiness gate the root cause names ("after trust-accept"): ❯ present,
+	// no trust modal, and the PTY quiet for settleWindow.
+	if err := tuidriver.WaitUntil(rootCtx, settledPredicate(session, settleWindow, func(snap []byte) bool {
+		return !tuidriver.HasTrustModal(snap) && tuidriver.IsIdle(snap)
+	})); err != nil {
+		return fmt.Errorf("wait settled idle before prompt: %w", err)
+	}
+	elapsedToReady := time.Since(startedAt)
+	logger.Printf("post-trust-settled-idle elapsed=%s quiet=%s",
+		elapsedToReady.Round(time.Millisecond), settleWindow)
 
 	// Send one trivial prompt — the only reason is to make claude create the
 	// session JSONL (deferred until first input lands). Once the file exists on
@@ -194,7 +243,7 @@ func run(trustFolderPolicy string) error {
 	if err := session.SendKeys(promptText); err != nil {
 		return fmt.Errorf("write prompt: %w", err)
 	}
-	logger.Printf("prompt-written")
+	logger.Printf("prompt-written elapsed=%s", time.Since(startedAt).Round(time.Millisecond))
 
 	// Discover claude's projects-dir INDEPENDENTLY of EncodeCwd. This never
 	// calls EncodeCwd / SessionJSONLPath / WaitForSessionJSONL — those derive
@@ -210,9 +259,36 @@ func run(trustFolderPolicy string) error {
 	// observedDir is known — including when it contradicts EncodeCwd (the
 	// expected, useful result) and when no candidate rule matches (unknown).
 	report := deriveObservation(sessionID, cwd, observedDir)
+	report.readinessSignal = readinessSignal
+	report.elapsedToReady = elapsedToReady
 	writeObservation(logger, outDir, report)
 	logger.Printf("observation recorded (elapsed %s)", time.Since(startedAt).Round(time.Millisecond))
 	return nil
+}
+
+// settledPredicate returns a WaitUntil predicate that holds once want(snapshot)
+// is true AND the PTY has been quiet for window — i.e. claude finished the
+// render burst that produced this state, rather than sitting on the transient
+// false idle mid-render (#251/#263). window == 0 degrades to a bare want()
+// check. LastAppendAt is read AFTER the snapshot so any append that shaped the
+// snapshot is reflected in the quiescence clock: the conservative order can only
+// under-report quiet (making us poll once more), never over-report it.
+func settledPredicate(s *tuidriver.Session, window time.Duration, want func([]byte) bool) func() bool {
+	return func() bool {
+		snap := s.Snapshot()
+		return isSettled(want(snap), time.Since(s.LastAppendAt()), window)
+	}
+}
+
+// isSettled is settledPredicate's pure, claude-free-testable core: a settled
+// gate holds when the target state is present (want) AND the PTY has been quiet
+// for at least window (sinceLastAppend >= window). window == 0 makes any
+// non-negative quiet duration pass, degrading to a bare want() check.
+func isSettled(want bool, sinceLastAppend, window time.Duration) bool {
+	if !want {
+		return false
+	}
+	return sinceLastAppend >= window
 }
 
 // discoverProjectsDir polls ~/.claude/projects/*/<sessionID>.jsonl until a
@@ -262,6 +338,11 @@ type observation struct {
 	wholePath    string // whole-path cross-check: matching rule name, or "none"
 	encodeCwd    string // EncodeCwd(cwd) — informational cross-check only
 	matches      bool   // encodeCwd == observedDir
+
+	// Readiness-timing record for the re-anchor (#263), the per-run evidence the
+	// operator diffs across the 10 live make-e2e runs (AC2/AC3).
+	readinessSignal string        // "trust-modal-settled" or "quiescent-idle-fallback"
+	elapsedToReady  time.Duration // run start → settled send-readiness gate
 }
 
 // deriveObservation computes the encoding-rule derivation from the compile-time
@@ -408,6 +489,8 @@ func writeObservation(logger *log.Logger, outDir string, o observation) {
 		fmt.Sprintf("OBSERVED: leaf=%s per_byte=%s per_utf16=%s per_rune=%s", nonASCIILeaf, o.perByte, o.perUTF16, o.perRune),
 		fmt.Sprintf("OBSERVED: derived_rule=%s whole_path_cross_check=%s", o.derivedRule, o.wholePath),
 		fmt.Sprintf("OBSERVED: encode_cwd_current=%s matches_observed=%t", o.encodeCwd, o.matches),
+		fmt.Sprintf("OBSERVED: readiness_signal=%s elapsed_to_ready=%s settle_window=%s",
+			o.readinessSignal, o.elapsedToReady.Round(time.Millisecond), settleWindow),
 	}
 
 	var sb strings.Builder
