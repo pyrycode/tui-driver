@@ -5,12 +5,16 @@ import (
 	"time"
 )
 
-// DefaultBufferCap is the rolling buffer capacity used by the 6 spike
-// binaries (4096 bytes). Tracks the latest TUI rendering for state
-// detection. Known limitation: long-running tool UIs (Task list, TodoWrite)
-// scroll past this window before snapshot — bigger cap or streaming
-// snapshots is a deferred architectural decision for the library.
-const DefaultBufferCap = 4096
+// DefaultBufferCap is the rolling buffer capacity (16384 bytes) the live
+// consumer (pyry agent-run, via BufferCap: 0) inherits. It is the rolling
+// window sized so a full-screen panel keeps classifying for as long as it is
+// physically on screen while ordinary status repaints (spinner / token-counter
+// frames) trickle in — a smaller window evicted the panel's header bytes while
+// the panel never left the screen. Region-scoped detectors read only the
+// bottom rendered rows, so a larger window only starts VT100 reconstruction
+// further back (strictly more faithful, fewer dropped characters); no detector
+// loses protection.
+const DefaultBufferCap = 16384
 
 // Buffer is a thread-safe rolling byte buffer that tracks the time of the
 // most recent append. Used as the PTY-side state-detection substrate: read

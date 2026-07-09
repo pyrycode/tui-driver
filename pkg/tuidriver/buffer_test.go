@@ -80,8 +80,8 @@ func TestBufferLastAppendAtTracksAppend(t *testing.T) {
 
 func TestBufferNewBufferDefaultsCap(t *testing.T) {
 	b := NewBuffer(-1)
-	// Append 5000 bytes; should trim to DefaultBufferCap.
-	big := bytes.Repeat([]byte("x"), 5000)
+	// Append > cap bytes; should trim to DefaultBufferCap.
+	big := bytes.Repeat([]byte("x"), DefaultBufferCap+100)
 	b.Append(big)
 	if got := len(b.Snapshot()); got != DefaultBufferCap {
 		t.Errorf("len(Snapshot) = %d, want %d", got, DefaultBufferCap)
