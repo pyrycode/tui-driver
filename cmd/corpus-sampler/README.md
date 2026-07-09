@@ -17,8 +17,8 @@ Sibling of [`corpus-replay`](../corpus-replay) (#227) — it reuses the same
 cast-directory listing, asciinema header parse, `-ok`/`-err` tag read, and
 prod/e2e segment cues, and (for `-fires`) its detector predicate set. **Scope:**
 quiet-gap stable screens plus, with `-final`, each cast's ending frame, plus,
-with `-fires`, each frame a structural detector fired on; random mid-stream
-slices are `-midstream` (#274).
+with `-fires`, each frame a structural detector fired on, plus, with
+`-midstream N`, N deterministically chosen mid-stream frames per cast.
 
 ## Run
 
@@ -27,6 +27,7 @@ go run ./cmd/corpus-sampler -dir /path/to/casts -out screens.jsonl
 go run ./cmd/corpus-sampler -dir /path/to/casts -out screens.jsonl -gap 1s
 go run ./cmd/corpus-sampler -dir /path/to/casts -out screens.jsonl -final
 go run ./cmd/corpus-sampler -dir /path/to/casts -out screens.jsonl -fires
+go run ./cmd/corpus-sampler -dir /path/to/casts -out screens.jsonl -midstream 5
 ```
 
 Flags:
@@ -48,15 +49,24 @@ Flags:
   (e.g. `["fire","idle"]`, `["fire","modal:trust-folder"]`). These are the direct
   false-positive-triage candidates for the #257 labeling pass — the exact screens
   a live run would have acted on, often mid-stream where quiet gaps are rare.
+- `-midstream N` (default `0`, off): also emit up to N deterministically chosen
+  mid-stream frames per cast (`source: ["midstream"]`). Each output-event index
+  is keyed by `sha256(cast-name + index)`; the N smallest keys are selected, so
+  re-running over the same input directory reproduces the identical distinct
+  set — no wall-clock time, no RNG. A cast with fewer than N eligible events
+  emits all of them, no padding. Surfaces streaming-state variety that lives
+  between output bursts, where the quiet-gap rule rarely fires (the #243
+  dot-spinner frame is the motivating case — it went uncounted in the original
+  glyph census because it appears mid-stream, not at a quiet wait-state).
 
 Each `-out` line carries full provenance: the raw rendered grid, its
 normalized-grid hash, cast filename, output-event index, timestamp, cols, rows,
 `ok`/`err` tag, prod/e2e segment, a cross-run `seen` count, and a `source` array
 naming every rule that found this screen (`"gap"`, `"final"`, `"fire"` plus the
-firing detector key; a screen found by more than one rule keeps the full sorted,
-distinct set). `stdout` prints a single aggregate line — `casts events gaps
-distinct` — and nothing else; `gaps` counts quiet-gap fires only, excluding any
-`-final` or `-fires` sample.
+firing detector key, `"midstream"`; a screen found by more than one rule keeps
+the full sorted, distinct set). `stdout` prints a single aggregate line —
+`casts events gaps distinct` — and nothing else; `gaps` counts quiet-gap fires
+only, excluding any `-final`, `-fires`, or `-midstream` sample.
 
 Local audit tool only — no CI workflow (org rule).
 
