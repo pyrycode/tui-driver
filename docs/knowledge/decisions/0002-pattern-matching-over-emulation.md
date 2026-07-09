@@ -33,6 +33,10 @@ This is a **deliberate initial choice**, not a permanent one. If a future state 
 - The verb in the thinking indicator is variable per prompt ("Baked", "Whipped up", "Cooking", …). Match-and-capture, don't whitelist — see [JSONL layout](../architecture/jsonl-layout.md) for the empirical observation surface.
 - 4 KB rolling cap is a knob we may have to tune if `claude` ever changes its redraw cadence. Re-examine if state predicates start missing signals.
 
+## Update — 2026-07-09 ([#246](../codebase/246.md))
+
+The 4 KB cap was raised to 16 KB. The trigger wasn't redraw-cadence drift — it was a full-screen panel (e.g. `/mcp`) that fills the window exactly: ordinary status repaints evicted the panel's header bytes from the front of the window while the panel was still on screen, going blind to content that never left the physical display. The per-tick render-once change (#225) had removed the earlier cost objection to a bigger window. `DefaultGridRows` stays 40 and region-scoped detectors (`Grid.LastRows`) still read only the bottom rendered rows, so this is a pure fidelity improvement, not a reopening of the pattern-matching-vs-emulation decision above.
+
 ## Links
 
 - Vault: `📋 Projects/2026-04-10 - Pyrycode/TUI Driver.md` § *Pattern Matching, Not Full Emulation (Initially)*
