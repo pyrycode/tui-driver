@@ -64,6 +64,41 @@ func TestReplayCast_ForgedHeaderAndRetiredTokenSuppressed(t *testing.T) {
 	}
 }
 
+// TestReplayCast_FlappingDetectorCountsMultipleEdges replays a synthetic cast
+// whose sampled frames alternate idle prompt -> trust modal -> thinking spinner
+// -> trust modal, each frame clearing the screen so the render fully repaints.
+// The trust class and the idle axis each appear and disappear repeatedly, so
+// both must register more than a single fire-and-stay edge.
+func TestReplayCast_FlappingDetectorCountsMultipleEdges(t *testing.T) {
+	r, err := replayCast(filepath.Join("testdata", "flap-err.cast"), 1)
+	if err != nil {
+		t.Fatalf("replayCast: %v", err)
+	}
+	if got := r.edges["modal:trust-folder"]; got <= 1 {
+		t.Errorf("modal:trust-folder edges = %d, want > 1 (modal shown/hidden repeatedly)", got)
+	}
+	if got := r.edges["idle"]; got <= 1 {
+		t.Errorf("idle edges = %d, want > 1 (idle flaps as the busy axis toggles)", got)
+	}
+	// fires semantics are preserved: a key that flapped still fired at least once.
+	if !r.fired["modal:trust-folder"] {
+		t.Errorf("modal:trust-folder did not fire")
+	}
+}
+
+// TestReplayCast_StableDetectorCountsOneEdge replays a cast where the trust modal
+// is present from the first sampled frame and never leaves. A detector that fires
+// once and stays registers exactly one edge — its first appearance — never more.
+func TestReplayCast_StableDetectorCountsOneEdge(t *testing.T) {
+	r, err := replayCast(filepath.Join("testdata", "stable-ok.cast"), 1)
+	if err != nil {
+		t.Fatalf("replayCast: %v", err)
+	}
+	if got := r.edges["modal:trust-folder"]; got != 1 {
+		t.Errorf("modal:trust-folder edges = %d, want 1 (fires once and stays)", got)
+	}
+}
+
 func TestTagFromName(t *testing.T) {
 	cases := map[string]string{
 		"20260707T-uuid-ok.cast":  "ok",

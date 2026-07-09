@@ -37,6 +37,45 @@ func bucketOf(r castResult) string {
 
 var buckets = []string{"prod-ok", "prod-err", "e2e-ok", "e2e-err", "other"}
 
+// topFlappersN caps the top-flappers list printed per bucket. A display constant
+// only — the sub-header states it so the truncation is never silent; bump it if a
+// real bucket proves deeper than this.
+const topFlappersN = 5
+
+// flapEntry is one flapping (cast, detector) pair with its transition-edge count.
+type flapEntry struct {
+	cast  string
+	key   string
+	count int
+}
+
+// bucketFlappers collects the (cast, detector, edge-count) entries in bucket b
+// whose edge count exceeds a single fire-and-stay (> 1), sorted descending by
+// count with cast then key as deterministic tie-breakers.
+func bucketFlappers(results []castResult, b string) []flapEntry {
+	var flaps []flapEntry
+	for _, r := range results {
+		if bucketOf(r) != b {
+			continue
+		}
+		for key, n := range r.edges {
+			if n > 1 {
+				flaps = append(flaps, flapEntry{shortName(r.name), key, n})
+			}
+		}
+	}
+	sort.Slice(flaps, func(i, j int) bool {
+		if flaps[i].count != flaps[j].count {
+			return flaps[i].count > flaps[j].count
+		}
+		if flaps[i].cast != flaps[j].cast {
+			return flaps[i].cast < flaps[j].cast
+		}
+		return flaps[i].key < flaps[j].key
+	})
+	return flaps
+}
+
 // isSuspect reports whether a fire of detector name in a healthy production run
 // is a false-positive suspect. idle and thinking fire in normal runs and are not
 // suspects; every modal/banner/shape detector is.
@@ -133,6 +172,62 @@ func report(w io.Writer, results []castResult, dir string, stride int, perCast b
 		}
 		fmt.Fprintf(w, "  %s: %d cast(s), structural detector %q also fired in %d — %d suppressed%s\n",
 			a.label, appeared, det, alsoFired, appeared-alsoFired, tag)
+	}
+
+	// Transition edges: how often each detector flipped — or the active modal
+	// class changed — between consecutive sampled ticks within a cast. A real
+	// dialog fires once and stays at 1; content forgeries and animation gaps flap
+	// past 1. Unlike the false-positive section, idle/thinking ARE counted here: a
+	// busy axis flipping many times a run is a flapping defect even though idle is
+	// not a false-positive suspect (#247).
+	edgeSums := map[string]map[string]int{}
+	edgeNames := map[string]bool{}
+	for _, r := range results {
+		b := bucketOf(r)
+		for key, n := range r.edges {
+			edgeNames[key] = true
+			if edgeSums[key] == nil {
+				edgeSums[key] = map[string]int{}
+			}
+			edgeSums[key][b] += n
+		}
+	}
+
+	fmt.Fprintln(w, "\ntransition edges (a detector flipping — or the active modal class changing — between consecutive sampled ticks; a real dialog fires once and stays at 1, flapping climbs):")
+	etw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(etw, "  DETECTOR\tprod-ok\tprod-err\te2e-ok\te2e-err\tother\ttotal")
+	for _, name := range sortedDetectors(edgeNames) {
+		row := "  " + name
+		total := 0
+		for _, b := range buckets {
+			row += fmt.Sprintf("\t%d", edgeSums[name][b])
+			total += edgeSums[name][b]
+		}
+		fmt.Fprintf(etw, "%s\t%d\n", row, total)
+	}
+	etw.Flush()
+
+	// Top flappers per (segment, tag) bucket: the specific casts whose edge count
+	// exceeds a single fire-and-stay, so a flapping regression names its recording
+	// (this is the line that surfaces "recording X, modal:permission, x6").
+	fmt.Fprintf(w, "\ntop flappers per (segment, tag) bucket (edge count > 1; top %d by edge count):\n", topFlappersN)
+	anyFlap := false
+	for _, b := range buckets {
+		flaps := bucketFlappers(results, b)
+		if len(flaps) == 0 {
+			continue
+		}
+		anyFlap = true
+		fmt.Fprintf(w, "  %s:\n", b)
+		if len(flaps) > topFlappersN {
+			flaps = flaps[:topFlappersN]
+		}
+		for _, f := range flaps {
+			fmt.Fprintf(w, "    %s  %s  x%d\n", f.cast, f.key, f.count)
+		}
+	}
+	if !anyFlap {
+		fmt.Fprintln(w, "  none")
 	}
 
 	if perCast {
