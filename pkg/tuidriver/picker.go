@@ -189,6 +189,83 @@ func snapHasPickerHighlight(snap []byte) bool {
 	return false
 }
 
+// snapHasRowOpeningHighlight reports whether any physical line of snap OPENS in
+// one of claude's picker-highlight shades (pickerHighlightedRGBs) — i.e. the
+// active foreground color at a line's first visible glyph is a highlight shade.
+//
+// This is the #244 row-bound co-signal for the two full-panel modal classes
+// (mcp, permissions-config), replacing the near-useless snapHasPickerHighlight
+// anywhere-scan in those two arms. Both real panels satisfy it: their top border
+// rule opens in the highlight shade (mcp also paints its header and the
+// ❯-selected row that way), so the check holds regardless of which content row
+// is selected. The general light blue claude paints on prose paths and links
+// renders MID-line — the leading run of plain text opens the row — so a quoted
+// path no longer supplies the co-signal. snapHasPickerHighlight (kept for
+// slash-picker chrome) matched that mid-line shade; this does not, and that is
+// the discrimination the review addendum called for.
+//
+// It reuses findPickerRows' line segmentation (StripOSC, split on BOTH `\n` and
+// `\r`) and pickerRowOpenColor's foreground-SGR walk, but considers EVERY line
+// (not only `/`-rows) and stops at each line's first visible glyph (not the
+// first `/`). One linear, allocation-light pass.
+func snapHasRowOpeningHighlight(snap []byte) bool {
+	if len(snap) == 0 {
+		return false
+	}
+	cleaned := StripOSC(snap)
+	start := 0
+	for i := 0; i <= len(cleaned); i++ {
+		isSep := i == len(cleaned) || cleaned[i] == '\n' || cleaned[i] == '\r'
+		if !isSep {
+			continue
+		}
+		line := cleaned[start:i]
+		start = i + 1
+		if len(line) != 0 && lineOpensInHighlight(line) {
+			return true
+		}
+	}
+	return false
+}
+
+// lineOpensInHighlight walks raw byte-by-byte tracking the active foreground
+// color (parseForegroundSGR — the same state machine pickerRowOpenColor uses)
+// and reports whether the color in effect at the line's first visible glyph is a
+// pickerHighlightedRGBs shade. Leading whitespace and control sequences are
+// skipped; the first non-whitespace content byte is the opening glyph. A lone or
+// malformed ESC is advanced past, never treated as a glyph (mirrors
+// pickerRowOpenColor's tolerance).
+func lineOpensInHighlight(raw []byte) bool {
+	var (
+		cur    rgb
+		curSet bool
+	)
+	for i := 0; i < len(raw); {
+		if raw[i] == 0x1b {
+			if i+1 < len(raw) && raw[i+1] == '[' {
+				c, consumed, isFg, isReset := parseForegroundSGR(raw[i:])
+				if consumed > 0 {
+					if isFg {
+						cur, curSet = c, true
+					} else if isReset {
+						cur, curSet = rgb{}, false
+					}
+					i += consumed
+					continue
+				}
+			}
+			i++
+			continue
+		}
+		if raw[i] == ' ' || raw[i] == '\t' || raw[i] == '\r' {
+			i++
+			continue
+		}
+		return curSet && rgbIsHighlighted(cur)
+	}
+	return false
+}
+
 // pickerRegionRows bounds how far up from the bottom of the rendered screen the
 // picker-row location signal may match (#237). The slash-command picker is an
 // input-line phenomenon: the user types `/` at the prompt and claude paints the

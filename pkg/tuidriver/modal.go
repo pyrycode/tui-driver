@@ -67,8 +67,10 @@ const (
 // negative suite pins). Literal forms plus co-signal, matched against the
 // rendered grid:
 //
-//	mcp                 → "Manage MCP servers" (modal title) AND the picker
-//	                      highlight color (snapHasPickerHighlight). #223 removed
+//	mcp                 → "Manage MCP servers" (modal title) AND a row-opening
+//	                      picker highlight color (snapHasRowOpeningHighlight,
+//	                      #244 — bound to a line-opening shade, not the shade
+//	                      anywhere in the snapshot). #223 removed
 //	                      the inline empty-state "No MCP servers configured"
 //	                      (#128) anchor entirely: it is a /mcp result echoed on an
 //	                      idle screen, not a modal, and matching it held the modal
@@ -93,8 +95,15 @@ const (
 //	                      modal_shown / modal_answer consumers.
 //	model-select        → "Select model" AND a pointer-marked option row
 //	                      (gridHasSelectionDialog, #223) — the `/model` modal.
-//	permissions-config  → "Permissions" header + one of Allow/Ask/Deny tabs AND
-//	                      the picker highlight color (#223).
+//	permissions-config  → "Permissions" header AND all three Allow/Ask/Deny tabs
+//	                      on ONE rendered row (gridRowContainsAll) AND a
+//	                      row-opening picker highlight color
+//	                      (snapHasRowOpeningHighlight). #244 bound both co-signals
+//	                      to rendered-panel structure: #223's whole-grid word
+//	                      matches plus an anywhere-highlight let plain prose forge
+//	                      the class (the header word and a tab word matched
+//	                      independent locations while the general highlight shade
+//	                      sat elsewhere in the frame).
 //
 // slash-picker classification (isSlashPicker in picker.go) combines two signals
 // of different fabric: an on-screen rendered row that begins `/<letter>`
@@ -190,6 +199,34 @@ func gridContains(g *Grid, sub []byte) bool {
 	return false
 }
 
+// gridRowContainsAll reports whether some single rendered screen row of g
+// contains ALL of subs. It is gridContains bound to one row: the whole-grid scan
+// matches each substring independently anywhere on the grid, while this requires
+// them to co-occur on the SAME rendered row. permissions-config uses it for the
+// three tab words (Allow/Ask/Deny), which the real panel renders together on its
+// tab row (#244) — so ordinary prose that merely mentions the three words
+// scattered across separate lines no longer forges the class, as three
+// independent whole-grid matches let it.
+func gridRowContainsAll(g *Grid, subs ...[]byte) bool {
+	strs := make([]string, len(subs))
+	for i, s := range subs {
+		strs[i] = string(s)
+	}
+	for _, row := range g.Rows() {
+		all := true
+		for _, s := range strs {
+			if !strings.Contains(row, s) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return true
+		}
+	}
+	return false
+}
+
 // DetectModalClass classifies the modal/picker currently rendered in snap.
 // It renders snap once via the #150 Grid and matches each class's anchor
 // against the rendered screen rows — never a StripANSI substring over the raw
@@ -210,9 +247,10 @@ func gridContains(g *Grid, sub []byte) bool {
 //
 // Since #223 each class also requires a structural co-signal of a different
 // fabric — a pointer-marked option row (gridHasSelectionDialog) for the option
-// dialogs, or the picker highlight color (snapHasPickerHighlight) for the
-// full panels — so one on-screen content line quoting a class's header text no
-// longer forges it.
+// dialogs, or a row-opening picker highlight color (snapHasRowOpeningHighlight,
+// #244) for the full panels — so one on-screen content line quoting a class's
+// header text no longer forges it. permissions-config additionally requires its
+// three tab words on one rendered row (gridRowContainsAll, #244).
 //
 // Returns ModalClassUnknown when no class matches (the common case at idle — no
 // modal currently rendered).
@@ -224,11 +262,12 @@ func DetectModalClass(snap []byte) ModalClass {
 // rendered. The per-tick classifier renders the snapshot once and threads that
 // grid here (#225), so a tick classifies every axis off one render;
 // DetectModalClass stays the thin single-snapshot wrapper. snap is still needed
-// for the raw-color picker-highlight check (snapHasPickerHighlight) and the
-// slash-picker chrome check, which read color bytes the grid discards.
+// for the raw-color highlight checks — the row-opening highlight the full panels
+// use (snapHasRowOpeningHighlight) and the slash-picker chrome check
+// (snapHasPickerHighlight) — which read color bytes the grid discards.
 func detectModalClassWithGrid(g *Grid, snap []byte) ModalClass {
 	switch {
-	case gridContains(g, anchorMCPSpaced) && snapHasPickerHighlight(snap):
+	case gridContains(g, anchorMCPSpaced) && snapHasRowOpeningHighlight(snap):
 		return ModalClassMCP
 	case gridHasTrustDialog(g):
 		return ModalClassTrustFolder
@@ -237,10 +276,8 @@ func detectModalClassWithGrid(g *Grid, snap []byte) ModalClass {
 	case gridContains(g, anchorModelSelectSpaced) && gridHasSelectionDialog(g):
 		return ModalClassModelSelect
 	case gridContains(g, anchorPermissionsHeader) &&
-		(gridContains(g, anchorPermissionsTabAllow) ||
-			gridContains(g, anchorPermissionsTabAsk) ||
-			gridContains(g, anchorPermissionsTabDeny)) &&
-		snapHasPickerHighlight(snap):
+		gridRowContainsAll(g, anchorPermissionsTabAllow, anchorPermissionsTabAsk, anchorPermissionsTabDeny) &&
+		snapHasRowOpeningHighlight(snap):
 		return ModalClassPermissionsConfig
 	case gridContains(g, anchorAskUserSpaced) && gridHasSelectionDialog(g):
 		return ModalClassAskUserQuestion

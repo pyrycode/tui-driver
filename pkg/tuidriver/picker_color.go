@@ -73,10 +73,15 @@ var pickerHighlightedRGBs = []rgb{
 // shades. Equality, not nearness — claude paints deterministic constants
 // per render; we extend the set rather than fuzzy-matching.
 //
-// The whole-snapshot highlight scan built on this (snapHasPickerHighlight,
-// picker.go) is reused as the #223 second-fabric co-signal for the full-panel
-// modal classes (mcp, agents, permissions-config): their real screens carry the
-// highlight color, a one-line content quotation of their header text does not.
+// Two snapshot scans build on this. snapHasPickerHighlight (picker.go) — the
+// slash-picker chrome half — matches the shade ANYWHERE on a line.
+// snapHasRowOpeningHighlight (picker.go, #244) — the full-panel co-signal (mcp,
+// permissions-config) — matches only when the shade OPENS a line. The panels'
+// real screens open a row (their border rule) in the highlight; a one-line
+// content quotation of their header text, or a mid-line highlighted prose path,
+// does not. #244 moved the panels off the anywhere-scan because that shade is a
+// general light blue claude also paints on paths and links (present in most
+// frames), so it added almost nothing as a co-signal.
 func rgbIsHighlighted(c rgb) bool {
 	for _, h := range pickerHighlightedRGBs {
 		if c == h {
