@@ -32,6 +32,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -41,6 +42,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -71,9 +73,10 @@ type sample struct {
 // source names. Multi-valued from the start so #273 (-fires) / #274 (-midstream)
 // layer on by adding values, not new machinery.
 const (
-	sourceGap   = "gap"
-	sourceFinal = "final"
-	sourceFire  = "fire"
+	sourceGap       = "gap"
+	sourceFinal     = "final"
+	sourceFire      = "fire"
+	sourceMidstream = "midstream"
 )
 
 // detector is one structural screen predicate. Copied verbatim from
@@ -119,6 +122,7 @@ func main() {
 	gap := flag.Duration("gap", 500*time.Millisecond, "minimum inter-event quiet gap that marks a stable screen")
 	final := flag.Bool("final", false, "also emit each cast's final rendered frame as a sample (source \"final\")")
 	fires := flag.Bool("fires", false, "also emit a sample at each event where a structural detector newly fires (source \"fire\" plus the detector key)")
+	midstream := flag.Int("midstream", 0, "also emit up to N deterministically chosen mid-stream frames per cast (source \"midstream\")")
 	flag.Parse()
 
 	if *dir == "" || *out == "" {
@@ -137,7 +141,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	distinct, casts, events, gaps, err := collect(paths, gap.Seconds(), *final, *fires)
+	distinct, casts, events, gaps, err := collect(paths, gap.Seconds(), *final, *fires, *midstream)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "corpus-sampler: %v\n", err)
 		os.Exit(1)
@@ -175,10 +179,10 @@ func castPaths(dir string) ([]string, error) {
 // scan is skipped with a stderr note and NOT counted in casts — one bad cast
 // never aborts a 1900-cast run. Determinism follows from sorted castPaths +
 // in-order events + first-occurrence-wins.
-func collect(paths []string, gap float64, final, fires bool) (distinct []sample, casts, events, gaps int, err error) {
+func collect(paths []string, gap float64, final, fires bool, midstream int) (distinct []sample, casts, events, gaps int, err error) {
 	idx := map[string]int{} // hash -> position in distinct
 	for _, p := range paths {
-		samples, ev, gp, serr := sampleCast(p, gap, final, fires)
+		samples, ev, gp, serr := sampleCast(p, gap, final, fires, midstream)
 		if serr != nil {
 			fmt.Fprintf(os.Stderr, "corpus-sampler: skip %s: %v\n", filepath.Base(p), serr)
 			continue
@@ -243,7 +247,17 @@ func mergeSources(a, b []string) []string {
 // sorted newly-fired keys). Emitting on the fire edge keeps each sample's
 // Event/TS at the onset moment; dedupe collapses repeats by hash regardless. The
 // returned gap count excludes fire samples.
-func sampleCast(path string, gap float64, final, fires bool) (samples []sample, events, gaps int, err error) {
+//
+// When midstream > 0, up to that many mid-stream frames are emitted (source
+// "midstream"): during the walk each output event is a candidate keyed by a pure
+// function of the cast name and event index (sha256(name + "\x00" + index)), and
+// the N candidates with the smallest keys are retained — bounded to N snapshots,
+// no wall-clock or RNG, so the selected set is identical across re-runs. The
+// winners are rendered post-append (the frame the event painted, like fires) and
+// appended after the walk sorted by event index. Fewer than N eligible events
+// emit all of them (no padding). The returned gap count excludes mid-stream
+// samples; dedupe unions "midstream" onto any screen a gap/final source already found.
+func sampleCast(path string, gap float64, final, fires bool, midstream int) (samples []sample, events, gaps int, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, 0, 0, err
@@ -260,7 +274,8 @@ func sampleCast(path string, gap float64, final, fires bool) (samples []sample, 
 	header := true
 	idx := 0
 	var prevTS float64
-	prev := map[string]bool{} // previous event's active-key set, for fire-edge detection
+	prev := map[string]bool{}   // previous event's active-key set, for fire-edge detection
+	var retained []midCandidate // the <=N smallest-key mid-stream candidates so far
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {
@@ -334,6 +349,20 @@ func sampleCast(path string, gap float64, final, fires bool) (samples []sample, 
 			}
 			prev = cur
 		}
+		if midstream > 0 {
+			// Retain up to N mid-stream candidates keyed by a pure function of the
+			// cast name and event index — no wall-clock, no RNG — so the retained set
+			// is exactly the N smallest keys over all output events, independent of
+			// processing order (the two-run identity, AC2/AC5b). Snapshot() is a fresh
+			// copy (buffer.go:56-64), safe to hold across later Appends; rendering is
+			// deferred to the N winners at end so at most N frames are ever rendered.
+			key := sha256.Sum256([]byte(name + "\x00" + strconv.Itoa(idx)))
+			if len(retained) < midstream {
+				retained = append(retained, midCandidate{index: idx, ts: ts, key: key, snap: buf.Snapshot()})
+			} else if m := maxKeyPos(retained); bytes.Compare(key[:], retained[m].key[:]) < 0 {
+				retained[m] = midCandidate{index: idx, ts: ts, key: key, snap: buf.Snapshot()}
+			}
+		}
 		prevTS = ts
 		idx++
 	}
@@ -359,6 +388,27 @@ func sampleCast(path string, gap float64, final, fires bool) (samples []sample, 
 		})
 	}
 
+	// Mid-stream samples: the deterministically-selected streaming frames (source
+	// "midstream"), emitted after the walk sorted by event index for a stable
+	// within-cast discovery order. Fewer than N eligible events ⇒ all retained emit
+	// (no padding, AC3); dedupe + mergeSources fold any overlap with gap/final onto
+	// the existing entry (AC4). Selection is by key alone, so the set is a pure
+	// function of (name, indices) — identical across re-runs (AC5b).
+	sort.Slice(retained, func(i, j int) bool { return retained[i].index < retained[j].index })
+	for _, c := range retained {
+		grid := tuidriver.Render(c.snap, cols, rows)
+		samples = append(samples, sample{
+			Grid:   grid,
+			Hash:   hashGrid(normalize(grid)),
+			Cast:   name,
+			Event:  c.index,
+			TS:     c.ts,
+			Cols:   cols,
+			Rows:   rows,
+			Source: []string{sourceMidstream},
+		})
+	}
+
 	tag := tagFromName(name)
 	segment := segmentOf(full.String())
 	for i := range samples {
@@ -366,6 +416,30 @@ func sampleCast(path string, gap float64, final, fires bool) (samples []sample, 
 		samples[i].Segment = segment
 	}
 	return samples, idx, gaps, nil
+}
+
+// midCandidate is one retained mid-stream candidate: the post-append snapshot at
+// output-event index, the stable selection key that ranks it, and the event
+// timestamp. sampleCast keeps at most N of these (the N smallest keys) so
+// retention stays bounded regardless of how many output events the cast holds.
+type midCandidate struct {
+	index int
+	ts    float64
+	key   [32]byte
+	snap  []byte
+}
+
+// maxKeyPos returns the position of the candidate with the largest selection key
+// — the eviction target when a smaller-key candidate arrives. Called only when
+// cs is full (len == N >= 1), so the linear scan is over a bounded set.
+func maxKeyPos(cs []midCandidate) int {
+	m := 0
+	for i := 1; i < len(cs); i++ {
+		if bytes.Compare(cs[i].key[:], cs[m].key[:]) > 0 {
+			m = i
+		}
+	}
+	return m
 }
 
 // parseOutputEventTS forks corpus-replay's parseOutputEvent to also return the

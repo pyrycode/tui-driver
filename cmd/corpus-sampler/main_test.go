@@ -31,8 +31,17 @@ func noOutputFixture() string { return filepath.Join("testdata", "no-output-ok.c
 // fire sample from it.
 func noFireFixture() string { return filepath.Join("testdata", "no-fire-ok.cast") }
 
+// midstreamFixture is a burst cast (cmd/corpus-sampler/testdata/midstream-ok.cast):
+// six output events 0.1s apart — all sub-threshold, so the quiet-gap rule never
+// fires — each painting a distinct streaming frame (distinct first word, no digits
+// or spinner glyphs so nothing folds). All six are eligible mid-stream candidates,
+// making N=3 a meaningful thin sample. The three winning event indices [1 2 5] are
+// the smallest-key triple (sha256(name+idx)); they are a stability pin recorded
+// from a first run, not a golden validated against ground truth.
+func midstreamFixture() string { return filepath.Join("testdata", "midstream-ok.cast") }
+
 func TestCollect_StableScreensDedupeAndCounts(t *testing.T) {
-	distinct, casts, events, gaps, err := collect([]string{fixture()}, 0.5, false, false)
+	distinct, casts, events, gaps, err := collect([]string{fixture()}, 0.5, false, false, 0)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -67,7 +76,7 @@ func TestCollect_StableScreensDedupeAndCounts(t *testing.T) {
 }
 
 func TestCollect_RepeatedScreenCollapsesWithSeenCount(t *testing.T) {
-	distinct, _, _, _, err := collect([]string{fixture()}, 0.5, false, false)
+	distinct, _, _, _, err := collect([]string{fixture()}, 0.5, false, false, 0)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -85,7 +94,7 @@ func TestCollect_RepeatedScreenCollapsesWithSeenCount(t *testing.T) {
 }
 
 func TestCollect_ProvenanceMatchesStableFrameRule(t *testing.T) {
-	distinct, _, _, _, err := collect([]string{fixture()}, 0.5, false, false)
+	distinct, _, _, _, err := collect([]string{fixture()}, 0.5, false, false, 0)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -123,11 +132,11 @@ func TestCollect_ProvenanceMatchesStableFrameRule(t *testing.T) {
 }
 
 func TestCollect_Deterministic(t *testing.T) {
-	a, _, _, _, err := collect([]string{fixture()}, 0.5, false, false)
+	a, _, _, _, err := collect([]string{fixture()}, 0.5, false, false, 0)
 	if err != nil {
 		t.Fatalf("collect (run a): %v", err)
 	}
-	b, _, _, _, err := collect([]string{fixture()}, 0.5, false, false)
+	b, _, _, _, err := collect([]string{fixture()}, 0.5, false, false, 0)
 	if err != nil {
 		t.Fatalf("collect (run b): %v", err)
 	}
@@ -145,7 +154,7 @@ func TestCollect_Deterministic(t *testing.T) {
 }
 
 func TestCollect_FinalEmitsLastFrameAndUnionsSources(t *testing.T) {
-	distinct, _, _, gaps, err := collect([]string{fixture()}, 0.5, true, false)
+	distinct, _, _, gaps, err := collect([]string{fixture()}, 0.5, true, false, 0)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -180,7 +189,7 @@ func TestCollect_FinalEmitsLastFrameAndUnionsSources(t *testing.T) {
 }
 
 func TestCollect_FinalSkipsZeroOutputCast(t *testing.T) {
-	distinct, casts, events, gaps, err := collect([]string{noOutputFixture()}, 0.5, true, false)
+	distinct, casts, events, gaps, err := collect([]string{noOutputFixture()}, 0.5, true, false, 0)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -200,11 +209,11 @@ func TestCollect_FinalSkipsZeroOutputCast(t *testing.T) {
 }
 
 func TestCollect_FinalSourceDeterministic(t *testing.T) {
-	a, _, _, _, err := collect([]string{fixture()}, 0.5, true, false)
+	a, _, _, _, err := collect([]string{fixture()}, 0.5, true, false, 0)
 	if err != nil {
 		t.Fatalf("collect (run a): %v", err)
 	}
-	b, _, _, _, err := collect([]string{fixture()}, 0.5, true, false)
+	b, _, _, _, err := collect([]string{fixture()}, 0.5, true, false, 0)
 	if err != nil {
 		t.Fatalf("collect (run b): %v", err)
 	}
@@ -224,7 +233,7 @@ func TestCollect_FinalSourceDeterministic(t *testing.T) {
 }
 
 func TestCollect_FireSourceEmitsWithDetectorAttribution(t *testing.T) {
-	distinct, _, _, gaps, err := collect([]string{fixture()}, 0.5, false, true)
+	distinct, _, _, gaps, err := collect([]string{fixture()}, 0.5, false, true, 0)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -270,7 +279,7 @@ func TestCollect_FireSourceEmitsWithDetectorAttribution(t *testing.T) {
 }
 
 func TestCollect_NoFireCastEmitsNoFireSample(t *testing.T) {
-	distinct, _, _, _, err := collect([]string{noFireFixture()}, 0.5, false, true)
+	distinct, _, _, _, err := collect([]string{noFireFixture()}, 0.5, false, true, 0)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -287,11 +296,11 @@ func TestCollect_NoFireCastEmitsNoFireSample(t *testing.T) {
 }
 
 func TestCollect_FireSourceDeterministic(t *testing.T) {
-	a, _, _, _, err := collect([]string{fixture()}, 0.5, false, true)
+	a, _, _, _, err := collect([]string{fixture()}, 0.5, false, true, 0)
 	if err != nil {
 		t.Fatalf("collect (run a): %v", err)
 	}
-	b, _, _, _, err := collect([]string{fixture()}, 0.5, false, true)
+	b, _, _, _, err := collect([]string{fixture()}, 0.5, false, true, 0)
 	if err != nil {
 		t.Fatalf("collect (run b): %v", err)
 	}
@@ -302,6 +311,140 @@ func TestCollect_FireSourceDeterministic(t *testing.T) {
 	// iterates a map, so the newly-fired keys and the whole Source slice are sorted
 	// before storing. Drop that sort and a fire sample that first introduces two
 	// keys serializes them in random order → this fails.
+	for i := range a {
+		if a[i].Hash != b[i].Hash {
+			t.Errorf("distinct[%d] hash differs across runs: %s vs %s", i, a[i].Hash, b[i].Hash)
+		}
+		if !reflect.DeepEqual(a[i].Source, b[i].Source) {
+			t.Errorf("distinct[%d] source differs across runs: %v vs %v (hash %s)", i, a[i].Source, b[i].Source, a[i].Hash)
+		}
+	}
+}
+
+func TestCollect_MidstreamEmitsStablePositions(t *testing.T) {
+	distinct, casts, events, gaps, err := collect([]string{midstreamFixture()}, 0.5, false, false, 3)
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if casts != 1 {
+		t.Errorf("casts = %d, want 1", casts)
+	}
+	if events != 6 {
+		t.Errorf("events = %d, want 6", events)
+	}
+	if gaps != 0 {
+		t.Errorf("gaps = %d, want 0 (every inter-event gap is sub-threshold)", gaps)
+	}
+	// N=3 over 6 distinct eligible frames → exactly 3 mid-stream samples, each
+	// source [midstream], no fold. The events [1 2 5] are the smallest-key triple
+	// (the stability pin), emitted sorted by event index (AC5a).
+	if len(distinct) != 3 {
+		t.Fatalf("distinct = %d, want 3 (N=3 mid-stream frames, all distinct)", len(distinct))
+	}
+	wantEvents := []int{1, 2, 5}
+	for i, s := range distinct {
+		if !reflect.DeepEqual(s.Source, []string{"midstream"}) {
+			t.Errorf("distinct[%d] source = %v, want [midstream] (hash %s in %s)", i, s.Source, s.Hash, s.Cast)
+		}
+		if s.Event != wantEvents[i] {
+			t.Errorf("distinct[%d] Event = %d, want %d (hash %s in %s)", i, s.Event, wantEvents[i], s.Hash, s.Cast)
+		}
+	}
+
+	// Two runs over the same input must produce the identical distinct set — the
+	// load-bearing determinism property (AC5b).
+	again, _, _, _, err := collect([]string{midstreamFixture()}, 0.5, false, false, 3)
+	if err != nil {
+		t.Fatalf("collect (second run): %v", err)
+	}
+	if len(again) != len(distinct) {
+		t.Fatalf("distinct lengths differ across runs: %d vs %d", len(distinct), len(again))
+	}
+	for i := range distinct {
+		if distinct[i].Hash != again[i].Hash {
+			t.Errorf("distinct[%d] hash differs across runs: %s vs %s (cast %s)", i, distinct[i].Hash, again[i].Hash, distinct[i].Cast)
+		}
+		if distinct[i].Event != again[i].Event {
+			t.Errorf("distinct[%d] Event differs across runs: %d vs %d (hash %s)", i, distinct[i].Event, again[i].Event, distinct[i].Hash)
+		}
+	}
+}
+
+func TestCollect_MidstreamOffEmitsNothing(t *testing.T) {
+	distinct, _, events, gaps, err := collect([]string{midstreamFixture()}, 0.5, false, false, 0)
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	// -midstream 0 (off) over an all-sub-threshold cast yields nothing: no gap
+	// sample fires and no mid-stream sample is emitted — the AC1 byte-identical-
+	// when-off pin on the new fixture.
+	if events != 6 {
+		t.Errorf("events = %d, want 6", events)
+	}
+	if gaps != 0 {
+		t.Errorf("gaps = %d, want 0", gaps)
+	}
+	if len(distinct) != 0 {
+		t.Fatalf("distinct = %d, want 0 (mid-stream off, no quiet gaps)", len(distinct))
+	}
+}
+
+func TestCollect_MidstreamEmitAllAndUnionsSources(t *testing.T) {
+	distinct, _, _, gaps, err := collect([]string{fixture()}, 0.5, false, false, 10)
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	// N=10 exceeds the 5 eligible events, so all 5 are selected (emit-all, AC3).
+	// After dedupe: idle (events 0/3/4), the Thinking spinner (event 2), and the
+	// mid-stream-only Working spinner (event 1) — which no quiet gap ever sampled.
+	// The Working entry is the point of the source; the other two exercise the
+	// mergeSources union of [gap] with [midstream] (AC4).
+	if len(distinct) != 3 {
+		t.Fatalf("distinct = %d, want 3 (idle + Thinking + the mid-stream-only Working spinner)", len(distinct))
+	}
+	// gaps counts quiet-gap fires only; mid-stream samples must not inflate it.
+	if gaps != 3 {
+		t.Errorf("gaps = %d, want 3 (mid-stream samples excluded from the gap count)", gaps)
+	}
+
+	want := []struct {
+		source []string
+		seen   int
+		event  int
+	}{
+		{[]string{"gap", "midstream"}, 5, 0}, // idle: two gap fires + selected at events 0/3/4
+		{[]string{"gap", "midstream"}, 2, 2}, // Thinking spinner: gap-sampled + mid-stream-selected
+		{[]string{"midstream"}, 1, 1},        // Working spinner: only the mid-stream source catches it
+	}
+	for i, w := range want {
+		got := distinct[i]
+		if !reflect.DeepEqual(got.Source, w.source) {
+			t.Errorf("distinct[%d] source = %v, want %v (hash %s in %s)", i, got.Source, w.source, got.Hash, got.Cast)
+		}
+		if got.Seen != w.seen {
+			t.Errorf("distinct[%d] Seen = %d, want %d (hash %s in %s)", i, got.Seen, w.seen, got.Hash, got.Cast)
+		}
+		if got.Event != w.event {
+			t.Errorf("distinct[%d] Event = %d, want %d (hash %s)", i, got.Event, w.event, got.Hash)
+		}
+	}
+}
+
+func TestCollect_MidstreamSourceDeterministic(t *testing.T) {
+	a, _, _, _, err := collect([]string{fixture()}, 0.5, false, false, 10)
+	if err != nil {
+		t.Fatalf("collect (run a): %v", err)
+	}
+	b, _, _, _, err := collect([]string{fixture()}, 0.5, false, false, 10)
+	if err != nil {
+		t.Fatalf("collect (run b): %v", err)
+	}
+	if len(a) != len(b) {
+		t.Fatalf("distinct lengths differ across runs: %d vs %d", len(a), len(b))
+	}
+	// Per-sample Source arrays (including the [gap midstream] unions) and the
+	// distinct ordering must be byte-identical across runs — selection is by key
+	// alone, independent of processing order (analog of the -final/-fires guards).
 	for i := range a {
 		if a[i].Hash != b[i].Hash {
 			t.Errorf("distinct[%d] hash differs across runs: %s vs %s", i, a[i].Hash, b[i].Hash)
