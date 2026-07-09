@@ -353,16 +353,37 @@ func buildChecks(runVersionLock func(ctx context.Context) (string, map[string]an
 			},
 		},
 		{
-			// Records how claude encodes a non-ASCII cwd into its projects-dir
-			// name (#206). Observation rig: ^OBSERVED gate; ships green when it
-			// observes, including when the observation contradicts EncodeCwd.
-			// Timeout left unset → 60s default; the internal 30s glob-poll must
-			// fit inside it, so do NOT use the 30s probeCheckTimeout here.
+			// De-gated (#251): an observation rig recording how claude encodes a
+			// non-ASCII cwd into its projects-dir name (#206; ^OBSERVED gate, ships
+			// green when it observes, even when the observation contradicts
+			// EncodeCwd). On claude 2.1.199 it now times out BEFORE it can observe —
+			// the session's ~/.claude/projects/<encoded-cwd> dir never appears within
+			// the probe's internal 30s sessionFileWait glob-poll, so it exits
+			// non-zero with no library signal. Diagnosis: first-prompt-readiness, the
+			// structural twin of probe-first-prompt-hang (#181). The probe sends its
+			// throwaway "hi\r" ONLY to make claude write the deferred session JSONL
+			// (which materialises the projects-dir); when that keystroke lands on a
+			// false idle (❯ present but claude's input handler not yet wired after
+			// startup/trust-accept) it is dropped, no JSONL is written, and the poll
+			// times out. An EncodeCwd/path change is excluded: discoverProjectsDir
+			// globs by session-id (.../*/<session-id>.jsonl), independent of
+			// EncodeCwd, and this same 2.1.199 observed cleanly on 2026-07-06 — the
+			// dir now fails to appear at all, not under a changed name. De-gate, not
+			// re-anchor: the only idle predicate is IsIdle (the bare ❯ glyph that
+			// produces the false idle), no positive ready-signal exists to wait on
+			// (#173 Open Q1), and any probe-level re-anchor is a live-claude-gated
+			// hypothesis the claude-free make check gate cannot confirm. NonGating
+			// keeps it running for its recording artifact while its status stays
+			// informational. Timeout stays unset (60s default) so the internal 30s
+			// poll fits inside it — do NOT set probeCheckTimeout here. Re-gate (drop
+			// NonGating) only once it reaches OBSERVED reliably against the pinned
+			// claude, which needs the deferred re-anchor spike (#251 Open Q1).
 			Name:          "probe-cwd-encoding",
 			Kind:          "probe",
 			Binary:        "probe-cwd-encoding",
 			Args:          commonArgs,
 			SuccessMarker: observedSuccess,
+			NonGating:     true,
 			OnFailure: func(stdout, stderr string) map[string]any {
 				m := probeOutDirRe.FindStringSubmatch(stderr)
 				if len(m) < 2 {

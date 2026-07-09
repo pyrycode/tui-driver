@@ -111,6 +111,18 @@ the `make e2e` run's `observation.log`.
 |----------|----------------|------|----------------------------------------|--------------|------------------------------|
 | 2026-07-06 | 2.1.199 | `Työ😀` | `-private-var-folders-k0-gc07w9ws319b07n0plnw6y8r0000gn-T-probe-cwd-encoding-2549730227-Ty---` | **per-UTF-16 code unit** | **no** — `EncodeCwd` (per-byte) gives `…-Ty------` |
 
+> **2026-07-09, claude 2.1.199 (#251):** the probe stopped materialising its
+> projects-dir within the 30s `sessionFileWait` — it now times out *before* it
+> can observe (`projects-dir for session <uuid> not found … within 30s`). Root:
+> first-prompt-readiness, the structural twin of `probe-first-prompt-hang` (#181)
+> — the throwaway `"hi\r"` lands on a false idle before claude's input handler is
+> wired, so the deferred session JSONL (which materialises the projects-dir) is
+> never written. **Not** an `EncodeCwd`/path change: discovery globs by
+> session-id, and this same 2.1.199 observed cleanly on 2026-07-06 (the dir now
+> fails to appear at all, not under a changed name). The `make e2e` check was
+> **de-gated** (`NonGating: true`) in #251 so a non-observation records without
+> reddening the gate; it re-gates only once it reaches `OBSERVED` reliably.
+
 Full `OBSERVED:` block (session `cf16bdbf-c05a-48bf-ac07-f7e127bb0b87`, temp
 suffix `…2549730227` elided in the middle for width):
 
