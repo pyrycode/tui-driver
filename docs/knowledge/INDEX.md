@@ -25,3 +25,4 @@ One-line summary per evergreen doc. Cross-reference target — keep it terse.
 `codebase/<N>.md`, one file per ticket. See [codebase/README.md](codebase/README.md) for the convention.
 
 - [245](codebase/245.md) — retired the `agents` modal classifier arm (reverses #182's "keep dormant"): `detectModalClassWithGrid` no longer routes to `ModalClassAgents`, closing a false-positive surface `cmd/corpus-replay` (#227) measured at 6 fires on one healthy production recording; `ModalClassAgents`/`ParseAgentList`/`agents-snapshot.bin` retained as frozen artifacts.
+- [247](codebase/247.md) — `cmd/corpus-replay` now reports per-detector transition-edge counts (active-key-set diff between consecutive sampled ticks, keyed incl. idle/thinking + `modal:<class>`): a per-key totals table plus a top-5-per-bucket flappers list, additive to the existing fires/anchor/`-per-cast` sections; report-only, not security-sensitive.

@@ -102,6 +102,7 @@ type castResult struct {
 	rows    int
 	events  int
 	fired   map[string]bool // detector key -> fired at least once
+	edges   map[string]int  // detector key -> transition-edge count within this cast
 	anchors map[string]bool // anchor label -> appeared in content
 }
 
@@ -182,11 +183,14 @@ func replayCast(path string, stride int) (castResult, error) {
 		name:    name,
 		tag:     tagFromName(name),
 		fired:   map[string]bool{},
+		edges:   map[string]int{},
 		anchors: map[string]bool{},
 	}
 
 	buf := tuidriver.NewBuffer(0) // DefaultBufferCap rolling window
 	var full strings.Builder      // full decoded output, for anchor + segment scans
+
+	prev := map[string]bool{} // previous sampled tick's active-key set, for edges
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024) // cast event lines can be large
@@ -216,15 +220,17 @@ func replayCast(path string, stride int) (castResult, error) {
 		buf.Append(data)
 		full.Write(data)
 		if res.events%stride == 0 {
-			applyDetectors(buf.Snapshot(), res.fired)
+			prev = res.classify(buf.Snapshot(), prev)
 		}
 	}
 	if err := sc.Err(); err != nil {
 		return castResult{}, err
 	}
 	// Always classify the final frame, even if the stride skipped it, so a modal
-	// that is up on the last event is not missed.
-	applyDetectors(buf.Snapshot(), res.fired)
+	// that is up on the last event is not missed. When the stride already sampled
+	// the last event, this re-renders the same frame: cur == prev, so the
+	// symmetric difference is empty and no spurious edge is recorded.
+	res.classify(buf.Snapshot(), prev)
 
 	text := full.String()
 	res.segment = segmentOf(text)
@@ -236,17 +242,46 @@ func replayCast(path string, stride int) (castResult, error) {
 	return res, nil
 }
 
-// applyDetectors runs every structural detector on snap and records fires into
-// fired. Modal classes are recorded as "modal:<class>".
-func applyDetectors(snap []byte, fired map[string]bool) {
+// activeKeys returns the set of detector keys active for snap: every flat
+// detector that fired, plus "modal:<class>" when DetectModalClass returns a
+// class. This is the same membership the fires table records; returning it as a
+// set lets classify both OR it into the monotonic fires map and diff it against
+// the previous tick for transition-edge counting.
+func activeKeys(snap []byte) map[string]bool {
+	keys := map[string]bool{}
 	for _, d := range flatDetectors {
 		if d.fire(snap) {
-			fired[d.name] = true
+			keys[d.name] = true
 		}
 	}
 	if mc := tuidriver.DetectModalClass(snap); mc != tuidriver.ModalClassUnknown {
-		fired["modal:"+string(mc)] = true
+		keys["modal:"+string(mc)] = true
 	}
+	return keys
+}
+
+// classify runs the detectors on snap, folds the result into this cast's
+// monotonic fires (r.fired) and per-key transition-edge counts (r.edges), and
+// returns the active-key set for use as the next tick's prev. A transition edge
+// on a key increments whenever its membership flips between consecutive sampled
+// ticks — for every key in the symmetric difference cur △ prev. A first
+// appearance ({} -> {key}) counts one edge, so a detector that fires once and
+// stays ends at exactly 1; a detector that flaps climbs past 1. prev is empty
+// for a cast's first tick.
+func (r *castResult) classify(snap []byte, prev map[string]bool) map[string]bool {
+	cur := activeKeys(snap)
+	for k := range cur {
+		r.fired[k] = true // preserve monotonic fires: OR cur into fired
+		if !prev[k] {
+			r.edges[k]++ // key appeared this tick
+		}
+	}
+	for k := range prev {
+		if !cur[k] {
+			r.edges[k]++ // key disappeared this tick
+		}
+	}
+	return cur
 }
 
 // parseOutputEvent decodes one asciinema event line [t, code, data] and returns
