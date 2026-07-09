@@ -27,9 +27,10 @@ import (
 //                       window, where the region-scoped detectors look.
 //
 // Anchor sites enumerated here (keep in sync when adding or changing an anchor):
-//   - modal.go       anchorMCPSpaced, the agents pair, anchorAskUserSpaced,
+//   - modal.go       anchorMCPSpaced, anchorAskUserSpaced,
 //                    anchorPermissionSpaced, anchorModelSelectSpaced, the
-//                    permissions-config pair.
+//                    permissions-config pair. (The agents anchors were deleted
+//                    when the class's classifier arm was retired in #245.)
 //   - permission.go  anchorTrustHeaderSpaced.
 //   - network.go     networkFailureAnchors.
 //   - mcp_banner.go  mcpFailureBannerRe.
@@ -43,10 +44,12 @@ import (
 //     #220/#153). A transcript-body forgery of these MUST fire nothing. These are
 //     the teeth; they pass now and encode 173 and 217.
 //  2. Formerly NOT YET PROTECTED — the whole-grid panel classes (mcp,
-//     model-select, permissions-config, ask-user, agents). #223 gave each a
-//     structural co-signal (a pointer-marked option row for model-select and
-//     ask-user, the picker highlight color for mcp/agents/permissions-config),
-//     so they too now fire nothing on a one-line content forgery. The former
+//     model-select, permissions-config, ask-user). #223 gave each a structural
+//     co-signal (a pointer-marked option row for model-select and ask-user, the
+//     picker highlight color for mcp/permissions-config), so they too now fire
+//     nothing on a one-line content forgery. agents was in this set too, but its
+//     classifier arm was retired entirely in #245 — its case below now holds
+//     because there is no arm, not because a co-signal is unmet. The former
 //     characterization test that pinned the gap is now
 //     TestWholeGridAnchorsRejectContentForgery, a fire-nothing regression.
 
@@ -251,7 +254,7 @@ func TestWholeGridAnchorsRejectContentForgery(t *testing.T) {
 		{"mcp empty-state", "it printed No MCP servers configured after /doctor"},
 		{"ask-user footer", "the picker footer reads Enter to select at the bottom"},
 		{"model-select title", "run /model to open the Select model picker"},
-		{"agents header+tab", "the Agents modal lists a Running and a Library tab"},
+		{"agents header+tab", "the Agents modal lists a Running and a Library tab"}, // #245: arm retired, so Unknown by construction (no arm), not by an unmet co-signal
 		{"permissions-config", "the Permissions screen has Allow, Ask and Deny tabs"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
