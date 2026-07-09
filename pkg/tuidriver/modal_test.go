@@ -31,7 +31,9 @@ func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 		// #223: bare header text with no co-signal (no highlight color for the
 		// panels, no ❯-option row for the option dialogs) no longer classifies.
 		{"mcp title text alone is NOT the mcp panel", []byte("...Manage MCP servers..."), ModalClassUnknown},
-		{"agents header + tab text alone is NOT agents", []byte("...Agents...Running..."), ModalClassUnknown},
+		// agents is retired (#245): its arm is gone entirely, so this is Unknown
+		// by construction — not merely for want of a #223 co-signal.
+		{"agents header + tab text alone is NOT agents (arm retired #245)", []byte("...Agents...Running..."), ModalClassUnknown},
 		{"model-select text alone is NOT model-select", []byte("...Select model..."), ModalClassUnknown},
 		{"ask-user footer alone is NOT ask-user", []byte("...Enter to select..."), ModalClassUnknown},
 		{"permissions-config text alone is NOT the config modal", []byte("Permissions...Allow...Ask...Deny"), ModalClassUnknown},
@@ -170,12 +172,20 @@ func TestDetectModalClassMatchesControlSequenceWrappedAnchor(t *testing.T) {
 	}
 }
 
-func TestDetectModalClassAgentsNeedsHeaderAndTab(t *testing.T) {
-	// "Agents" header alone is NOT enough — claude renders the word in
-	// many contexts (e.g. `← for agents` status bar). Requires Running or
-	// Library tab adjacency.
-	in := []byte("...press ← for agents...")
-	if got := DetectModalClass(in); got == ModalClassAgents {
+// TestDetectModalClassAgentsRetiredNeverFires pins the #245 retirement: the
+// agents classifier arm is removed from detectModalClassWithGrid, so nothing
+// classifies as ModalClassAgents — inert by construction, no version gate. The
+// load-bearing case is the very fixture that DID classify agents before #245.
+func TestDetectModalClassAgentsRetiredNeverFires(t *testing.T) {
+	// The real pre-2.1.199 render that used to classify ModalClassAgents.
+	snap := loadFixture(t, "agents-snapshot.bin")
+	if got := DetectModalClass(snap); got == ModalClassAgents {
+		t.Errorf("DetectModalClass(agents-snapshot.bin) = %q, want NOT agents (arm retired #245)", got)
+	}
+
+	// The old weak synthetic case, retained: the status-bar "agents" word (e.g.
+	// `← for agents`) never classified and still must not.
+	if got := DetectModalClass([]byte("...press ← for agents...")); got == ModalClassAgents {
 		t.Errorf("DetectModalClass(status-bar only) = %q, want NOT agents", got)
 	}
 }
@@ -266,7 +276,12 @@ func TestDetectModalClassRealFixtures(t *testing.T) {
 		// removed the empty-state anchor, so it now classifies Unknown and reads
 		// idle. TestDetectModalClassMcpEmptyIsIdleNotModal pins that below.
 		{"mcp-empty-snapshot.bin", ModalClassUnknown},
-		{"agents-snapshot.bin", ModalClassAgents},
+		// agents-snapshot.bin is a real pre-2.1.199 `/agents` capture. The
+		// classifier arm was retired in #245, so it now falls through to Unknown —
+		// not a misclassification (the agents footer's "Enter to select" doesn't
+		// reach ask-user: the only ❯ row, `❯ /agents`, is not a numbered option
+		// row; and that row is not a `/`-picker row either). See spec #245.
+		{"agents-snapshot.bin", ModalClassUnknown},
 		{"picker-snapshot.bin", ModalClassSlashPicker},
 		{"picker-truecolor-snapshot.bin", ModalClassSlashPicker},
 		{"permission-snapshot.bin", ModalClassPermission},
@@ -346,7 +361,7 @@ func TestDetectModalClassMCPAnchorScrolledOffNotModal(t *testing.T) {
 	// #223 co-signals present — so grid exclusion is the sole reason it must not
 	// classify once it scrolls off the visible screen.
 	rows := []string{"\x1b[38;5;153mManage MCP servers\x1b[39m"} // real anchor + highlight, as a log line
-	for i := 0; i < 45; i++ {                                     // enough output to scroll it off a 40-row screen
+	for i := 0; i < 45; i++ {                                    // enough output to scroll it off a 40-row screen
 		rows = append(rows, "transcript body line")
 	}
 	rows = append(rows, "❯ ") // idle prompt at the bottom; no modal is up

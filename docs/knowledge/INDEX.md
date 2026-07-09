@@ -23,3 +23,5 @@ One-line summary per evergreen doc. Cross-reference target — keep it terse.
 ## Per-ticket notes
 
 `codebase/<N>.md`, one file per ticket. See [codebase/README.md](codebase/README.md) for the convention.
+
+- [245](codebase/245.md) — retired the `agents` modal classifier arm (reverses #182's "keep dormant"): `detectModalClassWithGrid` no longer routes to `ModalClassAgents`, closing a false-positive surface `cmd/corpus-replay` (#227) measured at 6 fires on one healthy production recording; `ModalClassAgents`/`ParseAgentList`/`agents-snapshot.bin` retained as frozen artifacts.

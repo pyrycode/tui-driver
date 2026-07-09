@@ -13,8 +13,8 @@ import (
 //   - slash-picker       (loop 3 C-2 / 4 D-1)        — `/` command picker
 //   - ask-user-question  (loop 5 E-1)                — AskUserQuestion tool modal
 //   - mcp                (loop 6 F-1)                — `/mcp` status display
-//   - agents             (loop 6 F-1)                — `/agents` subagent list
-//     (removed in claude 2.1.199 — matches pre-2.1.199 builds only; see ModalClassAgents)
+//   - agents             (loop 6 F-1)                — `/agents` subagent list;
+//     classifier arm retired in #245 (not a live class; see ModalClassAgents)
 //   - model-select       (2026-05-18 evening probes) — `/model` model picker
 //   - permissions-config (2026-05-18 evening probes) — `/permissions` settings
 type ModalClass string
@@ -22,16 +22,22 @@ type ModalClass string
 const (
 	ModalClassUnknown ModalClass = ""
 	ModalClassMCP     ModalClass = "mcp"
-	// ModalClassAgents matches claude's pre-2.1.199 tabbed `/agents` modal.
-	// claude 2.1.199 removed the `/agents` wizard: `/agents` now prints a
-	// one-line "The /agents wizard has been removed…" notice that carries
-	// neither the "Agents" header nor a Running/Library tab, so
-	// DetectModalClass returns ModalClassUnknown for it (verified live against
-	// 2.1.199 while working #178). This class and its anchors therefore match
-	// pre-2.1.199 builds only (≤2.1.158 still render the real modal). Retained
-	// deliberately — not dead code — per claude-version.lock's tolerated-drift
-	// policy and the #129/#178 retain precedent; kept exercised host-
-	// independently by agents-snapshot.bin. See #182.
+	// ModalClassAgents identified claude's pre-2.1.199 tabbed `/agents` modal.
+	// claude 2.1.199 removed the `/agents` wizard, so on the pinned claude the
+	// modal can no longer render and the class could only ever fire falsely. The
+	// #227 corpus-replay harness confirmed the observed cost that #182 had not yet
+	// seen: a healthy production recording classified agents 6× on plain
+	// transcript content. The classifier arm was therefore RETIRED in #245 —
+	// detectModalClassWithGrid no longer returns this class, so transcript content
+	// can never classify as agents on the pinned claude.
+	//
+	// The constant is retained for source compatibility (the external consumer and
+	// cmd/spike-multiselect's dispatch still reference it), as are
+	// ParseAgentList/AgentList and the frozen agents-snapshot.bin fixture (which
+	// still parses a captured pre-2.1.199 modal host-independently). This comment
+	// is the single source of truth for the retirement; a future consumer needing
+	// pre-2.1.199 classification can reconstruct the ~5-line arm from git history
+	// against the retained fixture.
 	ModalClassAgents            ModalClass = "agents"
 	ModalClassSlashPicker       ModalClass = "slash-picker"
 	ModalClassAskUserQuestion   ModalClass = "ask-user-question"
@@ -67,10 +73,6 @@ const (
 //	                      (#128) anchor entirely: it is a /mcp result echoed on an
 //	                      idle screen, not a modal, and matching it held the modal
 //	                      axis on idle and suppressed idle/thinking edge events.
-//	agents              → "Agents" header + "Running" or "Library" tab AND the
-//	                      picker highlight color (#223). Pre-2.1.199 only — the
-//	                      wizard was removed in 2.1.199 (see ModalClassAgents);
-//	                      the color closes the one-line text forgery on old builds.
 //	ask-user-question   → "Enter to select" AND a pointer-marked option row
 //	                      (gridHasSelectionDialog, #223). The footer phrase is
 //	                      generic — the agents modal's footer carries it too — so
@@ -108,9 +110,6 @@ const (
 // and 217 forgeries shipped.
 var (
 	anchorMCPSpaced           = []byte("Manage MCP servers")
-	anchorAgentsHeader        = []byte("Agents")
-	anchorAgentsTabRunning    = []byte("Running")
-	anchorAgentsTabLibrary    = []byte("Library")
 	anchorAskUserSpaced       = []byte("Enter to select")
 	anchorPermissionSpaced    = []byte("Do you want to proceed")
 	anchorModelSelectSpaced   = []byte("Select model")
@@ -231,11 +230,6 @@ func detectModalClassWithGrid(g *Grid, snap []byte) ModalClass {
 	switch {
 	case gridContains(g, anchorMCPSpaced) && snapHasPickerHighlight(snap):
 		return ModalClassMCP
-	case gridContains(g, anchorAgentsHeader) &&
-		(gridContains(g, anchorAgentsTabRunning) ||
-			gridContains(g, anchorAgentsTabLibrary)) &&
-		snapHasPickerHighlight(snap):
-		return ModalClassAgents
 	case gridHasTrustDialog(g):
 		return ModalClassTrustFolder
 	case gridHasPermissionDialog(g):
