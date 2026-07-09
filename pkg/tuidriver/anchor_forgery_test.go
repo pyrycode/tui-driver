@@ -46,7 +46,11 @@ import (
 //  2. Formerly NOT YET PROTECTED — the whole-grid panel classes (mcp,
 //     model-select, permissions-config, ask-user). #223 gave each a structural
 //     co-signal (a pointer-marked option row for model-select and ask-user, the
-//     picker highlight color for mcp/permissions-config), so they too now fire
+//     picker highlight color for mcp/permissions-config); #244 then bound the
+//     mcp/permissions-config co-signal to rendered-panel structure — a
+//     row-opening highlight for both, plus the three tab words on one row for
+//     permissions-config — because the anywhere-highlight was a general light
+//     blue present in most frames and added almost nothing. So they too fire
 //     nothing on a one-line content forgery. agents was in this set too, but its
 //     classifier arm was retired entirely in #245 — its case below now holds
 //     because there is no arm, not because a co-signal is unmet. The former
@@ -264,6 +268,72 @@ func TestWholeGridAnchorsRejectContentForgery(t *testing.T) {
 				t.Errorf("%s: DetectModalClass = %q, want Unknown (content forgery must not classify)", tc.name, got)
 			}
 		})
+	}
+}
+
+// TestPermissionsConfigTabForgeryRejectedByRowBoundColor is the #244
+// content-forgery regression for the permissions-config class. Before #244 the
+// arm matched the "Permissions" header and any ONE of Allow/Ask/Deny anywhere on
+// the grid, plus the highlight shade ANYWHERE in the snapshot
+// (snapHasPickerHighlight). Because that shade is a general light blue claude
+// paints on paths and links — present in a large fraction of frames — plain
+// prose forged the class: the recording the ticket documents classified
+// permissions-config four times on ordinary transcript prose. #244 binds both
+// co-signals to rendered-panel structure — the three tab words on ONE rendered
+// row (gridRowContainsAll) AND a row-opening highlight (snapHasRowOpeningHighlight).
+// Prose reproduces neither. Anchors referenced by symbol, never the literal (the
+// ticket's self-reference discipline); \r\n so vt10x renders flat rows (the #150
+// grid fixture lesson).
+func TestPermissionsConfigTabForgeryRejectedByRowBoundColor(t *testing.T) {
+	const (
+		hl    = "\x1b[38;5;153m" // index 153 → 175,215,255, the general highlight shade
+		reset = "\x1b[39m"
+	)
+
+	// (a) The one-line tab forgery. The header AND all three tab words render on
+	// one prose line, so the header-anywhere guard and the three-tabs-on-one-row
+	// guard are BOTH satisfied; the highlight shade is present only MID-line
+	// elsewhere (light blue on a prose path, as a real frame carries it), so the
+	// row opens in plain text. Only the row-opening color guard rejects it.
+	tabLine := "assistant: the " + string(anchorPermissionsHeader) + " view has " +
+		string(anchorPermissionsTabAllow) + ", " + string(anchorPermissionsTabAsk) +
+		" and " + string(anchorPermissionsTabDeny) + " tabs"
+	pathLine := "see " + hl + "/Users/x/settings.json" + reset + " for config"
+	forged := gridRows(tabLine, pathLine)
+
+	// Non-vacuity: the old anywhere-highlight IS present (mirrors the
+	// snapHasPickerHighlight guard at the slash-picker case above), so the new
+	// row-opening check is provably what rejects the frame — not a missing shade.
+	if !snapHasPickerHighlight(forged) {
+		t.Fatal("fixture lost the highlight chrome — the forgery contrast is void")
+	}
+	// And the tab compound holds on one row, so the color guard is not passing
+	// vacuously on a missing tab word.
+	if !gridRowContainsAll(NewGrid(forged, 0, 0), anchorPermissionsTabAllow, anchorPermissionsTabAsk, anchorPermissionsTabDeny) {
+		t.Fatal("fixture lost the one-row tab compound — the color guard would pass vacuously")
+	}
+	if got := DetectModalClass(forged); got != ModalClassUnknown {
+		t.Errorf("one-line tab forgery: DetectModalClass = %q, want Unknown", got)
+	}
+
+	// (b) Strengthening for the tab-compound guard, independent of (a): the three
+	// tab words scattered across SEPARATE lines, with a genuine row-opening
+	// highlight present (a border-rule-shaped line). Here the color guard passes,
+	// so the single-row tab compound is the sole rejecter — three tabs never
+	// share a row. Leading upper-block glyph as bytes (\xe2\x96\x94 = U+2594),
+	// mirroring the real panel's border rule.
+	scattered := gridRows(
+		hl+"\xe2\x96\x94\xe2\x96\x94\xe2\x96\x94\xe2\x96\x94"+reset, // opens in the highlight shade
+		string(anchorPermissionsHeader)+" panel overview",
+		"the "+string(anchorPermissionsTabAllow)+" tab grants access",
+		"the "+string(anchorPermissionsTabAsk)+" tab prompts first",
+		"the "+string(anchorPermissionsTabDeny)+" tab blocks",
+	)
+	if !snapHasRowOpeningHighlight(scattered) {
+		t.Fatal("fixture lost the row-opening highlight — the tab-compound guard would pass vacuously")
+	}
+	if got := DetectModalClass(scattered); got != ModalClassUnknown {
+		t.Errorf("scattered-tabs forgery: DetectModalClass = %q, want Unknown", got)
 	}
 }
 
