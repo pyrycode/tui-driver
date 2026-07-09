@@ -15,14 +15,16 @@ spinner glyphs unified, rows right-trimmed) pulls the distinct situations out.
 
 Sibling of [`corpus-replay`](../corpus-replay) (#227) — it reuses the same
 cast-directory listing, asciinema header parse, `-ok`/`-err` tag read, and
-prod/e2e segment cues. **Scope:** quiet-gap stable screens only; random
-mid-stream slices, detector-fire moments, and final frames are #256.
+prod/e2e segment cues. **Scope:** quiet-gap stable screens plus, with `-final`,
+each cast's ending frame; random mid-stream slices and detector-fire moments are
+`-midstream`/`-fires` (#274/#273).
 
 ## Run
 
 ```sh
 go run ./cmd/corpus-sampler -dir /path/to/casts -out screens.jsonl
 go run ./cmd/corpus-sampler -dir /path/to/casts -out screens.jsonl -gap 1s
+go run ./cmd/corpus-sampler -dir /path/to/casts -out screens.jsonl -final
 ```
 
 Flags:
@@ -33,11 +35,18 @@ Flags:
   screen. The tool walks **every** event and gates on the time gap, never an
   event stride — a quiet dialog emits almost no events, so a stride steps over
   the exact stable screens this tool exists to catch.
+- `-final` (default `false`): also emit each cast's final rendered frame as one
+  sample (`source: ["final"]`). Catches how a run ended when the last events
+  arrive in a burst with no trailing quiet gap. A cast with zero output events
+  emits no final sample.
 
 Each `-out` line carries full provenance: the raw rendered grid, its
 normalized-grid hash, cast filename, output-event index, timestamp, cols, rows,
-`ok`/`err` tag, prod/e2e segment, and a cross-run `seen` count. `stdout` prints a
-single aggregate line — `casts events gaps distinct` — and nothing else.
+`ok`/`err` tag, prod/e2e segment, a cross-run `seen` count, and a `source` array
+naming every rule that found this screen (`"gap"`, `"final"`; a screen found by
+more than one rule keeps the full sorted, distinct set). `stdout` prints a
+single aggregate line — `casts events gaps distinct` — and nothing else; `gaps`
+counts quiet-gap fires only, excluding any `-final` sample.
 
 Local audit tool only — no CI workflow (org rule).
 

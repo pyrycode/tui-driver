@@ -2,6 +2,7 @@ package main
 
 import (
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -21,8 +22,12 @@ import (
 // the "Working" spinner is never sampled.
 func fixture() string { return filepath.Join("testdata", "stable-sample-ok.cast") }
 
+// noOutputFixture is a header-only cast (zero output events) — used to pin that
+// -final emits no final sample when there is nothing rendered (AC 1).
+func noOutputFixture() string { return filepath.Join("testdata", "no-output-ok.cast") }
+
 func TestCollect_StableScreensDedupeAndCounts(t *testing.T) {
-	distinct, casts, events, gaps, err := collect([]string{fixture()}, 0.5)
+	distinct, casts, events, gaps, err := collect([]string{fixture()}, 0.5, false)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -46,10 +51,18 @@ func TestCollect_StableScreensDedupeAndCounts(t *testing.T) {
 			t.Errorf("sub-threshold gap sampled event 1 (hash %s in %s); gap gating failed", s.Hash, s.Cast)
 		}
 	}
+
+	// -final off: every sample is gap-only. This is the AC 5c regression pin —
+	// turning the flag off changes nothing about the sample shape or provenance.
+	for _, s := range distinct {
+		if !reflect.DeepEqual(s.Source, []string{"gap"}) {
+			t.Errorf("source = %v, want [gap] with -final off (hash %s in %s)", s.Source, s.Hash, s.Cast)
+		}
+	}
 }
 
 func TestCollect_RepeatedScreenCollapsesWithSeenCount(t *testing.T) {
-	distinct, _, _, _, err := collect([]string{fixture()}, 0.5)
+	distinct, _, _, _, err := collect([]string{fixture()}, 0.5, false)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -67,7 +80,7 @@ func TestCollect_RepeatedScreenCollapsesWithSeenCount(t *testing.T) {
 }
 
 func TestCollect_ProvenanceMatchesStableFrameRule(t *testing.T) {
-	distinct, _, _, _, err := collect([]string{fixture()}, 0.5)
+	distinct, _, _, _, err := collect([]string{fixture()}, 0.5, false)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -105,11 +118,11 @@ func TestCollect_ProvenanceMatchesStableFrameRule(t *testing.T) {
 }
 
 func TestCollect_Deterministic(t *testing.T) {
-	a, _, _, _, err := collect([]string{fixture()}, 0.5)
+	a, _, _, _, err := collect([]string{fixture()}, 0.5, false)
 	if err != nil {
 		t.Fatalf("collect (run a): %v", err)
 	}
-	b, _, _, _, err := collect([]string{fixture()}, 0.5)
+	b, _, _, _, err := collect([]string{fixture()}, 0.5, false)
 	if err != nil {
 		t.Fatalf("collect (run b): %v", err)
 	}
@@ -122,6 +135,85 @@ func TestCollect_Deterministic(t *testing.T) {
 		}
 		if a[i].Seen != b[i].Seen {
 			t.Errorf("distinct[%d] Seen differs across runs: %d vs %d (hash %s)", i, a[i].Seen, b[i].Seen, a[i].Hash)
+		}
+	}
+}
+
+func TestCollect_FinalEmitsLastFrameAndUnionsSources(t *testing.T) {
+	distinct, _, _, gaps, err := collect([]string{fixture()}, 0.5, true)
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	// The final frame (idle "…ready 999", rendered after the walk) normalizes to
+	// the same hash as the gap-sampled idle screen, so it folds in rather than
+	// adding a distinct entry (AC 5a/5b).
+	if len(distinct) != 2 {
+		t.Fatalf("distinct = %d, want 2 (final folds into the idle screen)", len(distinct))
+	}
+	// gaps counts quiet-gap fires only; the final-frame sample must not inflate it.
+	if gaps != 3 {
+		t.Errorf("gaps = %d, want 3 (final sample excluded from the gap count)", gaps)
+	}
+
+	idle := distinct[0]
+	if !reflect.DeepEqual(idle.Source, []string{"final", "gap"}) {
+		t.Errorf("idle source = %v, want [final gap] (hash %s in %s)", idle.Source, idle.Hash, idle.Cast)
+	}
+	if idle.Seen != 3 {
+		t.Errorf("idle Seen = %d, want 3 (two gap fires + one final; hash %s in %s)", idle.Seen, idle.Hash, idle.Cast)
+	}
+
+	// The spinner screen is mid-run, not the ending, so final must not tag it —
+	// this pins that final marked the ending frame and nothing else.
+	spinner := distinct[1]
+	if !reflect.DeepEqual(spinner.Source, []string{"gap"}) {
+		t.Errorf("spinner source = %v, want [gap] (hash %s in %s)", spinner.Source, spinner.Hash, spinner.Cast)
+	}
+	if spinner.Seen != 1 {
+		t.Errorf("spinner Seen = %d, want 1 (hash %s in %s)", spinner.Seen, spinner.Hash, spinner.Cast)
+	}
+}
+
+func TestCollect_FinalSkipsZeroOutputCast(t *testing.T) {
+	distinct, casts, events, gaps, err := collect([]string{noOutputFixture()}, 0.5, true)
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if casts != 1 {
+		t.Errorf("casts = %d, want 1", casts)
+	}
+	if events != 0 {
+		t.Errorf("events = %d, want 0 (header-only cast has no output events)", events)
+	}
+	if gaps != 0 {
+		t.Errorf("gaps = %d, want 0", gaps)
+	}
+	// A cast with zero output events emits no final sample even with -final on.
+	if len(distinct) != 0 {
+		t.Fatalf("distinct = %d, want 0 (zero-output cast yields no final sample)", len(distinct))
+	}
+}
+
+func TestCollect_FinalSourceDeterministic(t *testing.T) {
+	a, _, _, _, err := collect([]string{fixture()}, 0.5, true)
+	if err != nil {
+		t.Fatalf("collect (run a): %v", err)
+	}
+	b, _, _, _, err := collect([]string{fixture()}, 0.5, true)
+	if err != nil {
+		t.Fatalf("collect (run b): %v", err)
+	}
+	if len(a) != len(b) {
+		t.Fatalf("distinct lengths differ across runs: %d vs %d", len(a), len(b))
+	}
+	// Per-sample source arrays must be byte-identical across runs (AC 4): the
+	// sorted-array serialization makes order independent of discovery order.
+	for i := range a {
+		if a[i].Hash != b[i].Hash {
+			t.Errorf("distinct[%d] hash differs across runs: %s vs %s", i, a[i].Hash, b[i].Hash)
+		}
+		if !reflect.DeepEqual(a[i].Source, b[i].Source) {
+			t.Errorf("distinct[%d] source differs across runs: %v vs %v (hash %s)", i, a[i].Source, b[i].Source, a[i].Hash)
 		}
 	}
 }
