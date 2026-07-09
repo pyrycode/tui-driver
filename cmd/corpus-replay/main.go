@@ -47,10 +47,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/pyrycode/tui-driver/pkg/tuidriver"
 )
@@ -111,6 +114,7 @@ func main() {
 	stride := flag.Int("stride", 1, "run the classifier every Nth output event (1 = every event)")
 	perCast := flag.Bool("per-cast", false, "print one line per cast (fires, anchors, segment, tag)")
 	only := flag.String("only", "", "only replay casts whose filename contains this substring")
+	workers := flag.Int("workers", runtime.NumCPU(), "number of concurrent cast-replay workers")
 	flag.Parse()
 
 	if *dir == "" {
@@ -120,6 +124,9 @@ func main() {
 	}
 	if *stride < 1 {
 		*stride = 1
+	}
+	if *workers < 1 {
+		*workers = 1
 	}
 
 	paths, err := castPaths(*dir, *only)
@@ -132,17 +139,81 @@ func main() {
 		os.Exit(1)
 	}
 
-	results := make([]castResult, 0, len(paths))
-	for _, p := range paths {
-		r, err := replayCast(p, *stride)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "corpus-replay: skip %s: %v\n", filepath.Base(p), err)
-			continue
+	results := replayAll(paths, *stride, *workers, os.Stderr)
+	report(os.Stdout, results, *dir, *stride, *perCast)
+}
+
+// replayOutcome carries one cast's replay result or its error from a worker to
+// the collector. Each castResult is created and mutated by exactly one worker,
+// then handed off via the channel — after the send the collector is its sole
+// owner, so there is no concurrent map access.
+type replayOutcome struct {
+	path string
+	res  castResult
+	err  error
+}
+
+// replayAll replays every path through the detectors using `workers` concurrent
+// workers and returns the results sorted by cast name — so report output is
+// byte-identical across worker counts (-workers 1 is the sequential baseline it
+// preserves). A cast that fails to replay prints one skip line to errOut and is
+// omitted from the results (identical semantics to the sequential path; the
+// relative ordering of skip lines under parallelism is out of scope for the
+// byte-identical criterion, as stderr is not report output).
+func replayAll(paths []string, stride, workers int, errOut io.Writer) []castResult {
+	if workers < 1 {
+		workers = 1
+	}
+	jobs := make(chan string)
+	out := make(chan replayOutcome)
+
+	// Feeder: stream the sorted paths into jobs, then close so the workers drain
+	// and exit. It runs as its own goroutine so it can send concurrently with the
+	// collector reading out — otherwise the workers would fill out with no reader.
+	go func() {
+		for _, p := range paths {
+			jobs <- p
 		}
-		results = append(results, r)
+		close(jobs)
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for p := range jobs {
+				res, err := replayCast(p, stride)
+				out <- replayOutcome{path: p, res: res, err: err}
+			}
+		}()
 	}
 
-	report(os.Stdout, results, *dir, *stride, *perCast)
+	// Closer: once every worker has drained jobs, close out so the collector's
+	// range terminates.
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	// Collector: the single reader of out, and the only goroutine that writes
+	// errOut and appends to results — so skip lines never interleave mid-byte and
+	// no mutex is needed.
+	results := make([]castResult, 0, len(paths))
+	for o := range out {
+		if o.err != nil {
+			fmt.Fprintf(errOut, "corpus-replay: skip %s: %v\n", filepath.Base(o.path), o.err)
+			continue
+		}
+		results = append(results, o.res)
+	}
+
+	// Casts complete in arbitrary order under the pool, so re-sort by name to
+	// restore the sequential (-workers 1) order report() walks. os.ReadDir yields
+	// unique names within one directory, so the comparator is a strict total order
+	// and a non-stable sort is deterministic.
+	sort.Slice(results, func(i, j int) bool { return results[i].name < results[j].name })
+	return results
 }
 
 // castPaths lists the .cast files in dir, optionally filtered to those whose

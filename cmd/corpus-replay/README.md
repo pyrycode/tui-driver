@@ -27,6 +27,10 @@ Flags:
 - `-stride N`: run the classifier every Nth output event (default 1). A modal is
   up for many frames, so a small stride still catches it while cutting cost on a
   large corpus.
+- `-workers N`: number of concurrent replay workers (default: the machine's CPU
+  count). Casts replay independently, so a full corpus pass scales roughly
+  linearly with cores; `-workers 1` is the sequential baseline. Report output
+  (stdout) is byte-identical across worker counts.
 - `-per-cast`: print one line per cast (fires, anchors, segment, tag).
 - `-only SUBSTR`: replay only casts whose filename contains SUBSTR — for
   drilling into a specific recording.
