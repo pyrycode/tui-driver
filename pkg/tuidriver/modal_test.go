@@ -88,7 +88,16 @@ func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 			[]byte("Quick safety check: Is this a project you trust?\r\n❯ 1. Yes\r\n  2. No\r\n"),
 			ModalClassTrustFolder,
 		},
-		{"permission spaced", []byte("...Do you want to proceed..."), ModalClassPermission},
+		{
+			// #242: permission now needs the dialog shape too (the proceed prompt
+			// AND a pointer-marked numbered option row directly below it, region-
+			// scoped), not the prompt phrase alone. A structurally complete overlay
+			// still classifies; the in-region prompt-alone forgery is pinned by
+			// TestPermissionAnchorRejectsStatusRegionQuotation.
+			"permission dialog",
+			[]byte("Do you want to proceed?\r\n❯ 1. Yes\r\n  2. No\r\n"),
+			ModalClassPermission,
+		},
 		{"permissions header alone is NOT a config modal", []byte("see Permissions docs for details"), ModalClassUnknown},
 	}
 	for _, tc := range cases {
@@ -196,11 +205,12 @@ func TestDetectModalClassSlashPickerContract(t *testing.T) {
 			ModalClassUnknown,
 		},
 		{
-			// A real permission modal that also has a `/`-path on screen
-			// painted in the highlight shade — i.e. BOTH picker signals
-			// present. The reorder must let the Permission anchor win.
+			// A real permission modal (prompt + ❯-marked option row, the #242
+			// dialog shape) that also has a `/`-path on screen painted in the
+			// highlight shade — i.e. BOTH picker signals present. The reorder
+			// must let the Permission anchor win.
 			"permission modal wins over co-present picker signals",
-			[]byte("Do you want to proceed?\r\n" + hlTrue + "/Users/x/file.go" + reset + "\r\n"),
+			[]byte("Do you want to proceed?\r\n❯ 1. Yes\r\n" + hlTrue + "/Users/x/file.go" + reset + "\r\n"),
 			ModalClassPermission,
 		},
 		{

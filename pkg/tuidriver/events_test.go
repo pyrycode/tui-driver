@@ -132,10 +132,10 @@ func TestMergeEvents_ModalShowAndHide(t *testing.T) {
 	out := make(chan Event, defaultEventBuffer)
 	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
 
-	// Phase 1: enter Permission modal. ❯ is present (modal still renders
-	// the input line) but idle/thinking emissions are suppressed while a
-	// modal is up — assert no spurious PtyIdle arrives.
-	snap.Set([]byte("\xe2\x9d\xaf Do you want to proceed"))
+	// Phase 1: enter Permission modal (prompt + ❯-marked option row, the #242
+	// dialog shape). ❯ is present (on the option row) but idle/thinking emissions
+	// are suppressed while a modal is up — assert no spurious PtyIdle arrives.
+	snap.Set([]byte("Do you want to proceed\r\n\xe2\x9d\xaf 1. Yes"))
 	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
 	if ev.Kind != EventKindPtyModalShown {
 		t.Errorf("phase 1 Kind = %v, want EventKindPtyModalShown", ev.Kind)
@@ -206,7 +206,7 @@ func TestMergeEvents_ModalClearRevealsSuppressedIdleThenThinking(t *testing.T) {
 	// Phase 1: Permission modal with ❯ present. IsIdle is true throughout,
 	// but idle emission is suppressed while a modal is up — only ModalShown
 	// fires, no PtyIdle.
-	snap.Set([]byte("\xe2\x9d\xaf Do you want to proceed"))
+	snap.Set([]byte("Do you want to proceed\r\n\xe2\x9d\xaf 1. Yes"))
 	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
 	if ev.Kind != EventKindPtyModalShown {
 		t.Errorf("phase 1 Kind = %v, want EventKindPtyModalShown", ev.Kind)
@@ -246,7 +246,7 @@ func TestMergeEvents_ModalClearRevealsSuppressedIdleThenThinking(t *testing.T) {
 	// ModalShown fires — the modal did not introduce a new low→high idle
 	// transition, and the freeze holds prev.idle/prev.thinking across the
 	// window.
-	snap.Set([]byte("\xe2\x9d\xaf Do you want to proceed"))
+	snap.Set([]byte("Do you want to proceed\r\n\xe2\x9d\xaf 1. Yes"))
 	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
 	if ev.Kind != EventKindPtyModalShown {
 		t.Errorf("phase 3 Kind = %v, want EventKindPtyModalShown", ev.Kind)
@@ -658,7 +658,7 @@ func TestMergeEvents_BannerCoexistsWithIdleAndModal(t *testing.T) {
 	// (no Hidden); idle/thinking suppressed under modal. Expect exactly
 	// one event: ModalShown(Permission). Critically, no
 	// McpFailureHidden — modal does not suppress the banner axis.
-	snap.Set([]byte("Do you want to proceed ... 1 MCP server failed · /mcp"))
+	snap.Set([]byte("Do you want to proceed\r\n\xe2\x9d\xaf 1. Yes\r\n1 MCP server failed · /mcp"))
 	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
 	if ev.Kind != EventKindPtyModalShown {
 		t.Errorf("phase 2 Kind = %v, want EventKindPtyModalShown", ev.Kind)
@@ -677,7 +677,7 @@ func TestMergeEvents_BannerCoexistsWithIdleAndModal(t *testing.T) {
 
 	// Phase 3: modal still up, banner gone. Expect exactly one event:
 	// McpFailureHidden. Modal axis unchanged → no modal event.
-	snap.Set([]byte("Do you want to proceed"))
+	snap.Set([]byte("Do you want to proceed\r\n\xe2\x9d\xaf 1. Yes"))
 	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
 	if ev.Kind != EventKindPtyMcpFailureHidden {
 		t.Errorf("phase 3 Kind = %v, want EventKindPtyMcpFailureHidden", ev.Kind)
@@ -883,7 +883,7 @@ func TestClassifyBehaviorUnchangedAfterSingleRender(t *testing.T) {
 		"empty":       nil,
 		"idle":        []byte("\xe2\x9d\xaf input"),
 		"thinking":    []byte("\xe2\x9c\xbb Baked for 2s\n\xe2\x9d\xaf input"),
-		"permission":  []byte("\xe2\x9d\xaf Do you want to proceed"),
+		"permission":  []byte("Do you want to proceed\r\n\xe2\x9d\xaf 1. Yes"),
 		"mcp-banner":  []byte("\xe2\x9d\xaf input ... 1 MCP server failed \xc2\xb7 /mcp"),
 		"network":     []byte("Unable to connect to API (ConnectionRefused)"),
 		"idle+banner": []byte("\xe2\x9d\xaf input ... 2 MCP servers failed"),

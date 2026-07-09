@@ -37,10 +37,11 @@ import (
 //
 // Two protection tiers exist today, so the suite asserts different outcomes:
 //
-//  1. STRUCTURALLY PROTECTED — trust (the option-row shape, #219), the two
-//     status banners, the permission overlay and the busy/idle axis (bottom-
-//     region scoping, #220/#153). A transcript-body forgery of these MUST fire
-//     nothing. These are the teeth; they pass now and encode 173 and 217.
+//  1. STRUCTURALLY PROTECTED — trust (the option-row shape, #219), the
+//     permission overlay (bottom-region scoping AND the option-row shape, #242),
+//     the two status banners and the busy/idle axis (bottom-region scoping,
+//     #220/#153). A transcript-body forgery of these MUST fire nothing. These are
+//     the teeth; they pass now and encode 173 and 217.
 //  2. Formerly NOT YET PROTECTED — the whole-grid panel classes (mcp,
 //     model-select, permissions-config, ask-user, agents). #223 gave each a
 //     structural co-signal (a pointer-marked option row for model-select and
@@ -191,6 +192,43 @@ func TestTrustAnchorRejectsStatusRegionQuotation(t *testing.T) {
 	snap := gridRows(append(filler, "log: prompt was \""+string(anchorTrustHeaderSpaced)+"\"")...)
 	if HasTrustModal(snap) || DetectModalClass(snap) == ModalClassTrustFolder {
 		t.Error("in-region trust-header quotation classified as trust, want no fire")
+	}
+}
+
+// TestPermissionAnchorRejectsStatusRegionQuotation covers permission's in-region
+// content form, the #242 fix. Permission is now shape-gated like trust (#219):
+// even the prompt phrase quoted in the bottom status region — where the region-
+// scoped detector looks — still needs a pointer-marked numbered option row
+// directly below it to classify. A bare in-region quotation does not fire. This
+// is the exact production forgery the ticket documents: the phrase scrolling
+// through the bottom window as prose, with no dialog on screen. Mirrors
+// TestTrustAnchorRejectsStatusRegionQuotation; references the anchor by symbol,
+// never the literal (the ticket's self-reference discipline).
+func TestPermissionAnchorRejectsStatusRegionQuotation(t *testing.T) {
+	filler := make([]string, 20)
+	for i := range filler {
+		filler[i] = "transcript body line"
+	}
+	// The prompt phrase quoted as content on the very last row: in-region (inside
+	// permissionRegionRows of the bottom) with NO option row below it anywhere.
+	anchorRow := "log: prompt was \"" + string(anchorPermissionSpaced) + "\""
+
+	forged := gridRows(append(append([]string{}, filler...), anchorRow)...)
+	if !strings.Contains(string(forged), string(anchorPermissionSpaced)) {
+		t.Fatal("fixture lost the permission anchor — forgery contrast void")
+	}
+	if got := DetectModalClass(forged); got == ModalClassPermission {
+		t.Error("in-region permission-prompt quotation classified as permission, want no fire")
+	}
+
+	// Non-vacuity positive control (guards the new lookahead path independent of
+	// the .bin fixture): the SAME filler and anchor row, plus a ❯-marked numbered
+	// option row directly below it, all in the bottom region — the real dialog
+	// shape. The only difference from the forgery above is the added option row,
+	// so this proves the lookahead fires on the shape, not on the phrase alone.
+	live := gridRows(append(append([]string{}, filler...), anchorRow, "❯ 1. Yes")...)
+	if got := DetectModalClass(live); got != ModalClassPermission {
+		t.Errorf("in-region prompt + ❯-option row: DetectModalClass = %q, want Permission", got)
 	}
 }
 

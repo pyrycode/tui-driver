@@ -88,11 +88,16 @@ func TestWaitReady(t *testing.T) {
 			wantClass: ModalClassPermission,
 		},
 		{
-			// Synthetic permission overlay in the bottom region (#152/#153). Spaced
-			// form: since #152 DetectModalClass matches the rendered grid, so the
-			// on-screen "Do you want to proceed" classifies as Permission.
-			name:      "unexpected permission modal at idle fails loudly (synthetic)",
-			snap:      append([]byte("Do you want to proceed"), idle...),
+			// Synthetic permission overlay in the bottom region (#152/#153). #242:
+			// the prompt phrase alone no longer suffices — the fixture is the full
+			// dialog shape (prompt plus a pointer-marked numbered option row region-
+			// scoped below it), so it classifies as Permission. The option row's ❯
+			// also supplies the idle glyph, so the screen still reads idle.
+			name: "unexpected permission modal at idle fails loudly (synthetic)",
+			snap: []byte("Do you want to proceed?\r\n" +
+				"❯ 1. Yes\r\n" +
+				"  2. No\r\n" +
+				"(Esc to cancel)\r\n"),
 			wantErr:   true,
 			wantClass: ModalClassPermission,
 		},

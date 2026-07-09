@@ -82,8 +82,13 @@ const (
 //	                      gridHasTrustDialog (trust.go). #219: the header alone
 //	                      classified any on-screen quotation of it as the modal,
 //	                      a fatal false positive under the runner's abort policy.
-//	permission          → "Do you want to proceed" — region-scoped to the
-//	                      bottom overlay window (permissionRegionRows)
+//	permission          → the proceed prompt (anchorPermissionSpaced) AND a
+//	                      pointer-marked numbered option row directly below it —
+//	                      the dialog shape, region-scoped to the bottom overlay
+//	                      window (permissionRegionRows), via gridHasPermissionDialog
+//	                      (below). #242: the prompt alone classified any in-region
+//	                      quotation of it as the modal — a forgeable surface for the
+//	                      modal_shown / modal_answer consumers.
 //	model-select        → "Select model" AND a pointer-marked option row
 //	                      (gridHasSelectionDialog, #223) — the `/model` modal.
 //	permissions-config  → "Permissions" header + one of Allow/Ask/Deny tabs AND
@@ -126,13 +131,56 @@ var (
 // whole-buffer or whole-grid match would misclassify as Permission.
 const permissionRegionRows = 12
 
+// permissionDialogLookahead bounds how many rows below anchorPermissionSpaced the
+// pointer-marked numbered option row may sit and still count. Mirrors
+// trustDialogLookahead: claude renders the ❯-marked option directly below the
+// prompt (permission-snapshot.bin: prompt at bottom-5, option at bottom-4); the
+// slack tolerates a blank or wrapped prompt line between them.
+const permissionDialogLookahead = 3
+
+// gridHasPermissionDialog reports whether g renders claude's real permission
+// overlay: anchorPermissionSpaced inside the bottom permissionRegionRows window
+// AND, within the next permissionDialogLookahead rows of that same window, a
+// pointer-marked numbered option row (modalOptionRe, group 1 = ❯ marker).
+//
+// The structural co-signal is the #242 fix, mirroring gridHasTrustDialog (#219).
+// Before it, the permission arm classified from the anchor phrase alone anywhere
+// in the bottom window, so fresh transcript content scrolling through that window
+// and quoting the phrase forged a live permission dialog — which a consumer would
+// surface to an operator or answer with a keystroke into a live turn.
+//
+// It keeps BOTH guards, and the difference from gridHasTrustDialog is exactly one
+// line: it iterates g.LastRows(permissionRegionRows), not g.Rows(). Permission is
+// a bottom-region overlay and that region scope is load-bearing — it is what
+// rejects an above-window transcript forgery (TestModalPhraseAnchorsRejectBodyForgery).
+// Because the window is already the bottom region and the downward lookahead can
+// only move toward the screen bottom, both the anchor and the option row are
+// inside permissionRegionRows by construction. A whole-grid match here would
+// silently drop the region guard — do not.
+func gridHasPermissionDialog(g *Grid) bool {
+	rows := g.LastRows(permissionRegionRows)
+	for i, row := range rows {
+		if !strings.Contains(row, string(anchorPermissionSpaced)) {
+			continue
+		}
+		end := min(i+1+permissionDialogLookahead, len(rows))
+		for j := i + 1; j < end; j++ {
+			if m := modalOptionRe.FindStringSubmatch(strings.TrimLeft(rows[j], " ")); m != nil && m[1] != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // gridContains reports whether sub appears within any rendered screen row of g.
 // This is the whole-visible-grid match used by the full-panel modal classes
 // (mcp, agents, model-select, permissions-config, trust-folder): the grid
 // already excludes scrolled-off history, so a panel anchor cannot be forged by
 // text that scrolled above the screen. The bottom-overlay class (permission)
-// uses Grid.ContainsInLastRows instead, to additionally reject an on-screen
-// transcript forgery rendered above the overlay.
+// scopes to the bottom window instead (gridHasPermissionDialog, via
+// Grid.LastRows), to additionally reject an on-screen transcript forgery
+// rendered above the overlay.
 func gridContains(g *Grid, sub []byte) bool {
 	s := string(sub)
 	for _, row := range g.Rows() {
@@ -190,7 +238,7 @@ func detectModalClassWithGrid(g *Grid, snap []byte) ModalClass {
 		return ModalClassAgents
 	case gridHasTrustDialog(g):
 		return ModalClassTrustFolder
-	case g.ContainsInLastRows(string(anchorPermissionSpaced), permissionRegionRows):
+	case gridHasPermissionDialog(g):
 		return ModalClassPermission
 	case gridContains(g, anchorModelSelectSpaced) && gridHasSelectionDialog(g):
 		return ModalClassModelSelect
