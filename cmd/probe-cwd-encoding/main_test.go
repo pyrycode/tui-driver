@@ -3,6 +3,7 @@ package main
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 // TestReferenceTransforms pins the three claude-free cwd-encoding reference
@@ -35,6 +36,39 @@ func TestReferenceTransforms(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.transform(tc.in); got != tc.want {
 				t.Errorf("%s(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIsSettled pins the pure settled-gate core the re-anchor rests on (#263):
+// the throwaway-prompt send is gated on the target state being present AND the
+// PTY quiet for settleWindow, so the bare-❯ false idle (present but still
+// rendering) can no longer fire the send early. These rows are the deterministic
+// make-check proof of the quiescence contract; the live reliability across the
+// 10 make-e2e runs is operator-verified out-of-band (AC2/AC3).
+func TestIsSettled(t *testing.T) {
+	const window = 1 * time.Second
+	tests := []struct {
+		name            string
+		want            bool
+		sinceLastAppend time.Duration
+		window          time.Duration
+		expect          bool
+	}{
+		{"present, quiet past window -> settled", true, window + time.Millisecond, window, true},
+		{"present, quiet exactly window -> settled", true, window, window, true},
+		{"present but still rendering (quiet < window) -> not settled", true, window / 2, window, false},
+		{"target absent, quiet past window -> not settled", false, 10 * window, window, false},
+		{"target absent, no quiet yet -> not settled", false, 0, window, false},
+		{"window 0 degrades to bare want (present) -> settled", true, 0, 0, true},
+		{"window 0, target absent -> not settled", false, 0, 0, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isSettled(tc.want, tc.sinceLastAppend, tc.window); got != tc.expect {
+				t.Errorf("isSettled(%t, %s, %s) = %t, want %t",
+					tc.want, tc.sinceLastAppend, tc.window, got, tc.expect)
 			}
 		})
 	}
