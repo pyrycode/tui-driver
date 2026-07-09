@@ -152,11 +152,17 @@ func TestBannerAnchorsRejectBodyForgery(t *testing.T) {
 // busy predicate (region scoping, #153). A stale ❯ scrolled into the body must
 // likewise not forge idle.
 func TestBusyIdleAnchorsRejectRegionForgery(t *testing.T) {
-	busy := make([]string, 0, len(spinnerGlyphs)+1)
+	busy := make([]string, 0, len(spinnerGlyphs)+2)
 	for _, g := range spinnerGlyphs {
 		busy = append(busy, string(g))
 	}
 	busy = append(busy, InterruptHint)
+	// The dot-frame row (#243): the plain dot spinner quoted as transcript body
+	// must fire nothing on the busy axis, exactly like the sparkle glyphs and the
+	// hint. Both guards reject it — the region scope (it renders above the window)
+	// and the row-start shape (embedded mid-prose, it never leads a row). Leading
+	// dot as a byte escape (\xc2\xb7 = U+00B7) per the screen-literal discipline.
+	busy = append(busy, "\xc2\xb7 Simmering…")
 	for _, anchor := range busy {
 		for _, f := range forgedBodyForms(anchor) {
 			t.Run("busy "+anchor+"/"+f.name, func(t *testing.T) {
@@ -336,5 +342,12 @@ func TestNegativeSuitePositiveControls(t *testing.T) {
 	}
 	if !HasNetworkFailure(loadFixture(t, "network-failure-snapshot.bin")) {
 		t.Error("network fixture: HasNetworkFailure = false, want true")
+	}
+	// #243 — the extracted dot-frame fixture fires the busy axis. Its only busy
+	// anchor is the dot-frame row (no sparkle, no hint in region), so this is the
+	// positive control for the dotSpinnerRe arm alongside the negative forgery
+	// case in TestBusyIdleAnchorsRejectRegionForgery.
+	if !IsThinking(loadFixture(t, "dot-spinner-snapshot.bin")) {
+		t.Error("dot-spinner fixture: IsThinking = false, want true")
 	}
 }

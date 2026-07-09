@@ -46,9 +46,11 @@ var SpinnerGlyphAlt = []byte("\xe2\x9c\xb3")
 // and SpinnerGlyphAlt stay as named exports; this superset is what busyInRegion
 // iterates. Additive: no existing glyph or its calibration changes.
 //
-// ⚠️ Adding a spinner frame here (or changing InterruptHint)? Add it to the #221
-// negative regression suite (anchor_forgery_test.go) so a body quotation of it
-// stays non-firing on the busy axis.
+// ⚠️ Adding a spinner frame here (or changing InterruptHint, or the dot-frame
+// row shape dotSpinnerRe)? Add it to the #221 negative regression suite
+// (anchor_forgery_test.go) so a body quotation of it stays non-firing on the
+// busy axis. The dot frame is deliberately NOT a member of this set — a bare dot
+// glyph would hold busy true at idle (dotSpinnerRe's doc-comment explains why).
 var spinnerGlyphs = [][]byte{
 	SpinnerGlyph,           // ✻ U+273B
 	SpinnerGlyphAlt,        // ✳ U+2733
@@ -85,24 +87,54 @@ const InterruptHint = "esc to interrupt"
 // small fails the realistic-thinking pin, too wide fails the forgery cases.
 const statusRegionRows = 6
 
+// dotSpinnerRe matches claude's plain dot-frame spinner ROW — a sixth thinking
+// frame the sparkle cycle (spinnerGlyphs) does not cover: the middle-dot spinner
+// glyph (U+00B7) as the row's leading rune, then whitespace, then a verb token,
+// then claude's ellipsis (U+2026). The glyphs are written as regexp hex escapes
+// so the literal never renders in source (the package's screen-literal
+// discipline; matches how spinnerGlyphs uses \xNN byte escapes).
+//
+// Anchored at row start (^) and applied per rendered row — NOT a substring — so
+// the SAME dot used mid-row as bottom-chrome separator (the "· /mcp" hint, the
+// class-C spinner's "(Ns · …)" bullet; see mcp_banner.go, ParseSpinnerTokens) or
+// a transcript bullet does not fire. Two discriminators carry that: the dot must
+// LEAD the row, and an ellipsis must follow it.
+//
+// Deliberately NOT folded into spinnerGlyphs as a bare glyph: claude renders the
+// same middle dot as an in-region separator, so a bare-dot anchor would hold
+// busy true at idle and break isIdleGrid's "❯ present AND not busy" conjunction.
+// The row shape is what makes the dot safe to key on. Extracted, observed frame:
+// testdata/dot-spinner-snapshot.bin (#243).
+var dotSpinnerRe = regexp.MustCompile(`^\x{00b7}\s+\S.*\x{2026}`)
+
 // busyInRegion reports whether a busy anchor is present in the status
 // region — THE single busy predicate for the idle/busy axis. Region-scoping
-// lives in exactly one place so IsIdle and IsThinking stay coherent. Two kinds
+// lives in exactly one place so IsIdle and IsThinking stay coherent. Three kinds
 // of independent anchor are OR'd here: any glyph in claude's spinner animation
-// cycle (spinnerGlyphs: ✻ ✳ ✢ ✶ ✽) and claude's "esc to interrupt" hint
-// (InterruptHint). They fail independently — claude would have to change every
-// spinner frame and the hint wording in one release to defeat the check. All
-// key on the grid's space-preserved rendered form; this must never reintroduce
-// a StripANSI whole-buffer substring path — that would both re-corrupt the
-// multi-word hint's inter-word spaces and re-open the mid-transcript forgery
-// #153 closed.
+// cycle (spinnerGlyphs: ✻ ✳ ✢ ✶ ✽), claude's "esc to interrupt" hint
+// (InterruptHint), and the plain dot-frame row shape (dotSpinnerRe) — the frame
+// that surfaces on long turns where claude swaps the hint row for a rotating tip
+// line, leaving the dot frame as the only anchor. They fail independently —
+// claude would have to change every spinner frame, the hint wording, and the
+// dot-frame shape in one release to defeat the check. All key on the grid's
+// space-preserved rendered form; this must never reintroduce a StripANSI
+// whole-buffer substring path — that would both re-corrupt the multi-word hint's
+// inter-word spaces and re-open the mid-transcript forgery #153 closed.
 func busyInRegion(g *Grid) bool {
 	for _, glyph := range spinnerGlyphs {
 		if g.ContainsInLastRows(string(glyph), statusRegionRows) {
 			return true
 		}
 	}
-	return g.ContainsInLastRows(InterruptHint, statusRegionRows)
+	if g.ContainsInLastRows(InterruptHint, statusRegionRows) {
+		return true
+	}
+	for _, row := range g.LastRows(statusRegionRows) {
+		if dotSpinnerRe.MatchString(row) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsIdle reports whether snap shows claude at the input prompt with no
