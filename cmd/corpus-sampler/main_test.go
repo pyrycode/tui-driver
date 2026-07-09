@@ -26,8 +26,13 @@ func fixture() string { return filepath.Join("testdata", "stable-sample-ok.cast"
 // -final emits no final sample when there is nothing rendered (AC 1).
 func noOutputFixture() string { return filepath.Join("testdata", "no-output-ok.cast") }
 
+// noFireFixture is a plain build-output cast (cmd/corpus-sampler/testdata/no-fire-ok.cast)
+// whose frames trip no structural detector — the AC4 negative: -fires emits no
+// fire sample from it.
+func noFireFixture() string { return filepath.Join("testdata", "no-fire-ok.cast") }
+
 func TestCollect_StableScreensDedupeAndCounts(t *testing.T) {
-	distinct, casts, events, gaps, err := collect([]string{fixture()}, 0.5, false)
+	distinct, casts, events, gaps, err := collect([]string{fixture()}, 0.5, false, false)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -62,7 +67,7 @@ func TestCollect_StableScreensDedupeAndCounts(t *testing.T) {
 }
 
 func TestCollect_RepeatedScreenCollapsesWithSeenCount(t *testing.T) {
-	distinct, _, _, _, err := collect([]string{fixture()}, 0.5, false)
+	distinct, _, _, _, err := collect([]string{fixture()}, 0.5, false, false)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -80,7 +85,7 @@ func TestCollect_RepeatedScreenCollapsesWithSeenCount(t *testing.T) {
 }
 
 func TestCollect_ProvenanceMatchesStableFrameRule(t *testing.T) {
-	distinct, _, _, _, err := collect([]string{fixture()}, 0.5, false)
+	distinct, _, _, _, err := collect([]string{fixture()}, 0.5, false, false)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -118,11 +123,11 @@ func TestCollect_ProvenanceMatchesStableFrameRule(t *testing.T) {
 }
 
 func TestCollect_Deterministic(t *testing.T) {
-	a, _, _, _, err := collect([]string{fixture()}, 0.5, false)
+	a, _, _, _, err := collect([]string{fixture()}, 0.5, false, false)
 	if err != nil {
 		t.Fatalf("collect (run a): %v", err)
 	}
-	b, _, _, _, err := collect([]string{fixture()}, 0.5, false)
+	b, _, _, _, err := collect([]string{fixture()}, 0.5, false, false)
 	if err != nil {
 		t.Fatalf("collect (run b): %v", err)
 	}
@@ -140,7 +145,7 @@ func TestCollect_Deterministic(t *testing.T) {
 }
 
 func TestCollect_FinalEmitsLastFrameAndUnionsSources(t *testing.T) {
-	distinct, _, _, gaps, err := collect([]string{fixture()}, 0.5, true)
+	distinct, _, _, gaps, err := collect([]string{fixture()}, 0.5, true, false)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -175,7 +180,7 @@ func TestCollect_FinalEmitsLastFrameAndUnionsSources(t *testing.T) {
 }
 
 func TestCollect_FinalSkipsZeroOutputCast(t *testing.T) {
-	distinct, casts, events, gaps, err := collect([]string{noOutputFixture()}, 0.5, true)
+	distinct, casts, events, gaps, err := collect([]string{noOutputFixture()}, 0.5, true, false)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -195,11 +200,11 @@ func TestCollect_FinalSkipsZeroOutputCast(t *testing.T) {
 }
 
 func TestCollect_FinalSourceDeterministic(t *testing.T) {
-	a, _, _, _, err := collect([]string{fixture()}, 0.5, true)
+	a, _, _, _, err := collect([]string{fixture()}, 0.5, true, false)
 	if err != nil {
 		t.Fatalf("collect (run a): %v", err)
 	}
-	b, _, _, _, err := collect([]string{fixture()}, 0.5, true)
+	b, _, _, _, err := collect([]string{fixture()}, 0.5, true, false)
 	if err != nil {
 		t.Fatalf("collect (run b): %v", err)
 	}
@@ -208,6 +213,95 @@ func TestCollect_FinalSourceDeterministic(t *testing.T) {
 	}
 	// Per-sample source arrays must be byte-identical across runs (AC 4): the
 	// sorted-array serialization makes order independent of discovery order.
+	for i := range a {
+		if a[i].Hash != b[i].Hash {
+			t.Errorf("distinct[%d] hash differs across runs: %s vs %s", i, a[i].Hash, b[i].Hash)
+		}
+		if !reflect.DeepEqual(a[i].Source, b[i].Source) {
+			t.Errorf("distinct[%d] source differs across runs: %v vs %v (hash %s)", i, a[i].Source, b[i].Source, a[i].Hash)
+		}
+	}
+}
+
+func TestCollect_FireSourceEmitsWithDetectorAttribution(t *testing.T) {
+	distinct, _, _, gaps, err := collect([]string{fixture()}, 0.5, false, true)
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	// With -fires on, the mid-stream "Working" spinner (event 1) — which no quiet
+	// gap ever sampled — is surfaced because IsThinking fired on it, so the distinct
+	// set grows from 2 (gap-only) to 3. This entry is the point of the source.
+	if len(distinct) != 3 {
+		t.Fatalf("distinct = %d, want 3 (idle + the gap-sampled Thinking spinner + the fire-only Working spinner)", len(distinct))
+	}
+	// gaps counts quiet-gap fires only; fire samples must not inflate it.
+	if gaps != 3 {
+		t.Errorf("gaps = %d, want 3 (fire samples excluded from the gap count)", gaps)
+	}
+
+	// Discovery order: fire idle (event 0) → fire Working spinner (event 1) → gap
+	// Thinking spinner (event 2). Each row pins Source (sorted union), Seen, and the
+	// first-occurrence Event/TS.
+	want := []struct {
+		source []string
+		seen   int
+		event  int
+		ts     float64
+	}{
+		{[]string{"fire", "gap", "idle"}, 4, 0, 0.0}, // idle: sat through a quiet gap AND IsIdle fired
+		{[]string{"fire", "thinking"}, 1, 1, 0.6},    // Working spinner: only the fire source catches it
+		{[]string{"gap"}, 1, 2, 0.7},                 // Thinking spinner: the gap-sampled one, no fire edge
+	}
+	for i, w := range want {
+		got := distinct[i]
+		if !reflect.DeepEqual(got.Source, w.source) {
+			t.Errorf("distinct[%d] source = %v, want %v (hash %s in %s)", i, got.Source, w.source, got.Hash, got.Cast)
+		}
+		if got.Seen != w.seen {
+			t.Errorf("distinct[%d] Seen = %d, want %d (hash %s in %s)", i, got.Seen, w.seen, got.Hash, got.Cast)
+		}
+		if got.Event != w.event {
+			t.Errorf("distinct[%d] Event = %d, want %d (hash %s)", i, got.Event, w.event, got.Hash)
+		}
+		if got.TS != w.ts {
+			t.Errorf("distinct[%d] TS = %v, want %v (hash %s)", i, got.TS, w.ts, got.Hash)
+		}
+	}
+}
+
+func TestCollect_NoFireCastEmitsNoFireSample(t *testing.T) {
+	distinct, _, _, _, err := collect([]string{noFireFixture()}, 0.5, false, true)
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	// The plain build-output cast trips no structural detector, so even with -fires
+	// on, no distinct entry may carry the "fire" source (a gap-only sample is fine —
+	// the AC is about the fire source, not emptiness).
+	for _, s := range distinct {
+		for _, src := range s.Source {
+			if src == "fire" {
+				t.Errorf("no-fire cast produced a fire sample (source %v, hash %s in %s); no detector should have fired", s.Source, s.Hash, s.Cast)
+			}
+		}
+	}
+}
+
+func TestCollect_FireSourceDeterministic(t *testing.T) {
+	a, _, _, _, err := collect([]string{fixture()}, 0.5, false, true)
+	if err != nil {
+		t.Fatalf("collect (run a): %v", err)
+	}
+	b, _, _, _, err := collect([]string{fixture()}, 0.5, false, true)
+	if err != nil {
+		t.Fatalf("collect (run b): %v", err)
+	}
+	if len(a) != len(b) {
+		t.Fatalf("distinct lengths differ across runs: %d vs %d", len(a), len(b))
+	}
+	// Per-sample Source arrays must be byte-identical across runs (AC3): activeKeys
+	// iterates a map, so the newly-fired keys and the whole Source slice are sorted
+	// before storing. Drop that sort and a fire sample that first introduces two
+	// keys serializes them in random order → this fails.
 	for i := range a {
 		if a[i].Hash != b[i].Hash {
 			t.Errorf("distinct[%d] hash differs across runs: %s vs %s", i, a[i].Hash, b[i].Hash)
