@@ -15,6 +15,7 @@ tui-driver
 /spike-queued-modals
 /probe-first-prompt-hang
 /probe-cwd-encoding
+/repro-permission-flake
 /e2e-runner
 /e2e-snapshot-check
 /bin/

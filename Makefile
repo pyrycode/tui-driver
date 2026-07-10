@@ -11,7 +11,7 @@ GO         ?= go
 SPIKES     := spike-one-turn spike-multi-turn spike-cancel spike-permission spike-multiselect spike-ask-user spike-long-prompt spike-short-prompt spike-queued-modals
 PROBES     := probe-first-prompt-hang probe-cwd-encoding
 RUNNER     := e2e-runner
-TOOLS      := corpus-replay
+TOOLS      := corpus-replay repro-permission-flake
 
 ALL_BINS   := $(SPIKES) $(PROBES) $(RUNNER) $(TOOLS)
 BIN_PATHS  := $(addprefix $(BIN_DIR)/,$(ALL_BINS))
@@ -29,7 +29,7 @@ CORPUS_DIR ?= $(HOME)/.local/share/pyry-recordings
 MODEL      ?=
 EFFORT     ?=
 
-.PHONY: e2e build-bin clean-bin clean-report check vet test corpus-replay
+.PHONY: e2e build-bin clean-bin clean-report check vet test corpus-replay repro-permission-flake
 
 # `make check` is the fast, claude-free gate run on every PR (see
 # .github/workflows/check.yml). `make e2e` remains the live-claude harness and
@@ -51,6 +51,18 @@ e2e: build-bin
 # cmd/corpus-replay/README.md. Override CORPUS_DIR / STRIDE as needed.
 corpus-replay: $(BIN_DIR)/corpus-replay
 	$(BIN_DIR)/corpus-replay -dir $(CORPUS_DIR) $(if $(STRIDE),-stride $(STRIDE))
+
+# Reproduce + diagnose spike-permission's "modal not detected within 30s" load
+# flake (#253 slice A). Hand-run diagnostic, live-claude, minutes-long — builds
+# the spike, then drives it in concurrent waves under artificial load and writes
+# a durable diagnosis artifact. NOT a make-e2e check (would spawn PxW live
+# claude). See cmd/repro-permission-flake/README.md. Override CONCURRENCY /
+# WAVES / CPU_BURN as needed.
+repro-permission-flake: $(BIN_DIR)/repro-permission-flake $(BIN_DIR)/spike-permission
+	$(BIN_DIR)/repro-permission-flake -bin $(BIN_DIR)/spike-permission \
+		$(if $(CONCURRENCY),-concurrency $(CONCURRENCY)) \
+		$(if $(WAVES),-waves $(WAVES)) \
+		$(if $(CPU_BURN),-cpu-burn $(CPU_BURN))
 
 build-bin: $(BIN_PATHS)
 
