@@ -123,6 +123,8 @@ func main() {
 	final := flag.Bool("final", false, "also emit each cast's final rendered frame as a sample (source \"final\")")
 	fires := flag.Bool("fires", false, "also emit a sample at each event where a structural detector newly fires (source \"fire\" plus the detector key)")
 	midstream := flag.Int("midstream", 0, "also emit up to N deterministically chosen mid-stream frames per cast (source \"midstream\")")
+	noCache := flag.Bool("no-cache", false, "bypass the result cache entirely (always sample; never read or write the cache)")
+	cacheDir := flag.String("cache-dir", "", "override the cache directory (default: a corpus-sampler subdirectory under the user cache dir)")
 	promoteMode := flag.Bool("promote", false, "promote mode: write a sampled screen to a committed fixture + manifest entry (needs -in, -hash, -dir)")
 	in := flag.String("in", "", "promote mode: sampler JSONL to read the screen's provenance from")
 	hash := flag.String("hash", "", "promote mode: normalized-grid hash of the screen to promote")
@@ -161,7 +163,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	distinct, casts, events, gaps, err := collect(paths, gap.Seconds(), *final, *fires, *midstream)
+	// The cache is an optimisation; the tool's core value is sampling + -out. If
+	// cache construction fails, degrade gracefully to a nil cache (an uncached run)
+	// so stdout and -out stay byte-identical to a -no-cache run.
+	var cache *sampleCache
+	if !*noCache {
+		c, err := newSampleCache(*cacheDir, gap.Seconds(), *final, *fires, *midstream, versionSourceDirs...)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "corpus-sampler: cache disabled: %v\n", err)
+		} else {
+			cache = c
+		}
+	}
+
+	distinct, casts, events, gaps, stats, err := collectCached(paths, gap.Seconds(), *final, *fires, *midstream, cache)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "corpus-sampler: %v\n", err)
 		os.Exit(1)
@@ -170,6 +185,12 @@ func main() {
 	if err := writeSamples(*out, distinct); err != nil {
 		fmt.Fprintf(os.Stderr, "corpus-sampler: %v\n", err)
 		os.Exit(1)
+	}
+
+	if cache != nil {
+		// Hit/miss summary to stderr — makes "only the new cast re-samples"
+		// observable without touching the stdout aggregate line or -out.
+		fmt.Fprintf(os.Stderr, "corpus-sampler: cache %d hit(s), %d miss(es)\n", stats.hits, stats.misses)
 	}
 
 	// stdout: aggregate counts ONLY — never any grid content or grid-derived text.
@@ -199,17 +220,41 @@ func castPaths(dir string) ([]string, error) {
 // scan is skipped with a stderr note and NOT counted in casts — one bad cast
 // never aborts a 1900-cast run. Determinism follows from sorted castPaths +
 // in-order events + first-occurrence-wins.
+//
+// collect is an uncached delegator to collectCached, preserving its 5-arg /
+// 5-return signature so its 21 existing call sites compile untouched.
 func collect(paths []string, gap float64, final, fires bool, midstream int) (distinct []sample, casts, events, gaps int, err error) {
+	distinct, casts, events, gaps, _, err = collectCached(paths, gap, final, fires, midstream, nil)
+	return distinct, casts, events, gaps, err
+}
+
+// collectCached is collect's body plus the per-cast cache. It swaps the single
+// sampleCast call for sampleOrLoad and tallies cache hits/misses; the cross-cast
+// dedup (the idx map + mergeSources) is byte-for-byte the existing loop, now
+// running over the union of cached and freshly-sampled per-cast sample lists.
+// That union "just works" because sampleCast returns the pre-dedup per-cast list
+// and every list, cached or fresh, flows through the one idx map — so a screen a
+// cached cast contributes still dedups against an identical screen in a fresh
+// cast, and mergeSources still unions finders across casts. With cache == nil the
+// stats stay zero and every cast is sampled (the collect delegator's behaviour).
+func collectCached(paths []string, gap float64, final, fires bool, midstream int, cache *sampleCache) (distinct []sample, casts, events, gaps int, stats cacheStats, err error) {
 	idx := map[string]int{} // hash -> position in distinct
 	for _, p := range paths {
-		samples, ev, gp, serr := sampleCast(p, gap, final, fires, midstream)
+		samples, ev, gp, hit, serr := sampleOrLoad(cache, p, gap, final, fires, midstream)
 		if serr != nil {
 			fmt.Fprintf(os.Stderr, "corpus-sampler: skip %s: %v\n", filepath.Base(p), serr)
-			continue
+			continue // an errored cast is neither a hit nor a miss, exactly as today
 		}
 		casts++
 		events += ev
 		gaps += gp
+		if cache != nil {
+			if hit {
+				stats.hits++
+			} else {
+				stats.misses++
+			}
+		}
 		for _, s := range samples {
 			if pos, ok := idx[s.Hash]; ok {
 				distinct[pos].Seen++
@@ -223,7 +268,7 @@ func collect(paths []string, gap float64, final, fires bool, midstream int) (dis
 			distinct = append(distinct, s)
 		}
 	}
-	return distinct, casts, events, gaps, nil
+	return distinct, casts, events, gaps, stats, nil
 }
 
 // mergeSources returns the sorted union of source sets a and b with duplicates
