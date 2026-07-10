@@ -18,7 +18,10 @@ tui-driver
 /e2e-runner
 /e2e-snapshot-check
 /bin/
-/e2e-report.json
+# e2e-runner report(s): the default /e2e-report.json plus per-run variants
+# (e.g. e2e-report-run1.json from a QA baseline sweep); never commit — a
+# committed report can sweep a live-red run onto a branch (#264 rework).
+e2e-report*.json
 
 # Capture logs (e.g. code-review's `make e2e` capture); never commit
 *.log
