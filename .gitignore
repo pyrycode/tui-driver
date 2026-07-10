@@ -27,10 +27,10 @@ tui-driver
 # asciinema session recordings (SpawnOpts.RecordTo); may contain secrets
 *.cast
 # Exception: hand-authored, secret-free .cast fixtures for the corpus-replay
-# harness (#227) and corpus-sampler (#255). Synthetic content only — not real
-# recordings.
-!cmd/corpus-replay/testdata/*.cast
-!cmd/corpus-sampler/testdata/*.cast
+# harness (#227), its assert-gate fixtures (#259, under testdata/assert/*), and
+# corpus-sampler (#255). Synthetic content only — not real recordings.
+!cmd/corpus-replay/testdata/**/*.cast
+!cmd/corpus-sampler/testdata/**/*.cast
 
 # Test
 *.test

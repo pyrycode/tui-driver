@@ -29,7 +29,7 @@ CORPUS_DIR ?= $(HOME)/.local/share/pyry-recordings
 MODEL      ?=
 EFFORT     ?=
 
-.PHONY: e2e build-bin clean-bin clean-report check vet test corpus-replay repro-permission-flake
+.PHONY: e2e build-bin clean-bin clean-report check vet test corpus-replay corpus-assert repro-permission-flake
 
 # `make check` is the fast, claude-free gate run on every PR (see
 # .github/workflows/check.yml). `make e2e` remains the live-claude harness and
@@ -51,6 +51,15 @@ e2e: build-bin
 # cmd/corpus-replay/README.md. Override CORPUS_DIR / STRIDE as needed.
 corpus-replay: $(BIN_DIR)/corpus-replay
 	$(BIN_DIR)/corpus-replay -dir $(CORPUS_DIR) $(if $(STRIDE),-stride $(STRIDE))
+
+# The operator-run detection GATE (#259): replay the corpus at full fidelity
+# (stride 1 forced) and exit non-zero if any detection-health invariant is
+# violated — a stray modal/banner fire, a missing idle, or a detector flapping
+# past the edge ceiling in a production ok-tagged run. Hand-run, expected tens of
+# minutes on the full corpus, NOT a CI gate and NOT a make check step (org rule).
+# See cmd/corpus-replay/README.md. Override CORPUS_DIR / EDGE_CEILING as needed.
+corpus-assert: $(BIN_DIR)/corpus-replay
+	$(BIN_DIR)/corpus-replay -dir $(CORPUS_DIR) -assert $(if $(EDGE_CEILING),-assert-edge-ceiling $(EDGE_CEILING))
 
 # Reproduce + diagnose spike-permission's "modal not detected within 30s" load
 # flake (#253 slice A). Hand-run diagnostic, live-claude, minutes-long — builds
