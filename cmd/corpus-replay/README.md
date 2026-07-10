@@ -34,6 +34,33 @@ Flags:
 - `-per-cast`: print one line per cast (fires, anchors, segment, tag).
 - `-only SUBSTR`: replay only casts whose filename contains SUBSTR — for
   drilling into a specific recording.
+- `-no-cache`: bypass the result cache entirely (always replay; never read or
+  write the cache).
+- `-cache-dir DIR`: override the cache directory (default: a `corpus-replay`
+  subdirectory under the user cache dir).
+
+## Caching
+
+The result cache is **on by default**. A cast's replay result is a pure function
+of the cast bytes, the resolved stride, and the detection code, and recordings
+are immutable — so on a repeat run over an unchanged corpus with unchanged
+detectors every result is recomputed identically for nothing. The cache removes
+that: the routine case (a handful of new recordings, unchanged detectors) costs
+seconds, while a full re-replay fires exactly when the detection code changes.
+
+Each cast's result is stored in one file, keyed by a hash of the detector
+sources (`pkg/tuidriver` **and** `cmd/corpus-replay`) plus the resolved stride
+plus the cast's name and content. So:
+
+- editing any detector source re-replays the **whole** corpus (every key flips);
+- adding a new cast to an otherwise-unchanged corpus replays **only** the new
+  cast (the rest stay hits);
+- a result recorded at one stride is never served to a lookup at a different
+  stride.
+
+A hit/miss summary is printed to stderr (it does not affect the stdout report).
+`-no-cache` bypasses the cache; `-cache-dir` relocates it. Stale entries from a
+previous detector version are never read again and are safe to delete wholesale.
 
 ## What it reports
 
