@@ -20,8 +20,8 @@ func TestReplayAll_ByteIdenticalAcrossWorkerCounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("castPaths: %v", err)
 	}
-	r1 := replayAll(paths, 1, 1, io.Discard)
-	rN := replayAll(paths, 1, 8, io.Discard)
+	r1, _ := replayAll(paths, 1, 1, nil, io.Discard)
+	rN, _ := replayAll(paths, 1, 8, nil, io.Discard)
 
 	var b1, bN bytes.Buffer
 	report(&b1, r1, "testdata", 1, true)
@@ -41,7 +41,7 @@ func TestReplayAll_ResultsSortedByName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("castPaths: %v", err)
 	}
-	res := replayAll(paths, 1, 8, io.Discard)
+	res, _ := replayAll(paths, 1, 8, nil, io.Discard)
 	if len(res) == 0 {
 		t.Fatal("replayAll returned no results")
 	}
@@ -62,7 +62,7 @@ func TestReplayAll_SkipsUnreadableCastAndContinues(t *testing.T) {
 		filepath.Join("testdata", "does-not-exist.cast"),
 	}
 	var errBuf bytes.Buffer
-	res := replayAll(paths, 1, 4, &errBuf)
+	res, _ := replayAll(paths, 1, 4, nil, &errBuf)
 	if len(res) != 1 {
 		t.Fatalf("len(results) = %d, want 1 (only sample-ok)", len(res))
 	}

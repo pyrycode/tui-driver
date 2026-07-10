@@ -115,6 +115,8 @@ func main() {
 	perCast := flag.Bool("per-cast", false, "print one line per cast (fires, anchors, segment, tag)")
 	only := flag.String("only", "", "only replay casts whose filename contains this substring")
 	workers := flag.Int("workers", runtime.NumCPU(), "number of concurrent cast-replay workers")
+	noCache := flag.Bool("no-cache", false, "bypass the result cache entirely (always replay; never read or write the cache)")
+	cacheDir := flag.String("cache-dir", "", "override the cache directory (default: a corpus-replay subdirectory under the user cache dir)")
 	flag.Parse()
 
 	if *dir == "" {
@@ -139,7 +141,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	results := replayAll(paths, *stride, *workers, os.Stderr)
+	// The cache is an optimisation; the tool's core value is replay + report. If
+	// cache construction fails, degrade gracefully to a nil cache (an uncached run)
+	// so stdout stays byte-identical to a -no-cache run.
+	var cache *resultCache
+	if !*noCache {
+		c, err := newResultCache(*cacheDir, versionSourceDirs...)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "corpus-replay: cache disabled: %v\n", err)
+		} else {
+			cache = c
+		}
+	}
+
+	results, stats := replayAll(paths, *stride, *workers, cache, os.Stderr)
+	if cache != nil {
+		// Hit/miss summary to stderr — makes "only the new cast replays" observable
+		// without touching the stdout report.
+		fmt.Fprintf(os.Stderr, "corpus-replay: cache %d hit(s), %d miss(es)\n", stats.hits, stats.misses)
+	}
 	report(os.Stdout, results, *dir, *stride, *perCast)
 }
 
@@ -150,6 +170,7 @@ func main() {
 type replayOutcome struct {
 	path string
 	res  castResult
+	hit  bool // the result came from the cache (no replay was performed)
 	err  error
 }
 
@@ -160,7 +181,13 @@ type replayOutcome struct {
 // omitted from the results (identical semantics to the sequential path; the
 // relative ordering of skip lines under parallelism is out of scope for the
 // byte-identical criterion, as stderr is not report output).
-func replayAll(paths []string, stride, workers int, errOut io.Writer) []castResult {
+//
+// When cache != nil each cast is served from the cache on a hit (no replay) or
+// replayed and stored on a miss; the returned cacheStats tally hits and misses
+// (an errored cast is a skip, counted as neither). Distinct keys map to distinct
+// files, so the pool stays lockless — see replayOrLoad and cache.go. With
+// cache == nil every cast is replayed and cacheStats is zero.
+func replayAll(paths []string, stride, workers int, cache *resultCache, errOut io.Writer) ([]castResult, cacheStats) {
 	if workers < 1 {
 		workers = 1
 	}
@@ -183,8 +210,8 @@ func replayAll(paths []string, stride, workers int, errOut io.Writer) []castResu
 		go func() {
 			defer wg.Done()
 			for p := range jobs {
-				res, err := replayCast(p, stride)
-				out <- replayOutcome{path: p, res: res, err: err}
+				res, hit, err := replayOrLoad(cache, p, stride)
+				out <- replayOutcome{path: p, res: res, hit: hit, err: err}
 			}
 		}()
 	}
@@ -200,10 +227,18 @@ func replayAll(paths []string, stride, workers int, errOut io.Writer) []castResu
 	// errOut and appends to results — so skip lines never interleave mid-byte and
 	// no mutex is needed.
 	results := make([]castResult, 0, len(paths))
+	var stats cacheStats
 	for o := range out {
 		if o.err != nil {
 			fmt.Fprintf(errOut, "corpus-replay: skip %s: %v\n", filepath.Base(o.path), o.err)
 			continue
+		}
+		if cache != nil {
+			if o.hit {
+				stats.hits++
+			} else {
+				stats.misses++
+			}
 		}
 		results = append(results, o.res)
 	}
@@ -213,7 +248,7 @@ func replayAll(paths []string, stride, workers int, errOut io.Writer) []castResu
 	// unique names within one directory, so the comparator is a strict total order
 	// and a non-stable sort is deterministic.
 	sort.Slice(results, func(i, j int) bool { return results[i].name < results[j].name })
-	return results
+	return results, stats
 }
 
 // castPaths lists the .cast files in dir, optionally filtered to those whose
