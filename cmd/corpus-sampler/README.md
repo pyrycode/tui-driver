@@ -28,6 +28,7 @@ go run ./cmd/corpus-sampler -dir /path/to/casts -out screens.jsonl -gap 1s
 go run ./cmd/corpus-sampler -dir /path/to/casts -out screens.jsonl -final
 go run ./cmd/corpus-sampler -dir /path/to/casts -out screens.jsonl -fires
 go run ./cmd/corpus-sampler -dir /path/to/casts -out screens.jsonl -midstream 5
+go run ./cmd/corpus-sampler -dir /path/to/casts -out screens.jsonl -no-cache
 ```
 
 To promote a sampled screen to a committed fixture + manifest entry:
@@ -64,6 +65,30 @@ Flags:
   between output bursts, where the quiet-gap rule rarely fires (the #243
   dot-spinner frame is the motivating case — it went uncounted in the original
   glyph census because it appears mid-stream, not at a quiet wait-state).
+- `-no-cache` (default `false`): bypass the result cache entirely — always sample,
+  never read or write the cache.
+- `-cache-dir` (default ``): override the cache location (default: a
+  `corpus-sampler` subdirectory under the user cache dir).
+
+## Caching
+
+On by default. Each cast's sampler result (its pre-dedup sample list plus that
+cast's event and gap counts) is cached under the cache dir, keyed by a `sha256`
+over the detector sources (every `*.go` under `pkg/tuidriver` **and**
+`cmd/corpus-sampler`), the mode flags (`-gap`/`-final`/`-fires`/`-midstream`), the
+cast name, and the cast content. So a re-run over the immutable, additive corpus
+re-samples **only new recordings** — the expensive full-corpus pass (2118
+recordings, ~1.1 GB, ~6 h on the fanless Air) collapses to the handful of new
+casts. Changing any detector source **or** any mode flag re-samples the whole
+corpus (every key changes); a new recording samples only itself. A cache
+hit/miss summary is written to stderr; `stdout` and `-out` are byte-identical to a
+`-no-cache` run. `-no-cache` bypasses the cache, `-cache-dir` relocates it, and
+stale entries under the cache dir are safe to delete wholesale.
+
+Parallelism (`-workers`, like `corpus-replay`) is deliberately **not** offered:
+the target machine is a fanless MacBook Air that throttles under sustained
+multi-core load, so caching (skip the work) is the right lever, not racing it
+across cores.
 
 ## Promote mode (`-promote`)
 
