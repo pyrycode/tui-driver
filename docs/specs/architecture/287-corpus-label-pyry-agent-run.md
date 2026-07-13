@@ -89,6 +89,21 @@ continues from the first unlabeled screen, which suits the fanless-Air multi-day
 and `-workdir` (default `.`, the already-trusted current dir). `-batch` stays `[10,20]`; `-model`
 still switches to re-pass mode on a non-default value.
 
+### Resumability across a multi-day run
+
+The run is kill-and-relaunch safe. On relaunch, resume reads `-out`, skips every already-labeled hash,
+and continues from the first unlabeled screen; labels flush per batch, so a crash loses at most the
+in-flight batch (which is re-done, not lost). A batch that fails twice parks to `-park` and never
+reaches `-out`, so the next run re-attempts it — this is how a transient auth 401 is absorbed. Ctrl-C
+cancels the in-flight batch cleanly (neither persisted nor parked).
+
+The re-pass rewrite is made crash-atomic: `rewriteLabels` writes to a temp file in the same directory,
+fsyncs, then renames over `-out`. A kill mid-write leaves the temp file and the previous `-out`
+intact, so re-pass never truncates the labels file. The bulk haiku pass is append-only and already
+safe. One residual edge left as-is: a kill mid-append can leave a torn final line in `-out`, and
+`readLabels` treats a corrupt line as fatal (deliberately — a garbled resume source must not silently
+re-label everything), so resume then needs that one torn line removed by hand.
+
 ## Billing invariant
 
 The billing invariant is: run the default `pyry agent-run` path with `ANTHROPIC_API_KEY` and
