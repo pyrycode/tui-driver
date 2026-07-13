@@ -3,50 +3,74 @@
 // structural detectors classifies each sampled screen ahead of fixture promotion
 // (#258). A presweep that classified with the code under test could only
 // re-discover what the detectors already see — a blind spot would dedupe into the
-// boring bucket — so the judge is a headless `claude` reading the raw grids, with a
-// free-text `unusual:` escape hatch that surfaces situations no enum value covers
-// (the dot-frame spinner gap #243 was found exactly this way).
+// boring bucket — so the judge reads the raw grids, with a free-text `unusual:`
+// escape hatch that surfaces situations no enum value covers (the dot-frame spinner
+// gap #243 was found exactly this way).
 //
-// The run is resumable: the operator's `claude` subscription window can cap
-// mid-run, so a capped run just pauses and the next run continues from the first
-// unlabeled screen. Labels are flushed per batch, so a mid-run kill loses at most
-// the in-flight batch. Sequential by design (no goroutines): the subscription login
-// is a single serialized resource and resume correctness wants ordered,
-// flush-per-batch persistence — a parallel pool could leave a mid-run gap resume
-// can't reason about.
+// Each batch is judged by one fresh `pyry agent-run`, which spawns interactive
+// claude through pyry's pseudo-terminal on the subscription login and ends when the
+// turn completes. This is the one blessed way to run claude on the subscription
+// without metered spend — the same path the agent dispatchers use every day. A
+// print-mode `claude -p` call would bill per token against the metered API, the
+// exact outcome this design avoids, so it is never used.
 //
-// Billing safety: the child `claude` runs on the ambient subscription login with
-// ANTHROPIC_API_KEY REMOVED from its environment — its presence flips billing to
-// metered, the exact outcome this design avoids. Default model haiku; a non-default
-// -model forces a re-pass over the low-confidence and unusual screens.
+// The run is resumable: the subscription window can cap mid-run, so a capped run
+// just pauses and the next run continues from the first unlabeled screen. Labels are
+// flushed per batch, so a mid-run kill loses at most the in-flight batch. Ctrl-C
+// (SIGINT/SIGTERM) cancels the in-flight batch and exits cleanly; resume then
+// continues from the first unlabeled screen. Sequential by design (no goroutines):
+// the subscription login is a single serialized resource and resume correctness
+// wants ordered, flush-per-batch persistence — a parallel pool could leave a mid-run
+// gap resume can't reason about.
+//
+// Billing safety: the child inherits the environment with ANTHROPIC_API_KEY and
+// PYRY_USE_STREAMJSON both REMOVED — the first flips claude to metered billing, the
+// second routes pyry through its metered print-mode fallback; either defeats the
+// design. The durable subscription auth (CLAUDE_CODE_OAUTH_TOKEN) is preserved.
+// Default model haiku; a non-default -model forces a re-pass over the low-confidence
+// and unusual screens.
 //
 // Local audit tool — no CI workflow (org rule); run BY HAND off the agent pipeline.
 //
 // ⚠️ Self-reference: sample grids quote detection anchors, and displaying them on
 // screen mid-run can false-fire live detection (#152/#154/#155). Grids flow ONLY to
-// the child claude's stdin; -out stores hashes (never grids); stdout carries
-// aggregate counts only; test failures reference hashes and cast names, never grid
-// content.
+// the judge's prompt file; -out stores hashes (never grids); stdout carries
+// aggregate counts only; a park record carries only the model's reply or a
+// grid-free error; test failures reference hashes and cast names, never grid content.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
 // defaultModel is the labeling model. A non-default -model switches to re-pass mode
 // (re-label the low-confidence and unusual screens).
 const defaultModel = "haiku"
 
+// options is the parsed flag set threaded into run.
+type options struct {
+	in, out, park          string
+	batch                  int
+	model, effort, workdir string
+	pyryPath               string
+	minConf                float64
+}
+
 func main() {
 	in := flag.String("in", "", "sampler output JSONL to label (required)")
 	out := flag.String("out", "", "labels JSONL; also the resume source (required)")
 	park := flag.String("park", "", "park JSONL for batches that fail to label twice (required)")
-	batch := flag.Int("batch", 15, "screens per claude -p call (10-20)")
-	model := flag.String("model", defaultModel, "model for claude -p; a non-default value switches to re-pass mode")
+	batch := flag.Int("batch", 15, "screens per pyry agent-run batch (10-20)")
+	model := flag.String("model", defaultModel, "model for the judge; a non-default value switches to re-pass mode")
 	minConf := flag.Float64("min-confidence", 0.7, "re-pass selects labels below this confidence (or unusual:)")
-	claudePath := flag.String("claude", "claude", "claude binary path (test injection seam)")
+	pyryPath := flag.String("pyry", "pyry", "pyry binary path; must support agent-run (test injection seam)")
+	effort := flag.String("effort", "low", "thinking effort for pyry agent-run: low|medium|high|xhigh|max")
+	workdir := flag.String("workdir", ".", "working directory for pyry agent-run (must exist; default is the already-trusted current dir)")
 	flag.Parse()
 
 	if *in == "" || *out == "" || *park == "" {
@@ -59,7 +83,17 @@ func main() {
 		os.Exit(2)
 	}
 
-	if err := run(*in, *out, *park, *batch, *model, *minConf, *claudePath); err != nil {
+	// Ctrl-C cancels the in-flight batch; run exits cleanly and resume continues
+	// from the first unlabeled screen next launch. Suits the fanless-Air multi-day run.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	opt := options{
+		in: *in, out: *out, park: *park, batch: *batch,
+		model: *model, effort: *effort, workdir: *workdir,
+		pyryPath: *pyryPath, minConf: *minConf,
+	}
+	if err := run(ctx, opt); err != nil {
 		fmt.Fprintf(os.Stderr, "corpus-label: %v\n", err)
 		os.Exit(1)
 	}
@@ -67,28 +101,60 @@ func main() {
 
 // run wires the pipeline: read -in → select (resume or re-pass) → prioritize →
 // batch → label loop with per-batch persist-or-park → aggregate counts.
-func run(inPath, outPath, parkPath string, batchSize int, model string, minConf float64, claudePath string) error {
-	samples, err := readSamples(inPath)
+func run(ctx context.Context, opt options) error {
+	samples, err := readSamples(opt.in)
 	if err != nil {
 		return fmt.Errorf("reading -in: %w", err)
 	}
 
-	l := &labeler{claudePath: claudePath, model: model, labels: taxonomyLabels(), tax: taxonomySet()}
-	repass := model != defaultModel
+	// One minimal system prompt, written once and reused across every batch: it
+	// steers the judge to a pure text answer and needs no per-batch rebuild.
+	sysPrompt, cleanup, err := writeSystemPrompt()
+	if err != nil {
+		return fmt.Errorf("writing system prompt: %w", err)
+	}
+	defer cleanup()
 
-	queue, persist, err := plan(samples, outPath, repass, minConf)
+	l := &labeler{
+		runner: &pyryRunner{
+			pyryPath:         opt.pyryPath,
+			model:            opt.model,
+			effort:           opt.effort,
+			workdir:          opt.workdir,
+			systemPromptPath: sysPrompt,
+			maxTurns:         labelMaxTurns,
+			timeout:          batchTimeout,
+		},
+		model:  opt.model,
+		labels: taxonomyLabels(),
+		tax:    taxonomySet(),
+	}
+	repass := opt.model != defaultModel
+
+	queue, persist, err := plan(samples, opt.out, repass, opt.minConf)
 	if err != nil {
 		return err
 	}
 
 	queue = prioritize(queue)
-	batches := batchesOf(queue, batchSize)
+	batches := batchesOf(queue, opt.batch)
 
 	labeled, parked := 0, 0
+	interrupted := false
 	for _, b := range batches {
-		recs, park := l.labelBatch(b)
+		if ctx.Err() != nil {
+			interrupted = true
+			break
+		}
+		recs, park := l.labelBatch(ctx, b)
+		if ctx.Err() != nil {
+			// Interrupted mid-batch: the in-flight batch was cancelled, not failed.
+			// Don't persist or park it — resume re-does it next run.
+			interrupted = true
+			break
+		}
 		if park != nil {
-			if err := appendPark(parkPath, *park); err != nil {
+			if err := appendPark(opt.park, *park); err != nil {
 				return fmt.Errorf("writing -park: %w", err)
 			}
 			parked += len(park.Hashes)
@@ -103,6 +169,9 @@ func run(inPath, outPath, parkPath string, batchSize int, model string, minConf 
 	// stdout: aggregate counts ONLY — never grid content or a label's free text.
 	fmt.Printf("mode=%s in=%d queued=%d batches=%d labeled=%d parked=%d\n",
 		modeName(repass), len(samples), len(queue), len(batches), labeled, parked)
+	if interrupted {
+		fmt.Fprintln(os.Stderr, "corpus-label: interrupted — re-run to resume from the first unlabeled screen")
+	}
 	return nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -257,26 +258,45 @@ func appendPark(path string, p parkRecord) (err error) {
 	return w.Flush()
 }
 
-// rewriteLabels writes the full record set to path (truncating). Re-pass uses it to
-// overwrite updated entries; the labels file is low-thousands lines, so a full
-// rewrite per batch is fine and keeps re-pass resumable.
+// rewriteLabels atomically writes the full record set to path. Re-pass uses it to
+// overwrite updated entries every batch; the labels file is low-thousands lines, so a
+// full rewrite is fine. It writes to a temp file in the same directory, fsyncs, then
+// renames over path — so a kill mid-write leaves the temp file untouched and the
+// previous -out intact, keeping re-pass resumable. A plain truncate-then-write would
+// leave -out truncated on a mid-write crash, losing labels resume can't recover.
 func rewriteLabels(path string, recs []labelRecord) (err error) {
-	f, err := os.Create(path)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".labels-*.tmp")
 	if err != nil {
 		return err
 	}
+	tmpName := tmp.Name()
+	// Remove the temp file on any failure before the rename lands; a successful
+	// rename consumes it, so err == nil leaves nothing to clean.
 	defer func() {
-		if cerr := f.Close(); cerr != nil && err == nil {
-			err = cerr
+		if err != nil {
+			_ = os.Remove(tmpName)
 		}
 	}()
-	w := bufio.NewWriter(f)
+
+	w := bufio.NewWriter(tmp)
 	for _, r := range recs {
-		if err := writeJSONLine(w, r); err != nil {
-			return err
+		if werr := writeJSONLine(w, r); werr != nil {
+			tmp.Close()
+			return werr
 		}
 	}
-	return w.Flush()
+	if ferr := w.Flush(); ferr != nil {
+		tmp.Close()
+		return ferr
+	}
+	if serr := tmp.Sync(); serr != nil {
+		tmp.Close()
+		return serr
+	}
+	if cerr := tmp.Close(); cerr != nil {
+		return cerr
+	}
+	return os.Rename(tmpName, path)
 }
 
 func writeJSONLine(w *bufio.Writer, v any) error {

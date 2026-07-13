@@ -1,7 +1,9 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -179,6 +181,42 @@ func TestAppendAndReadLabelsRoundTrip(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].Hash != "a" || got[1].Hash != "b" {
 		t.Errorf("round-trip = %+v, want a then b appended", got)
+	}
+}
+
+// TestRewriteLabels_ReplacesAndLeavesNoTemp pins the re-pass rewrite: it fully
+// replaces -out (never appends) and leaves no temp file behind on success. The
+// temp-then-rename shape is what keeps a mid-write kill from truncating -out.
+func TestRewriteLabels_ReplacesAndLeavesNoTemp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.jsonl")
+
+	first := []labelRecord{
+		{Hash: "a", Label: "idle", Confidence: 0.9, Model: "haiku"},
+		{Hash: "b", Label: "busy", Confidence: 0.8, Model: "haiku"},
+	}
+	if err := rewriteLabels(path, first); err != nil {
+		t.Fatal(err)
+	}
+	// A second rewrite must fully replace, not append.
+	second := []labelRecord{{Hash: "a", Label: "idle", Confidence: 0.95, Model: "sonnet"}}
+	if err := rewriteLabels(path, second); err != nil {
+		t.Fatal(err)
+	}
+
+	got := readLabelsT(t, path)
+	if len(got) != 1 || got[0].Model != "sonnet" || got[0].Confidence != 0.95 {
+		t.Fatalf("rewrite = %+v, want the single sonnet record (full replace)", got)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("leftover temp file after a successful rewrite: %s", e.Name())
+		}
 	}
 }
 
