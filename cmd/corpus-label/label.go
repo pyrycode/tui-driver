@@ -1,12 +1,9 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"os"
-	"os/exec"
 	"sort"
 	"strings"
 
@@ -31,12 +28,6 @@ const (
 // surfaces situations no enum value covers (the dot-frame spinner gap #243 was
 // found exactly this way, by reading frames rather than by any detector).
 const unusualPrefix = "unusual:"
-
-// apiKeyEnv is the Anthropic API-key variable. Its presence in the child env flips
-// claude from the ambient subscription login to metered billing — the exact outcome
-// this design avoids — so scrubEnv REMOVES it (not blanks it), leaving the child's
-// os.LookupEnv(apiKeyEnv) returning ok == false. See CLAUDE.md (Drop-In Contract).
-const apiKeyEnv = "ANTHROPIC_API_KEY"
 
 // screenHashMarker prefixes each screen block in the prompt so a response object
 // can be tied back to its screen; the fake claude in tests reads the batch hashes
@@ -82,27 +73,10 @@ func validConfidence(c float64) bool {
 	return c >= 0 && c <= 1
 }
 
-// scrubEnv returns env with every apiKeyEnv entry removed. Only this one variable
-// is stripped (AC-specified); over-scrubbing risks breaking the subscription login.
-func scrubEnv(env []string) []string {
-	out := make([]string, 0, len(env))
-	for _, kv := range env {
-		key := kv
-		if i := strings.IndexByte(kv, '='); i >= 0 {
-			key = kv[:i]
-		}
-		if key == apiKeyEnv {
-			continue
-		}
-		out = append(out, kv)
-	}
-	return out
-}
-
-// buildPrompt renders the batch into a single prompt for `claude -p`: the allowed
+// buildPrompt renders the batch into a single prompt for the judge: the allowed
 // labels, the unusual: instruction, the JSON-array output contract, then one block
-// per screen tagged with its hash and raw grid. Grids appear ONLY here (the child's
-// stdin) — never on argv, never on this process's stdout.
+// per screen tagged with its hash and raw grid. Grids appear ONLY here (the judge's
+// prompt file) — never on argv, never on this process's stdout, never in a record.
 func buildPrompt(batch []sample, labels []string) string {
 	var b strings.Builder
 	b.WriteString("You are an independent judge classifying terminal screen captures from the claude CLI.\n")
@@ -127,27 +101,29 @@ func buildPrompt(batch []sample, labels []string) string {
 	return b.String()
 }
 
-// labeler runs `claude -p` batches on the ambient subscription login.
+// labeler labels batches through a runner (production: one fresh `pyry agent-run`
+// per batch on the subscription login).
 type labeler struct {
-	claudePath string          // -claude; the test injection seam
-	model      string          // -model; passed via --model
-	labels     []string        // sorted taxonomy for the prompt
-	tax        map[string]bool // taxonomy membership set for validation
+	runner runner          // the per-batch judge call; the test injection seam
+	model  string          // -model; recorded on each label and park record
+	labels []string        // sorted taxonomy for the prompt
+	tax    map[string]bool // taxonomy membership set for validation
 }
 
-// labelBatch labels one batch: build prompt → spawn claude -p → parse+validate.
+// labelBatch labels one batch: build prompt → run the judge → parse+validate.
 // Malformed output (bad JSON, hash mismatch, invalid label/confidence) or a
-// spawn/non-zero exit is retried once; still malformed → the batch is parked with
-// the verbatim last response (returned as parked, labels nil). Never drops a screen,
-// never crashes the run.
-func (l *labeler) labelBatch(batch []sample) (labels []labelRecord, parked *parkRecord) {
+// runner error (non-zero exit, timeout, unparseable result) is retried once;
+// still malformed → the batch is parked with the verbatim last response
+// (returned as parked, labels nil). Never drops a screen, never crashes the run.
+func (l *labeler) labelBatch(ctx context.Context, batch []sample) (labels []labelRecord, parked *parkRecord) {
 	prompt := buildPrompt(batch, l.labels)
 	var lastRaw string
 	for attempt := 1; attempt <= 2; attempt++ {
-		raw, err := l.spawn(prompt)
+		raw, err := l.runner.run(ctx, prompt)
 		if err != nil {
-			// A spawn/non-zero exit is treated as malformed for this attempt; keep
-			// whatever stdout came back plus the error for the park record.
+			// A runner error is treated as malformed for this attempt. raw is
+			// empty on error (the runner never returns grid-bearing stdout), so
+			// the park record captures only the error text.
 			lastRaw = strings.TrimSpace(raw + "\n" + err.Error())
 			continue
 		}
@@ -164,20 +140,6 @@ func (l *labeler) labelBatch(batch []sample) (labels []labelRecord, parked *park
 		Attempts: 2,
 		Model:    l.model,
 	}
-}
-
-// spawn runs `claude -p --model <model>` with the prompt on stdin and the env
-// scrubbed of the API key, capturing stdout. A non-zero exit returns an error with
-// whatever stdout was produced (the caller treats it as malformed).
-func (l *labeler) spawn(prompt string) (string, error) {
-	cmd := exec.Command(l.claudePath, "-p", "--model", l.model)
-	cmd.Env = scrubEnv(os.Environ())
-	cmd.Stdin = strings.NewReader(prompt)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = io.Discard
-	err := cmd.Run()
-	return out.String(), err
 }
 
 // parseResponse extracts the outermost JSON array from raw (models may wrap it in
