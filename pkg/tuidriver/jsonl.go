@@ -134,16 +134,42 @@ type ContentBlock struct {
 	Raw  map[string]any
 }
 
-// TailJSONL opens path, seeks to startOffset, and spawns a goroutine
-// that reads lines, parses each as JSON into a JSONLEntry, and emits
-// them on the returned channel. Use 0 for startOffset to start at the
-// beginning; use a previously recorded offset (e.g. f.Tell()-ish) to
-// resume mid-file.
+// TailFromEnd, passed as TailJSONL's startOffset, starts the tail at the
+// current end of the tail's OWN fd — the fd-agnostic way to say "skip
+// existing content, stream only future appends," without a caller
+// measuring size against a foreign os.Stat.
+const TailFromEnd int64 = -1
+
+// TailJSONL opens path, resolves the tail's start position against its
+// OWN open fd, and spawns a goroutine that reads lines, parses each as
+// JSON into a JSONLEntry, and emits them on the returned channel.
 //
-// Returns an error synchronously if the file cannot be opened or the
-// seek fails — both indicate a programmer error or permission issue
-// that polling will not resolve. Use WaitForSessionJSONL first to
-// guarantee the file exists.
+// The start position is derived from startOffset and the size of the
+// tail's own fd (never a caller-precomputed offset measured against a
+// foreign os.Stat):
+//
+//   - 0 starts from the beginning.
+//   - TailFromEnd (-1) starts from the current end of the tail's own
+//     fd — "skip existing content, stream only future appends."
+//   - A positive offset is clamped to the own-fd size: an oversized or
+//     stale offset starts at the end (skipping everything that exists),
+//     never past content. A seek beyond EOF does not error on a regular
+//     file, so clamping — not a raw seek — is what keeps the reader on
+//     real bytes.
+//   - Any other negative offset (< -1) is rejected as a programmer
+//     error; only TailFromEnd is a legal negative.
+//
+// The size is read via f.Stat() and the seek via f.Seek() on the SAME
+// open fd, so the window between them is not a TOCTOU: within one fd an
+// append-only log can only grow, so seekTo <= size stays true-or-
+// conservative (a grown file just re-reads a few appended lines). Do
+// not "harden" this window away — the cross-fd race it replaces is what
+// this ownership inversion exists to close.
+//
+// Returns an error synchronously if the file cannot be opened, stat'd,
+// or the seek fails, or if startOffset is an illegal negative — all
+// indicate a programmer error or permission issue that polling will not
+// resolve. Use WaitForSessionJSONL first to guarantee the file exists.
 //
 // The channel is closed when ctx is cancelled or when an
 // unrecoverable read error occurs (rare on an append-only file). The
@@ -169,13 +195,31 @@ type ContentBlock struct {
 //	if err != nil { /* … */ }
 //	for ev := range entries { /* … */ }
 func TailJSONL(ctx context.Context, path string, startOffset int64) (<-chan JSONLEntry, error) {
+	if startOffset < TailFromEnd {
+		return nil, fmt.Errorf("tail session jsonl %s: invalid negative startOffset %d (only %d/TailFromEnd is a legal negative)", path, startOffset, TailFromEnd)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open session jsonl %s: %w", path, err)
 	}
-	if _, serr := f.Seek(startOffset, io.SeekStart); serr != nil {
+	fi, err := f.Stat()
+	if err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("seek session jsonl %s to %d: %w", path, startOffset, serr)
+		return nil, fmt.Errorf("stat session jsonl %s: %w", path, err)
+	}
+	size := fi.Size()
+	var seekTo int64
+	switch {
+	case startOffset == TailFromEnd:
+		seekTo = size
+	default:
+		// startOffset >= 0; clamp to the own-fd size so an oversized or
+		// stale request lands at the end, never past content.
+		seekTo = min(startOffset, size)
+	}
+	if _, serr := f.Seek(seekTo, io.SeekStart); serr != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("seek session jsonl %s to %d: %w", path, seekTo, serr)
 	}
 	ch := make(chan JSONLEntry, defaultJSONLTailBuffer)
 	go tailJSONLLoop(ctx, f, ch)
