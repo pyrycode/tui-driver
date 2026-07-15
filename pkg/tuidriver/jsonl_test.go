@@ -510,6 +510,93 @@ func TestTailJSONL_OpenFailsWhenFileMissing(t *testing.T) {
 	}
 }
 
+// TestTailJSONL_OversizedOffsetClampsToEnd is the AC4 primary test: a
+// requested resume position larger than the tail's own fd content must
+// clamp to the own-fd end (skip everything that exists, stream appends),
+// never read past content. Pre-written a/b sit before the clamp point and
+// must never arrive; the post-tail append c must.
+func TestTailJSONL_OversizedOffsetClampsToEnd(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	body := []byte(`{"type":"a"}` + "\n" + `{"type":"b"}` + "\n")
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	oversized := int64(len(body)) + 9999
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := TailJSONL(ctx, path, oversized)
+	if err != nil {
+		t.Fatalf("TailJSONL = %v, want nil (oversized offset must clamp, not error)", err)
+	}
+	mustAppend(t, path, `{"type":"c"}`+"\n")
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "c" {
+		t.Errorf("first entry Type = %q, want %q (a/b are before the clamp point and must be skipped)", got, "c")
+	}
+	cancel()
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Errorf("expected channel close after cancel, got entry")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Errorf("channel did not close within 500ms after cancel")
+	}
+}
+
+// TestTailJSONL_FromEndSentinelSkipsExisting pins AC2: TailFromEnd
+// resolves to the current end of the tail's own fd without any caller
+// measuring size. The two pre-written lines are skipped; only the third,
+// appended after the tail is live, is delivered.
+func TestTailJSONL_FromEndSentinelSkipsExisting(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"a"}`+"\n"+`{"type":"b"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := TailJSONL(ctx, path, TailFromEnd)
+	if err != nil {
+		t.Fatalf("TailJSONL = %v, want nil", err)
+	}
+	mustAppend(t, path, `{"type":"c"}`+"\n")
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "c" {
+		t.Errorf("first entry Type = %q, want %q (TailFromEnd must skip existing a/b)", got, "c")
+	}
+	cancel()
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Errorf("expected channel close after cancel, got entry")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Errorf("channel did not close within 500ms after cancel")
+	}
+}
+
+// TestTailJSONL_InvalidNegativeOffset pins the documented policy: only
+// TailFromEnd (-1) is a legal negative; any other negative offset is
+// rejected synchronously (no fd is opened, ch is nil) with an error that
+// mentions the path.
+func TestTailJSONL_InvalidNegativeOffset(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"a"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ch, err := TailJSONL(context.Background(), path, -2)
+	if err == nil {
+		t.Fatalf("TailJSONL(_, -2) err = nil, want error")
+	}
+	if ch != nil {
+		t.Errorf("TailJSONL(_, -2) ch != nil, want nil")
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("err = %q, want it to mention path %q", err.Error(), path)
+	}
+}
+
 // textBlock builds a content block of type "text" with the given text.
 func textBlock(text string) ContentBlock {
 	return ContentBlock{Type: "text", Raw: map[string]any{"type": "text", "text": text}}
