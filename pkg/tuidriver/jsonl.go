@@ -182,6 +182,32 @@ const TailFromEnd int64 = -1
 // channel value, never two. EOF on a still-active log is treated as
 // "wait for more bytes" (sleep one poll tick, retry).
 //
+// Mid-tail recovery policy: at each EOF poll the loop re-checks the file
+// behind path for two failure modes and, on either, re-syncs to offset 0
+// of the current generation:
+//
+//   - Rotation — path is replaced by a new inode (log rotation, a
+//     /clear-style session swap). Detected when path's device/inode
+//     diverges from the tail's own open fd; the loop reopens path and
+//     reads the entire new generation from the beginning.
+//   - Truncation — the file is rewritten shorter under the same inode.
+//     Detected when path's size drops below the fd's read position; the
+//     loop reseeks the same fd to the beginning and re-reads, so there is
+//     no silent wrong-offset read.
+//
+// Both recover to offset 0, so a consumer may re-observe entries from the
+// top of the new/rewritten generation — these are genuinely new bytes
+// (the prior generation is gone), not duplicates of already-consumed live
+// content. Recovery is best-effort: a stat/open/seek error or a
+// rotation-window race (path momentarily absent between unlink and the
+// replacement's rename) parks the tail and retries next tick — it never
+// closes the channel with an error. Rotation detection needs inode
+// identity, which is Unix-only; on Windows it is a documented no-op
+// (truncation detection, size-only, still works). Known gap: a
+// truncate-then-regrow that rewrites past the stale offset within a
+// single poll window is not detected — the check runs at the EOF poll
+// only, not on every read.
+//
 // The channel is buffered (capacity 32 — matches the spike-side
 // observed-stable size). Consumers should drain promptly; if the
 // buffer fills, the tail goroutine blocks on the next send until
@@ -226,14 +252,117 @@ func TailJSONL(ctx context.Context, path string, startOffset int64) (<-chan JSON
 	return ch, nil
 }
 
+// statReader is the subset of *os.File the mid-tail rotation/truncation
+// guard needs (Name for reopen, Stat for identity, Seek for the read
+// offset). The production tail reader (*os.File) satisfies it; the
+// fault-injection seam (faultReader — Read+Close only) does not, so the
+// guard is a no-op under injection and no call site of tailJSONLLoop
+// changes.
+type statReader interface {
+	io.ReadCloser
+	Name() string
+	Stat() (os.FileInfo, error)
+	Seek(offset int64, whence int) (int64, error)
+}
+
+// fileIdentity is a file's (device, inode) generation identity. known is
+// false on platforms (Windows) that cannot supply one; two unknown
+// identities never compare equal (see sameGeneration), so rotation
+// detection self-disables where inode identity is unavailable. The
+// platform-tagged statIdentity (jsonl_ident_{other,windows}.go) is the
+// only producer.
+type fileIdentity struct {
+	dev, ino uint64
+	known    bool
+}
+
+// sameGeneration reports whether a and b name the same file generation.
+// True only when both identities are known and their device and inode
+// match — so two unknown identities (Windows) are never "same", which is
+// what makes rotation detection a no-op there rather than a misfire.
+func (a fileIdentity) sameGeneration(b fileIdentity) bool {
+	return a.known && b.known && a.dev == b.dev && a.ino == b.ino
+}
+
+// recoveryKind classifies the generation change checkTailGeneration
+// detected at the EOF poll, and thus how tailJSONLLoop re-syncs.
+type recoveryKind int
+
+const (
+	recoveryNone      recoveryKind = iota // no change (or a transient race); park.
+	recoveryRotated                       // path is a new inode; a fresh fd at offset 0.
+	recoveryTruncated                     // file shrank below the read offset; same fd, reseeked to 0.
+)
+
+// checkTailGeneration inspects the path behind sr (sr.Name()) for a
+// generation change at the EOF poll and, if found, prepares recovery per
+// the policy documented on TailJSONL. It is best-effort and never fails
+// the tail: any stat/open/seek error, or a rotation-window race, resolves
+// to recoveryNone so the caller simply parks and retries the next tick —
+// recovery never introduces a new terminal-error path.
+//
+//   - recoveryNone: no change (or a transient error); next == sr, park.
+//   - recoveryRotated: the path names a new inode; next is a FRESH
+//     *os.File opened at offset 0. The caller closes the old sr, then
+//     resets its reader and partial buffer.
+//   - recoveryTruncated: the file shrank below the read offset; next == sr,
+//     already reseeked to offset 0 (fd unchanged, the caller must NOT
+//     close it), and the caller resets its reader and partial buffer.
+func checkTailGeneration(sr statReader) (next statReader, kind recoveryKind) {
+	pathInfo, err := os.Stat(sr.Name())
+	if err != nil {
+		return sr, recoveryNone // ENOENT rotation window, permission, ENOTDIR — park.
+	}
+	fdInfo, err := sr.Stat()
+	if err != nil {
+		return sr, recoveryNone
+	}
+	// Rotation: the path now names a different generation (device/inode)
+	// than our still-open fd. Requires both identities known (Unix); on
+	// Windows both are unknown, so this branch never fires.
+	pathID := statIdentity(pathInfo)
+	fdID := statIdentity(fdInfo)
+	if pathID.known && fdID.known && !pathID.sameGeneration(fdID) {
+		newFile, oerr := os.Open(sr.Name())
+		if oerr != nil {
+			return sr, recoveryNone // stat saw the new inode but open raced/failed — keep old fd, retry.
+		}
+		return newFile, recoveryRotated
+	}
+	// Truncation: same generation, but the file shrank below where we have
+	// read to. At EOF the fd position is the high-water mark of bytes
+	// pulled off disk (bufio has drained), so a size below it means bytes
+	// we already consumed were discarded by a rewrite. Strict < so a file
+	// read exactly to its end (size == offset) is never a false positive.
+	readOffset, serr := sr.Seek(0, io.SeekCurrent)
+	if serr != nil {
+		return sr, recoveryNone
+	}
+	if pathInfo.Size() < readOffset {
+		if _, serr := sr.Seek(0, io.SeekStart); serr != nil {
+			return sr, recoveryNone
+		}
+		return sr, recoveryTruncated
+	}
+	return sr, recoveryNone
+}
+
 // tailJSONLLoop owns r and ch from entry. It closes both on every exit
 // path. Runs on its own goroutine spawned by TailJSONL. The reader is
 // typed io.ReadCloser (not *os.File) purely so tests can inject a
 // fault reader; TailJSONL passes the opened *os.File and the production
 // behaviour is unchanged.
+//
+// Mid-tail, each EOF poll re-checks the file behind the path for rotation
+// (a new inode) or truncation (the file rewritten shorter) via
+// checkTailGeneration and re-syncs to offset 0 of the current generation
+// — see TailJSONL's doc comment for the recovery policy. r is reassigned
+// on a rotation reopen, so the deferred Close is a closure over r (not a
+// method value bound to the original fd); old fds are closed explicitly at
+// each rotation and the final fd by the deferred closure.
 func tailJSONLLoop(ctx context.Context, r io.ReadCloser, ch chan<- JSONLEntry) {
 	defer close(ch)
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	reader := bufio.NewReader(r)
 	var partial []byte
 	for {
@@ -261,6 +390,20 @@ func tailJSONLLoop(ctx context.Context, r io.ReadCloser, ch chan<- JSONLEntry) {
 				return
 			}
 		case rerr == io.EOF:
+			// At EOF the tail is stranded on the current fd — the point to
+			// re-check for a rotated/truncated generation. Only *os.File
+			// (statReader) is inspectable; the fault seam is skipped.
+			if sr, ok := r.(statReader); ok {
+				if next, kind := checkTailGeneration(sr); kind != recoveryNone {
+					if kind == recoveryRotated {
+						_ = r.Close() // release the old generation's fd.
+					}
+					r = next
+					reader.Reset(r)
+					partial = partial[:0] // drop any partial line from the gone generation.
+					continue              // read the recovered file now; skip the poll-sleep.
+				}
+			}
 			select {
 			case <-ctx.Done():
 				return

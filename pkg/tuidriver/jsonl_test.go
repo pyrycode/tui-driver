@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -934,6 +935,267 @@ func TestAssistantUsage(t *testing.T) {
 			}
 		})
 	}
+}
+
+// assertTailClosed asserts ch closes within a tick budget. Mirrors the
+// inline close-assertion the other tail tests use after cancelling ctx.
+func assertTailClosed(t *testing.T, ch <-chan JSONLEntry) {
+	t.Helper()
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Errorf("expected channel close after cancel, got entry")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Errorf("channel did not close within 500ms after cancel")
+	}
+}
+
+// rotateInto replaces path with a brand-new inode holding content, via an
+// atomic rename-over from a sibling temp file. The temp file is written
+// and closed (Close flushes) before the rename makes it visible at path,
+// so the tail's fresh reopen sees durable bytes. Works whether or not
+// path currently exists (rename creates it if absent).
+func rotateInto(t *testing.T, dir, path, content string) {
+	t.Helper()
+	tmp := filepath.Join(dir, "rotate.tmp")
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		t.Fatalf("write rotate tmp: %v", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatalf("rename rotate over %s: %v", path, err)
+	}
+}
+
+// writeSync writes s to f and fsyncs. The rotation/truncation tests hold
+// a write handle open across the write→reopen boundary, so they cannot
+// rely on mustAppend's close-per-append flush — macOS APFS defers
+// cross-handle visibility without an explicit Sync.
+func writeSync(t *testing.T, f *os.File, s string) {
+	t.Helper()
+	if _, err := f.WriteString(s); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+}
+
+// TestTailJSONL_RotationRecoversNewGeneration exercises AC1: a mid-tail
+// rotation (path replaced by a new inode with different-length content)
+// is detected and the tail delivers the new generation from offset 0.
+func TestTailJSONL_RotationRecoversNewGeneration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"old1"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := TailJSONL(ctx, path, 0)
+	if err != nil {
+		t.Fatalf("TailJSONL = %v, want nil", err)
+	}
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "old1" {
+		t.Fatalf("entry 1 Type = %q, want %q", got, "old1")
+	}
+	rotateInto(t, dir, path, `{"type":"new1"}`+"\n"+`{"type":"new2"}`+"\n")
+	if got := mustReceive(t, ch, time.Second).Type; got != "new1" {
+		t.Errorf("post-rotation entry 1 Type = %q, want %q (new generation from offset 0)", got, "new1")
+	}
+	if got := mustReceive(t, ch, time.Second).Type; got != "new2" {
+		t.Errorf("post-rotation entry 2 Type = %q, want %q", got, "new2")
+	}
+	cancel()
+	assertTailClosed(t, ch)
+}
+
+// TestTailJSONL_RotationSameLengthDetectedByInode is the AC1 critical
+// case: the replacement is byte-length-identical to the original, so only
+// inode identity (not size) can distinguish it. Recovery must still fire.
+func TestTailJSONL_RotationSameLengthDetectedByInode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	old := `{"type":"aaaa"}` + "\n"
+	neu := `{"type":"bbbb"}` + "\n"
+	if len(old) != len(neu) {
+		t.Fatalf("test bug: old (%d) and new (%d) must be byte-length identical", len(old), len(neu))
+	}
+	if err := os.WriteFile(path, []byte(old), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := TailJSONL(ctx, path, 0)
+	if err != nil {
+		t.Fatalf("TailJSONL = %v, want nil", err)
+	}
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "aaaa" {
+		t.Fatalf("entry 1 Type = %q, want %q", got, "aaaa")
+	}
+	rotateInto(t, dir, path, neu)
+	if got := mustReceive(t, ch, time.Second).Type; got != "bbbb" {
+		t.Errorf("post-rotation Type = %q, want %q (same-length rotation must be caught by inode, not size)", got, "bbbb")
+	}
+	cancel()
+	assertTailClosed(t, ch)
+}
+
+// TestTailJSONL_TruncationRecovers exercises AC2: the file is rewritten
+// shorter under the same inode; the tail detects size < read offset,
+// reseeks to 0, and delivers the rewritten content with no wrong-offset
+// garbage.
+func TestTailJSONL_TruncationRecovers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	writeSync(t, f, `{"type":"old1"}`+"\n"+`{"type":"old2"}`+"\n")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := TailJSONL(ctx, path, 0)
+	if err != nil {
+		t.Fatalf("TailJSONL = %v, want nil", err)
+	}
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "old1" {
+		t.Fatalf("entry 1 Type = %q, want %q", got, "old1")
+	}
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "old2" {
+		t.Fatalf("entry 2 Type = %q, want %q", got, "old2")
+	}
+	if err := f.Truncate(0); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatalf("seek: %v", err)
+	}
+	writeSync(t, f, `{"type":"new1"}`+"\n")
+	if got := mustReceive(t, ch, time.Second).Type; got != "new1" {
+		t.Errorf("post-truncation Type = %q, want %q (reseek to 0, no wrong-offset read)", got, "new1")
+	}
+	cancel()
+	assertTailClosed(t, ch)
+}
+
+// TestTailJSONL_TruncateToEmptyThenRegrow exercises the truncate-to-0,
+// let the tail observe the empty file, then regrow path: entries land
+// from offset 0.
+func TestTailJSONL_TruncateToEmptyThenRegrow(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+	writeSync(t, f, `{"type":"old1"}`+"\n")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := TailJSONL(ctx, path, 0)
+	if err != nil {
+		t.Fatalf("TailJSONL = %v, want nil", err)
+	}
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "old1" {
+		t.Fatalf("entry 1 Type = %q, want %q", got, "old1")
+	}
+	if err := f.Truncate(0); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatalf("seek: %v", err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	// Let the tail observe the now-empty file before it regrows.
+	time.Sleep(150 * time.Millisecond)
+	writeSync(t, f, `{"type":"r1"}`+"\n"+`{"type":"r2"}`+"\n")
+	if got := mustReceive(t, ch, time.Second).Type; got != "r1" {
+		t.Errorf("regrow entry 1 Type = %q, want %q", got, "r1")
+	}
+	if got := mustReceive(t, ch, time.Second).Type; got != "r2" {
+		t.Errorf("regrow entry 2 Type = %q, want %q", got, "r2")
+	}
+	cancel()
+	assertTailClosed(t, ch)
+}
+
+// TestTailJSONL_PlainAppendNoRecovery pins the no-false-positive case: a
+// normal append grows the file under the same inode and must NOT trigger
+// recovery or re-deliver already-consumed entries.
+func TestTailJSONL_PlainAppendNoRecovery(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"a"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := TailJSONL(ctx, path, 0)
+	if err != nil {
+		t.Fatalf("TailJSONL = %v, want nil", err)
+	}
+	var got []string
+	got = append(got, mustReceive(t, ch, 500*time.Millisecond).Type)
+	mustAppend(t, path, `{"type":"b"}`+"\n")
+	got = append(got, mustReceive(t, ch, 500*time.Millisecond).Type)
+	mustAppend(t, path, `{"type":"c"}`+"\n")
+	got = append(got, mustReceive(t, ch, 500*time.Millisecond).Type)
+	// No fourth entry: a recovery mis-fire would reopen from 0 and
+	// re-deliver a (or b), surfacing here as an extra value.
+	select {
+	case extra, ok := <-ch:
+		if ok {
+			t.Errorf("unexpected re-delivered entry after plain appends: %+v", extra)
+		}
+	case <-time.After(200 * time.Millisecond):
+	}
+	if want := []string{"a", "b", "c"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("delivered = %v, want %v (each entry exactly once, in order)", got, want)
+	}
+	cancel()
+	assertTailClosed(t, ch)
+}
+
+// TestTailJSONL_RotationWindowENOENTGraceful pins the error-handling
+// contract: removing the path with no replacement parks the tail (no
+// crash, no garbage, no close); a later new file at the path recovers.
+func TestTailJSONL_RotationWindowENOENTGraceful(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"old1"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := TailJSONL(ctx, path, 0)
+	if err != nil {
+		t.Fatalf("TailJSONL = %v, want nil", err)
+	}
+	if got := mustReceive(t, ch, 500*time.Millisecond).Type; got != "old1" {
+		t.Fatalf("entry 1 Type = %q, want %q", got, "old1")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	// The tail must park across the gap — neither an entry nor a close.
+	select {
+	case ev, ok := <-ch:
+		if ok {
+			t.Fatalf("unexpected entry after removal: %+v", ev)
+		}
+		t.Fatalf("channel closed after removal — tail must park, not close")
+	case <-time.After(300 * time.Millisecond):
+	}
+	rotateInto(t, dir, path, `{"type":"new1"}`+"\n")
+	if got := mustReceive(t, ch, time.Second).Type; got != "new1" {
+		t.Errorf("post-recreate Type = %q, want %q", got, "new1")
+	}
+	cancel()
+	assertTailClosed(t, ch)
 }
 
 func TestWaitForSessionJSONL_DeadlineExpiry(t *testing.T) {
