@@ -708,6 +708,57 @@ func TestEvents_TailJSONLErrorBubbles(t *testing.T) {
 	}
 }
 
+// TestScreenEvents_ModalWithoutTranscript is the ScreenEvents counterpart to
+// TestEvents_TailJSONLErrorBubbles: the exact situation where Events fails (no
+// transcript on disk), ScreenEvents must still surface a modal off the PTY grid.
+// This is the pyrycode #1066 case — a permission-blocked minted claude writes no
+// JSONL, so the modal that would unblock it can only come from the screen.
+func TestScreenEvents_ModalWithoutTranscript(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A permission modal already on the grid; NO jsonlPath is ever passed.
+	s := &Session{buffer: NewBuffer(0)}
+	s.buffer.Append([]byte("Do you want to proceed\r\n\xe2\x9d\xaf 1. Yes"))
+
+	ch := s.ScreenEvents(ctx)
+	ev := mustReceiveEvent(t, ch, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyModalShown {
+		t.Fatalf("Kind = %v, want EventKindPtyModalShown", ev.Kind)
+	}
+	if ev.Modal != ModalClassPermission {
+		t.Errorf("Modal = %q, want %q", ev.Modal, ModalClassPermission)
+	}
+	if ev.Source != EventSourcePty {
+		t.Errorf("Source = %v, want EventSourcePty", ev.Source)
+	}
+
+	cancel()
+	assertEventChClosed(t, ch, 500*time.Millisecond)
+}
+
+// TestScreenEvents_NoStallWithoutTranscript pins the stall suppression: a mid-turn
+// PTY-quiet screen (not idle, no modal) satisfies the stall predicate's screen
+// conditions, but with no transcript ScreenEvents must NOT emit
+// EventKindStallDetected — stall is a JSONL-progress signal.
+func TestScreenEvents_NoStallWithoutTranscript(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s := &Session{buffer: NewBuffer(0)}
+	s.buffer.Append(stallSnap) // "working" — not idle, not thinking, no modal/banner
+
+	ch := s.ScreenEvents(ctx)
+	select {
+	case ev, ok := <-ch:
+		if ok && ev.Kind == EventKindStallDetected {
+			t.Fatalf("ScreenEvents emitted EventKindStallDetected without a transcript; stall must be suppressed")
+		}
+	case <-time.After(6 * DefaultPollInterval):
+		// no event within several ticks — correct (stall suppressed, no other axis fires)
+	}
+}
+
 // stallSnap is a mid-turn snapshot: no ❯ (so IsIdle is false → stall
 // condition (a) holds) and no ✻/modal/banner anchors (so no other merge
 // axis fires). It isolates the stall arm from the idle/thinking/modal/
