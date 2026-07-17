@@ -195,6 +195,32 @@ func (s *Session) Events(ctx context.Context, jsonlPath string, startOffset int6
 	return out, nil
 }
 
+// ScreenEvents is Events without a JSONL transcript: it spawns the same merge
+// loop but tails no file, so it emits ONLY the screen-derived axes
+// (idle / thinking / modal / mcp-failure / network-failure) and never a JSONL
+// entry, an end-of-turn, or a stall event. Because it opens no file it cannot
+// fail, so it returns the channel directly with no error.
+//
+// Use it for consumers that need screen/modal events BEFORE (or without) a
+// session transcript. Motivating case: surfacing a permission modal on a
+// per-conversation session that has not written its JSONL yet. Interactive claude
+// under --session-id defers JSONL creation until it produces output, and a claude
+// blocked on a permission prompt produces none — so Events would block in
+// WaitForSessionJSONL forever while the very modal that would unblock it goes
+// unseen. ScreenEvents reads the modal straight off the PTY grid instead.
+//
+// The stall axis (EventKindStallDetected) is a turn-progress signal defined
+// against JSONL arrival, so it is suppressed here (no transcript ⇒ no stall).
+// The returned channel is buffered (capacity defaultEventBuffer) and closes when
+// ctx is cancelled or the session terminates, same as Events.
+func (s *Session) ScreenEvents(ctx context.Context) <-chan Event {
+	out := make(chan Event, defaultEventBuffer)
+	// nil jsonlCh ⇒ the merge loop tails no file and never fires the stall arm;
+	// ptyQuietLimit is unused in that mode, so 0 is passed.
+	go mergeEvents(ctx, s.buffer.Snapshot, s.gridDims, s.buffer.QuietFor, 0, nil, out, DefaultPollInterval)
+	return out
+}
+
 // mergeEvents owns the unified merge loop. Polls snapshot at
 // pollInterval for PTY-state transitions (idle / thinking / modal /
 // mcp-failure / network-failure / stall), drains entries from jsonlCh,
@@ -301,7 +327,10 @@ func mergeEvents(
 			// quiet beyond the limit AND no JSONL progress within that
 			// same window. Computed here (not in classify, which sees
 			// only the snapshot, never the quiet timings).
-			cur.stalled = !cur.idle &&
+			// Stall is a turn-progress signal defined against JSONL arrival, so a
+			// screen-only subscription (nil jsonlCh, e.g. ScreenEvents) never stalls.
+			cur.stalled = jsonlCh != nil &&
+				!cur.idle &&
 				quietFor() > ptyQuietLimit &&
 				now.Sub(lastJsonlAt) > ptyQuietLimit
 			// Modal axis dominates: emit modal transitions first
