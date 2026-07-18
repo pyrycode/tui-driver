@@ -285,6 +285,15 @@ func TestDetectModalClassRealFixtures(t *testing.T) {
 		{"picker-snapshot.bin", ModalClassSlashPicker},
 		{"picker-truecolor-snapshot.bin", ModalClassSlashPicker},
 		{"permission-snapshot.bin", ModalClassPermission},
+		// #295: permission-snapshot.bin is a Bash-tool prompt ("Do you want to
+		// proceed?"). permission-write-snapshot.bin is a Write-tool prompt ("Do
+		// you want to create probe.txt?"), captured live off claude 2.1.199 at
+		// 120x40 via tuidriver.Spawn — the exact shape the daemon's interactive
+		// per-conversation session renders and the desktop#483 real-claude
+		// permission spec triggers. Its prompt line has NO "proceed", so the old
+		// single-phrase anchor classified it Unknown and no modal_shown ever
+		// reached the client. Pins the tool-independent prompt anchor.
+		{"permission-write-snapshot.bin", ModalClassPermission},
 		{"trust-folder-snapshot.bin", ModalClassTrustFolder},
 		// #222: real-screen fixtures captured live off claude 2.1.199 via
 		// spike-multiselect (/model, /permissions) and spike-ask-user. These
