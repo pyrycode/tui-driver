@@ -58,6 +58,32 @@ func TestParseModalContentPermission(t *testing.T) {
 	}
 }
 
+// #295: extraction must work on a Write-tool permission dialog, not only the
+// Bash "proceed" form. permission-write-snapshot.bin is a real claude 2.1.199
+// Write prompt captured live at 120x40. Its prompt line carries no "proceed",
+// so before the tool-independent anchor the whole modal classified Unknown and a
+// remote client got neither a modal_shown nor this typed content.
+func TestParseModalContentPermissionWrite(t *testing.T) {
+	got := ParseModalContent(loadFixture(t, "permission-write-snapshot.bin"))
+	if got == nil {
+		t.Fatal("ParseModalContent(permission-write) = nil, want non-nil")
+	}
+	want := &ModalContent{
+		Class:  ModalClassPermission,
+		Title:  "Create file",
+		Prompt: "Do you want to create probe.txt?",
+		Options: []ModalOption{
+			{Index: 1, Label: "Yes"},
+			{Index: 2, Label: "Yes, allow all edits during this session (shift+tab)"},
+			{Index: 3, Label: "No"},
+		},
+		Default: 1,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ParseModalContent(permission-write) =\n  %+v\nwant\n  %+v", got, want)
+	}
+}
+
 func TestParseModalContentTrustFolder(t *testing.T) {
 	got := ParseModalContent(loadFixture(t, "trust-folder-snapshot.bin"))
 	if got == nil {

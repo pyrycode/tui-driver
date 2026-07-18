@@ -86,13 +86,17 @@ const (
 //	                      gridHasTrustDialog (trust.go). #219: the header alone
 //	                      classified any on-screen quotation of it as the modal,
 //	                      a fatal false positive under the runner's abort policy.
-//	permission          → the proceed prompt (anchorPermissionSpaced) AND a
+//	permission          → the prompt prefix "Do you want to " (anchorPermissionSpaced,
+//	                      tool-independent — Bash/Read say "proceed", Write says
+//	                      "create X", Edit says "make this edit to X") AND a
 //	                      pointer-marked numbered option row directly below it —
 //	                      the dialog shape, region-scoped to the bottom overlay
 //	                      window (permissionRegionRows), via gridHasPermissionDialog
 //	                      (below). #242: the prompt alone classified any in-region
 //	                      quotation of it as the modal — a forgeable surface for the
-//	                      modal_shown / modal_answer consumers.
+//	                      modal_shown / modal_answer consumers. #295: the full
+//	                      "proceed" phrase missed every non-Bash prompt, so the
+//	                      anchor is the invariant prefix and the co-signal is the guard.
 //	model-select        → "Select model" AND a pointer-marked option row
 //	                      (gridHasSelectionDialog, #223) — the `/model` modal.
 //	permissions-config  → "Permissions" header AND all three Allow/Ask/Deny tabs
@@ -118,9 +122,24 @@ const (
 // structural co-signal fails it by default. Skipping this step is how the 173
 // and 217 forgeries shipped.
 var (
-	anchorMCPSpaced           = []byte("Manage MCP servers")
-	anchorAskUserSpaced       = []byte("Enter to select")
-	anchorPermissionSpaced    = []byte("Do you want to proceed")
+	anchorMCPSpaced     = []byte("Manage MCP servers")
+	anchorAskUserSpaced = []byte("Enter to select")
+	// anchorPermissionSpaced is the tool-INDEPENDENT prefix every claude
+	// permission prompt opens with, whatever tool is being approved:
+	//   Bash/Read → "Do you want to proceed?"
+	//   Write     → "Do you want to create <file>?"
+	//   Edit      → "Do you want to make this edit to <file>?"
+	// #242 originally anchored on the full Bash/Read phrase "Do you want to
+	// proceed", so a Write/Edit dialog (no "proceed") classified Unknown and the
+	// daemon never surfaced modal_shown for it — the desktop#483 / #295 bug,
+	// reproduced on the live per-conversation buffer (permission-write-snapshot.bin).
+	// The prompt WORDING is the forgeable, tool-varying part; matching only the
+	// invariant "Do you want to " prefix keeps the class tool-independent, and the
+	// forgery resistance stays in the structural co-signal, not the phrase — the
+	// bottom-region scope (permissionRegionRows) plus the pointer-marked option
+	// row directly below (gridHasPermissionDialog). The trailing space keeps it a
+	// prompt-line prefix, not a "do you want to" fragment mid-prose.
+	anchorPermissionSpaced    = []byte("Do you want to ")
 	anchorModelSelectSpaced   = []byte("Select model")
 	anchorPermissionsHeader   = []byte("Permissions")
 	anchorPermissionsTabAllow = []byte("Allow")
@@ -129,12 +148,13 @@ var (
 )
 
 // permissionRegionRows bounds how far up from the bottom of the rendered screen
-// the permission overlay's "Do you want to proceed?" line may sit and still
+// the permission overlay's "Do you want to …?" prompt line may sit and still
 // count. The real overlay renders that line ~5 rows from the bottom
 // (permission-snapshot.bin); the prompt always sits just above its numbered
 // options and the "(Esc to cancel)" footer, so this window covers it with
-// slack even for a modal with several options. Scoping the match to this bottom
-// window is what rejects an identical "Do you want to proceed?" phrase forged
+// slack even for a modal with several options (the Write dialog in
+// permission-write-snapshot.bin renders identically). Scoping the match to this
+// bottom window is what rejects an identical "Do you want to …?" phrase forged
 // higher up in the on-screen transcript body — the CRITICAL B case that a
 // whole-buffer or whole-grid match would misclassify as Permission.
 const permissionRegionRows = 12

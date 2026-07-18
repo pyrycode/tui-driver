@@ -160,6 +160,42 @@ func TestDetectModalClassPermissionRegion(t *testing.T) {
 	}
 }
 
+// TestDetectModalClassPermissionToolIndependent pins #295: the permission class
+// keys on the invariant "Do you want to " prompt prefix, so every tool's dialog
+// classifies, not just Bash/Read's "proceed". Each is a live-overlay shape (the
+// prompt in the bottom region with a ❯-marked option row below), so the
+// structural co-signal — not the phrase — is doing the guarding.
+func TestDetectModalClassPermissionToolIndependent(t *testing.T) {
+	body := strings.Repeat("transcript body line\r\n", 25)
+	prompts := []string{
+		"Do you want to proceed?",                     // Bash / Read
+		"Do you want to create probe.txt?",            // Write
+		"Do you want to make this edit to main.go?",   // Edit
+		"Do you want to make these edits to main.go?", // MultiEdit
+	}
+	for _, p := range prompts {
+		t.Run(p, func(t *testing.T) {
+			live := []byte(body + p + "\r\n❯ 1. Yes\r\n  2. No\r\n(Esc to cancel · Tab to amend)\r\n")
+			if got := DetectModalClass(live); got != ModalClassPermission {
+				t.Errorf("DetectModalClass(%q live overlay) = %q, want Permission", p, got)
+			}
+		})
+	}
+}
+
+// TestDetectModalClassPermissionPromptNeedsOptionRow pins that the broadened
+// prefix is not enough on its own: a "Do you want to …?" line in the bottom
+// region with NO ❯-marked option row below must stay Unknown. This is the
+// structural co-signal that keeps the wider anchor forgery-safe (#242/#295).
+func TestDetectModalClassPermissionPromptNeedsOptionRow(t *testing.T) {
+	body := strings.Repeat("transcript body line\r\n", 25)
+	// Prompt phrase in the bottom region, but followed by prose, not an option row.
+	noOpts := []byte(body + "Do you want to deploy the release now, or wait?\r\nLet me know.\r\n")
+	if got := DetectModalClass(noOpts); got != ModalClassUnknown {
+		t.Errorf("DetectModalClass(prompt without option row) = %q, want Unknown", got)
+	}
+}
+
 func TestDetectModalClassMatchesControlSequenceWrappedAnchor(t *testing.T) {
 	// Spaced anchor wrapped in CSI + OSC noise — the grid render consumes the
 	// control sequences and preserves the spacing, so the predicate still
