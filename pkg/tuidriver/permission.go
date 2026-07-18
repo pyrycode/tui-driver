@@ -104,13 +104,17 @@ func modalLines(text string) []string {
 	return lines
 }
 
-// parsePermissionModal extracts a permission modal. Layout (post-Render):
+// parsePermissionModal extracts a permission modal. Layout (post-Render), Bash
+// shown; the prompt line wording varies by tool (Write → "Do you want to create
+// probe.txt?", Edit → "Do you want to make this edit to X?"), which is why
+// lineHasPermissionPrompt matches only the invariant "Do you want to " prefix
+// (#295):
 //
 //	────────────…────────────        ← separator (modal top anchor)
 //	Bash command                     ← Title
 //	ls /tmp                          ← action detail (not captured)
 //	List files in /tmp               ← action detail (not captured)
-//	Do you want to proceed?          ← Prompt
+//	Do you want to proceed?          ← Prompt (Write: "Do you want to create X?")
 //	❯ 1. Yes                         ← option, ❯ → Default
 //	  2. Yes, allow reading from tmp/ from this project
 //	  3. No
@@ -217,11 +221,13 @@ func extractOptions(lines []string) (opts []ModalOption, def int) {
 	return opts, def
 }
 
-// lineHasPermissionPrompt reports whether line is the permission modal's
-// proceed question. line is a Render'd, space-normalized modal row, so the
-// space-preserved anchor is what matches. #154 removed the space-stripped
-// variant: it could never match a rendered line, so it was dead weight and the
-// last space-stripped classification anchor in the package.
+// lineHasPermissionPrompt reports whether line is the permission modal's prompt
+// question. line is a Render'd, space-normalized modal row, so the
+// space-preserved anchor is what matches. It keys on the tool-independent
+// "Do you want to " prefix (#295), so it locates the prompt on a Write/Edit
+// dialog too, not only the Bash/Read "proceed" phrasing. #154 removed the
+// space-stripped variant: it could never match a rendered line, so it was dead
+// weight and the last space-stripped classification anchor in the package.
 func lineHasPermissionPrompt(line string) bool {
 	return bytes.Contains([]byte(line), anchorPermissionSpaced)
 }
