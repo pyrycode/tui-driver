@@ -331,6 +331,14 @@ func TestDetectModalClassRealFixtures(t *testing.T) {
 		// reached the client. Pins the tool-independent prompt anchor.
 		{"permission-write-snapshot.bin", ModalClassPermission},
 		{"trust-folder-snapshot.bin", ModalClassTrustFolder},
+		// #300: trust-folder-snapshot.bin is a compact constructed fixture (header
+		// immediately above the option row). trust-folder-2.1.199-snapshot.bin is a
+		// real claude 2.1.199 trust dialog captured live at 120x40 — its layout now
+		// separates the "Quick safety check" header from the "❯ 1. Yes, I trust this
+		// folder" option row by 7 rows (a wrapped header, an explanatory line, and a
+		// "Security guide" link), which overran the old trustDialogLookahead=3 so the
+		// startup safety net missed it. Pins the widened lookahead.
+		{"trust-folder-2.1.199-snapshot.bin", ModalClassTrustFolder},
 		// #222: real-screen fixtures captured live off claude 2.1.199 via
 		// spike-multiselect (/model, /permissions) and spike-ask-user. These
 		// three classes had no rendered fixture before — ask-user's only .bin was

@@ -410,6 +410,16 @@ func TestNegativeSuitePositiveControls(t *testing.T) {
 	if !HasTrustModal(trust) {
 		t.Error("trust fixture: HasTrustModal = false, want true")
 	}
+	// #300: the real claude 2.1.199 trust dialog (header 7 rows above its option
+	// row) must fire BOTH the startup safety net (HasTrustModal) and the class.
+	// The compact constructed fixture above never exercised the widened lookahead.
+	trust2 := loadFixture(t, "trust-folder-2.1.199-snapshot.bin")
+	if !HasTrustModal(trust2) {
+		t.Error("trust 2.1.199 fixture: HasTrustModal = false, want true")
+	}
+	if got := DetectModalClass(trust2); got != ModalClassTrustFolder {
+		t.Errorf("trust 2.1.199 fixture: DetectModalClass = %q, want TrustFolder", got)
+	}
 	if got := DetectModalClass(loadFixture(t, "permission-snapshot.bin")); got != ModalClassPermission {
 		t.Errorf("permission fixture: DetectModalClass = %q, want Permission", got)
 	}
