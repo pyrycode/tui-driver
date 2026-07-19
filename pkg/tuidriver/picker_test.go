@@ -169,9 +169,10 @@ func TestSnapHasPickerHighlight(t *testing.T) {
 	}
 }
 
-// #151: isSlashPicker is the AND of grid-region row location and chrome. Truth
-// table over {on-screen /-row?, chrome?}. Fixtures use \r\n (the #150 grid
-// staircase lesson).
+// #151/#296: isSlashPicker is the AND of a bottom-region `/`-row BLOCK
+// (≥pickerRowBlockMin rows, #296) and chrome. Truth table over {row block?,
+// chrome?}, plus the #296 conscious-drop pin (a lone `/`-row + chrome is no longer
+// a picker). Fixtures use \r\n (the #150 grid staircase lesson).
 func TestIsSlashPicker(t *testing.T) {
 	const hl = "\x1b[38;2;177;185;249m"
 	cases := []struct {
@@ -179,8 +180,9 @@ func TestIsSlashPicker(t *testing.T) {
 		in   []byte
 		want bool
 	}{
-		{"row + chrome", []byte(hl + "/figma-use\x1b[39m\r\n"), true},
-		{"row, no chrome (lone path)", []byte("/Users/x/file.go\r\n"), false},
+		{"row block + chrome", []byte(hl + "/figma-use\x1b[39m\r\n" + hl + "/code-review\x1b[39m\r\n"), true},
+		{"single row + chrome (dropped #296)", []byte(hl + "/figma-use\x1b[39m\r\n"), false},
+		{"row block, no chrome (lone paths)", []byte("/Users/x/file.go\r\n/tmp/y/z.go\r\n"), false},
 		{"chrome, no /-row", []byte(hl + "hello\x1b[39m\r\n"), false},
 		{"neither (idle)", []byte("just some idle text\r\n"), false},
 		{"empty", nil, false},

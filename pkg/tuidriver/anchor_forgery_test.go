@@ -383,16 +383,91 @@ func TestSlashPickerRejectsBodyForgery(t *testing.T) {
 		})
 	}
 
-	// Positive control: a genuine single-match filtered picker whose /-row sits
-	// in the bottom region still classifies — the region scope must not silence a
-	// real picker (#237 AC). Same 20-row transcript above it as the forgeries, so
-	// the ONLY difference from a forgery is the /-row's screen position.
-	live := gridRows(append(append([]string{}, filler...), hl+"/figma-use  (figma) invoke this skill first")...)
+	// Positive control: a genuine picker — a BLOCK of `/`-command rows
+	// (≥pickerRowBlockMin, #296) in the bottom region — still classifies; the
+	// region scope must not silence a real picker (#237 AC). Same 20-row transcript
+	// above it as the forgeries, so the ONLY difference from a forgery is the
+	// in-region `/`-row block (two command rows, not one).
+	live := gridRows(append(append([]string{}, filler...),
+		hl+"/figma-use  (figma) invoke this skill first",
+		hl+"/code-review  (dev) review the pending diff")...)
 	if !isSlashPicker(live) {
-		t.Error("in-region single-match picker: isSlashPicker = false, want true")
+		t.Error("in-region picker block: isSlashPicker = false, want true")
 	}
 	if got := DetectModalClass(live); got != ModalClassSlashPicker {
-		t.Errorf("in-region single-match picker: DetectModalClass = %q, want SlashPicker", got)
+		t.Errorf("in-region picker block: DetectModalClass = %q, want SlashPicker", got)
+	}
+}
+
+// TestSlashPickerRejectsSingleRowForgery is the #296 content-forgery regression:
+// the residual class #237's region scope could not reach — a SINGLE bottom-region
+// `/`-row. A shell-command output line wrapping so its continuation begins with a
+// path token, or claude's footer tip wrapping to a `/`-command line, lands INSIDE
+// the input window (unlike the #237 body forgeries, which the region scope pushes
+// above it). Each takes the exact shape the pre-#296 detector accepted: one
+// in-region `/<word>` row (gridHasPickerRow) plus a picker-highlight shade
+// anywhere on the frame (snapHasPickerHighlight) — isSlashPicker's whole pre-#296
+// test. #296 binds the row half to picker SHAPE: a real picker is a BLOCK of
+// ≥pickerRowBlockMin command rows (gridHasPickerRowBlock), so a single stray
+// `/`-continuation no longer forges it.
+//
+// Mirrors the #244 non-vacuity idiom (TestPermissionsConfigTabForgeryRejectedByRowBoundColor):
+// assert both pre-fix weak signals ARE present, then assert the new structural
+// co-signal is the rejecter. Fixtures hand-built in Go via gridRows (\r\n flat
+// rows), never `.bin` bytes with raw ESC (Go json rejects 0x1b). The trigger
+// tokens appear only as test fixture byte data, never in prose (the arc's
+// self-reference discipline).
+func TestSlashPickerRejectsSingleRowForgery(t *testing.T) {
+	const (
+		hl    = "\x1b[38;5;153m" // index 153 → 175,215,255, a real picker-highlight shade
+		reset = "\x1b[39m"
+	)
+	// Each token is the leading text of a single wrapped continuation row that
+	// begins `/<word>` — the path forms and the footer-tip form the ticket names.
+	for _, tok := range []string{
+		"/Users/x/Projects/architecture/README.md",
+		"/Workspace/pyrycode/tui-driver/pkg",
+		"/dev/disk/by-id/nvme-eui.0025",
+		"/gradlew assembleRelease --stacktrace",
+		"/btw to ask a quick side question",
+	} {
+		t.Run(tok, func(t *testing.T) {
+			// One `/`-row INSIDE the bottom region (the last row), non-`/` context
+			// rows above it, and the highlight shade painted on the `/`-row itself
+			// (as claude paints a real path). The opposite placement to
+			// TestSlashPickerRejectsBodyForgery, whose `/`-line is pushed ABOVE the
+			// region by 20 filler rows.
+			snap := gridRows(
+				"output from the running shell command:",
+				"$ find /repo -type f | head",
+				hl+tok+reset,
+			)
+			g := NewGrid(snap, 0, 0)
+
+			// Non-vacuity — both pre-#296 weak signals ARE present, so the new block
+			// co-signal (not a missing colour or an out-of-region row) is provably
+			// what rejects the frame (mirrors the snapHasPickerHighlight guard in
+			// TestSlashPickerRejectsBodyForgery).
+			if !gridHasPickerRow(g) {
+				t.Fatal("fixture lost the in-region /-row — the forgery contrast is void")
+			}
+			if !snapHasPickerHighlight(snap) {
+				t.Fatal("fixture lost the highlight chrome — the forgery contrast is void")
+			}
+			// Sanity — the `/`-row is a SINGLE in-region row, not a block, so the
+			// gate is not passing vacuously on zero rows.
+			if got := gridPickerRowCount(g); got != 1 {
+				t.Fatalf("fixture has %d in-region /-rows, want exactly 1 (single-row forgery shape)", got)
+			}
+
+			// Rejected: the single-row forgery is not a picker under #296.
+			if isSlashPicker(snap) {
+				t.Errorf("isSlashPicker = true, want false (single-row /-continuation forgery)")
+			}
+			if got := DetectModalClass(snap); got == ModalClassSlashPicker {
+				t.Errorf("DetectModalClass = SlashPicker, want not-picker")
+			}
+		})
 	}
 }
 

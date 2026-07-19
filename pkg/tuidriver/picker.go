@@ -285,21 +285,69 @@ func lineOpensInHighlight(raw []byte) bool {
 // two of residual, not worth narrowing the real-picker margin.
 const pickerRegionRows = 6
 
-// gridHasPickerRow reports whether a rendered row within the bottom
-// pickerRegionRows begins with a picker row start (`/<letter>` after optional
-// leading whitespace, via pickerRowStartRe). Location only, and region-scoped
-// two ways: it reads from #150's Grid so rows scrolled off into raw history
-// don't count, and only the bottom input window so a `/`-line in the on-screen
-// transcript body (a path, a link, a command name in a diff) can't forge the
-// picker (#237). Grid rows are StripANSI'd and carry no color, so highlight
-// chrome is checked separately (see isSlashPicker).
-func gridHasPickerRow(g *Grid) bool {
+// pickerRowBlockMin is the minimum number of bottom-region `/`-rows that must
+// render together for the slash-picker chrome to classify (#296). A real
+// slash-command picker paints a LIST of command rows — the two committed captures
+// carry 5 (picker-snapshot.bin) and 6 (picker-truecolor-snapshot.bin) `/`-rows in
+// the bottom pickerRegionRows window — whereas the residual forgery #237's region
+// scope could not reach is a SINGLE stray `/`-row: a shell-command output line
+// wrapping so its continuation begins `/Users…`/`/gradlew…`, or claude's own
+// footer tip wrapping to a line beginning `/btw…`. Requiring ≥2 rows rejects the
+// single-row forgery while both real captures classify with margin.
+//
+// This consciously DROPS single-match filtered-picker detection (one command
+// row): a filtered picker narrowed to exactly one row is structurally identical
+// to a single stray `/`-continuation, so no threshold can separate them. The drop
+// is safe because the consumer (pyry agent-run) is headless — no human types `/`,
+// so a real picker never surfaces in an agent run and every slash-picker fire
+// there is a false positive (#296). Threshold is 2, not 3: 2 directly encodes "a
+// list has more than one item; the forgery has one"; 3 would drop genuine
+// two-match pickers to defend an unobserved two-row coincidence.
+const pickerRowBlockMin = 2
+
+// gridPickerRowCount counts rendered rows within the bottom pickerRegionRows that
+// begin with a picker row start (`/<letter>` after optional leading whitespace,
+// via pickerRowStartRe). Region-scoped exactly like the location check below: it
+// reads from #150's Grid so rows scrolled off into raw history don't count, and
+// only the bottom input window. Reuses pickerRowStartRe — no second regex. The
+// count is non-contiguous (any N `/`-rows in the window, not N adjacent): a real
+// picker's long descriptions wrap and interleave with command rows at narrow
+// widths (picker-snapshot.bin already carries a wrapped description breaking its
+// block), so a contiguity requirement would grow fragile against real pickers
+// while the observed forgeries are single-row and rejected regardless.
+func gridPickerRowCount(g *Grid) int {
+	n := 0
 	for _, row := range g.LastRows(pickerRegionRows) {
 		if pickerRowStartRe.MatchString(row) {
-			return true
+			n++
 		}
 	}
-	return false
+	return n
+}
+
+// gridHasPickerRow reports whether at least one rendered row within the bottom
+// pickerRegionRows begins with a picker row start (via gridPickerRowCount).
+// Location only, region-scoped two ways so a `/`-line scrolled into raw history or
+// sitting in the on-screen transcript body (a path, a link, a command name in a
+// diff) can't forge the picker (#237). It is no longer the production gate —
+// isSlashPickerWithGrid requires a `/`-row BLOCK (gridHasPickerRowBlock) since
+// #296 — but the anchor-forgery regressions keep it as the weak "there IS a
+// bottom-region `/`-row" signal, so their non-vacuity assertions prove the block
+// requirement (not a missing row or missing colour) is what rejects a single-row
+// forgery.
+func gridHasPickerRow(g *Grid) bool {
+	return gridPickerRowCount(g) >= 1
+}
+
+// gridHasPickerRowBlock reports whether the bottom pickerRegionRows carry a BLOCK
+// of at least pickerRowBlockMin `/`-rows — the structural co-signal (#296) that a
+// real picker is a command LIST, not a single stray `/`-continuation. This is the
+// row-half gate isSlashPickerWithGrid uses: the shape-over-literal posture #242 /
+// #244 apply to the permission and full-panel arms, here applied to the picker's
+// row half. Grid rows are StripANSI'd and carry no color, so highlight chrome is
+// checked separately (see isSlashPicker).
+func gridHasPickerRowBlock(g *Grid) bool {
+	return gridPickerRowCount(g) >= pickerRowBlockMin
 }
 
 // isSlashPicker reports whether snap renders claude's `/` slash-command picker.
@@ -307,16 +355,20 @@ func gridHasPickerRow(g *Grid) bool {
 // when no specific modal anchor matched. Two independent signals of different
 // fabric, ANDed:
 //
-//  1. Bottom-region location — an on-screen grid row within the bottom input
-//     window (pickerRegionRows) begins `/<letter>`. Off-screen `/`-lines in raw
-//     history are excluded by the rendered grid, and a `/`-line up in the
-//     transcript body is excluded by the region scope (#237).
+//  1. Bottom-region block — a BLOCK of at least pickerRowBlockMin on-screen grid
+//     rows within the bottom input window (pickerRegionRows) begin `/<letter>`
+//     (gridHasPickerRowBlock). Off-screen `/`-lines in raw history are excluded
+//     by the rendered grid, a `/`-line up in the transcript body is excluded by
+//     the region scope (#237), and a SINGLE stray `/`-continuation inside the
+//     region — a wrapped path or the footer tip — no longer forges the row half
+//     (#296).
 //  2. Chrome — the snapshot carries a picker highlight color.
 //
-// Requiring both stops a benign on-screen absolute path (/Users/x/file.go) in
-// the transcript body from phantom-pickering, while a genuine single-match
-// filtered picker (one `/`-row at the input line, painted in the highlight
-// shade) still classifies.
+// Requiring a block (not one row) stops a wrapped path continuation or the
+// wrapped footer tip in the input region from phantom-pickering. A genuine
+// single-match filtered picker is consciously dropped (headless agent runs never
+// surface a real picker — see pickerRowBlockMin), while both real multi-row
+// captures still classify.
 func isSlashPicker(snap []byte) bool {
 	return isSlashPickerWithGrid(NewGrid(snap, 0, 0), snap)
 }
@@ -326,7 +378,7 @@ func isSlashPicker(snap []byte) bool {
 // classification does not render twice (#152). snap is still needed for the
 // chrome check, which reads the raw color bytes the grid discards.
 func isSlashPickerWithGrid(g *Grid, snap []byte) bool {
-	if !gridHasPickerRow(g) {
+	if !gridHasPickerRowBlock(g) {
 		return false
 	}
 	return snapHasPickerHighlight(snap)
