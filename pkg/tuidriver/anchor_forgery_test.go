@@ -35,6 +35,8 @@ import (
 //   - network.go     networkFailureAnchors.
 //   - mcp_banner.go  mcpFailureBannerRe.
 //   - apiretry.go    apiRetryRowRe (the "API error" + "Retrying in" two-token anchor).
+//   - midresponse.go midResponseErrorAnchors (the "Connection closed
+//                    mid-response" partial-output token).
 //   - state.go       spinnerGlyphs, InterruptHint, IdleGlyph.
 //
 // Two protection tiers exist today, so the suite asserts different outcomes:
@@ -145,6 +147,12 @@ func TestBannerAnchorsRejectBodyForgery(t *testing.T) {
 		// "Retrying in" would trivially not fire for the wrong reason. Region
 		// scoping (bannerRegionRows) is the guard.
 		{"api-error retry (#303)", "API error · Retrying in 1s · attempt 3/10", HasApiRetry},
+		// #304: the mid-response partial-output error line as transcript-body
+		// content. The full line carries the distinctive "Connection closed
+		// mid-response" token, so the forgery is non-vacuous — a bare "API Error:"
+		// with no partial-output token would trivially not fire for the wrong
+		// reason. Region scoping (bannerRegionRows) is the guard.
+		{"mid-response error (#304)", "API Error: Connection closed mid-response. The response above may be incomplete.", HasMidResponseError},
 	}
 	for _, tc := range cases {
 		for _, f := range forgedBodyForms(tc.anchor) {
