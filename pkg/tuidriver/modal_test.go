@@ -60,15 +60,17 @@ func TestDetectModalClassSyntheticAnchors(t *testing.T) {
 			ModalClassUnknown,
 		},
 		{
-			// Stays a picker: the mid-row 38;5;153 is a real highlight shade
-			// (index 153 → 175,215,255), so chrome is present.
-			"slash-picker filtered (multiple colors mid-row)",
-			[]byte("noise\n\x1b[38;5;246m/\x1b[38;5;153mp\x1b[38;5;246mlugin desc\n"),
+			// Stays a picker: a two-row `/`-block (#296) whose mid-row 38;5;153
+			// (index 153 → 175,215,255) is a real highlight shade, so chrome is
+			// present too.
+			"slash-picker filtered block (multiple colors mid-row)",
+			[]byte("noise\n\x1b[38;5;246m/\x1b[38;5;153mp\x1b[38;5;246mlugin desc\n\x1b[38;5;246m/\x1b[38;5;153mf\x1b[38;5;246migma desc\n"),
 			ModalClassSlashPicker,
 		},
 		{
-			"slash-picker truecolor highlighted row",
-			[]byte("noise\n\x1b[38;2;177;185;249m/code-review desc\n"),
+			// #296: a two-row truecolor-highlighted `/`-block.
+			"slash-picker truecolor highlighted block",
+			[]byte("noise\n\x1b[38;2;177;185;249m/code-review desc\n\x1b[38;2;177;185;249m/figma-use desc\n"),
 			ModalClassSlashPicker,
 		},
 		{
@@ -226,11 +228,12 @@ func TestDetectModalClassAgentsRetiredNeverFires(t *testing.T) {
 	}
 }
 
-// TestDetectModalClassSlashPickerContract covers #151's two guarantees: the
-// slash-picker check runs LAST (a specific anchor wins even when picker signals
-// are present), and it requires picker chrome (a highlight color), not just an
-// on-screen `/`-row. Fixtures use \r\n so vt10x renders flat rows, not a
-// staircase (the #150 grid lesson).
+// TestDetectModalClassSlashPickerContract covers #151's two guarantees plus the
+// #296 tightening: the slash-picker check runs LAST (a specific anchor wins even
+// when picker signals are present), and it requires picker chrome (a highlight
+// color) AND a bottom-region `/`-row BLOCK (≥pickerRowBlockMin, #296) — not just a
+// single on-screen `/`-row, which is now consciously dropped. Fixtures use \r\n so
+// vt10x renders flat rows, not a staircase (the #150 grid lesson).
 func TestDetectModalClassSlashPickerContract(t *testing.T) {
 	const (
 		hlTrue = "\x1b[38;2;177;185;249m" // truecolor highlight shade
@@ -260,16 +263,26 @@ func TestDetectModalClassSlashPickerContract(t *testing.T) {
 			ModalClassPermission,
 		},
 		{
-			// Single-match filtered picker (one row) painted in the highlight
-			// shade → still a picker. Truecolor + indexed twins.
-			"single-match picker with truecolor chrome is a picker",
-			[]byte(hlTrue + "/figma-use" + reset + "\r\n"),
+			// #296: a genuine picker is a BLOCK of `/`-rows; a two-row block with
+			// truecolor chrome classifies — the region scope + block together admit
+			// a real in-region picker.
+			"slash-picker block with truecolor chrome is a picker",
+			[]byte(hlTrue + "/figma-use" + reset + "\r\n" + hlTrue + "/code-review" + reset + "\r\n"),
 			ModalClassSlashPicker,
 		},
 		{
-			"single-match picker with indexed chrome is a picker",
+			// #296: a single-match picker (one `/`-row) is structurally identical to
+			// a single-row forgery, so it is consciously dropped — headless agent
+			// runs never surface a real picker (see pickerRowBlockMin). Truecolor +
+			// indexed twins, both now Unknown.
+			"single-match picker dropped (truecolor chrome) #296",
+			[]byte(hlTrue + "/figma-use" + reset + "\r\n"),
+			ModalClassUnknown,
+		},
+		{
+			"single-match picker dropped (indexed chrome) #296",
 			[]byte(hlIdx + "/figma-use" + reset + "\r\n"),
-			ModalClassSlashPicker,
+			ModalClassUnknown,
 		},
 	}
 	for _, tc := range cases {
