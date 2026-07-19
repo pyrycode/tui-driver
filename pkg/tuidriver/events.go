@@ -69,6 +69,28 @@ const (
 	// EventKindPtyNetworkFailureHidden is the paired falling edge.
 	EventKindPtyNetworkFailureHidden
 
+	// EventKindPtyApiRetryShown fires on the rising edge of claude's live
+	// API-error retry state (the "API error … Retrying in … attempt N/M"
+	// status row appears in the status region) AND re-fires whenever the
+	// parsed attempt count changes while the state persists (3/10 → 4/10
+	// climbs). Retry carries the parsed ApiRetryAttempt.
+	//
+	// This is the FIRST payload-carrying PTY event: every prior PTY banner
+	// event is payload-free (the kind is the whole signal); this one adds
+	// the attempt count so a remote head can render "retrying, 3 of 10".
+	//
+	// Independent of the modal/idle/thinking axes, like the mcp-failure and
+	// network-failure banners: it fires while a modal is up or the spinner
+	// runs. When the row is present but the counter did not parse, Retry is
+	// the zero value {0, 0} ("retrying, count unknown").
+	EventKindPtyApiRetryShown
+
+	// EventKindPtyApiRetryHidden is the paired falling edge — the retry row
+	// clears. Retry carries the last-known attempt (the value from the tick
+	// before it cleared) so a consumer's final render stays coherent; a
+	// consumer keying only on the kind ignores it.
+	EventKindPtyApiRetryHidden
+
 	// EventKindJsonlEntry carries one parsed JSONL line forwarded from
 	// the internal tail. Entry carries the JSONLEntry.
 	EventKindJsonlEntry
@@ -128,6 +150,11 @@ const (
 //     EventKindPtyNetworkFailureShown, EventKindPtyNetworkFailureHidden:
 //     no payload fields. The kind itself is the signal; the predicate
 //     identity is implicit.
+//   - EventKindPtyApiRetryShown, EventKindPtyApiRetryHidden: Retry carries
+//     the parsed attempt N/M (the current count on Shown; the last-known
+//     count on Hidden; the zero value {0,0} when the counter did not parse).
+//     This is the first PTY event that carries a payload — every other PTY
+//     event is payload-free.
 //   - EventKindJsonlEntry, EventKindJsonlEndOfTurn: Entry carries the
 //     parsed entry. Both events for one end-of-turn carry the same
 //     entry.
@@ -144,13 +171,14 @@ type Event struct {
 	Kind   EventKind
 	Source EventSource
 	Time   time.Time
-	Modal  ModalClass // populated only on EventKindPtyModal*
-	Entry  JSONLEntry // populated only on EventKindJsonl*
-	Err    error      // populated only on EventKindError
+	Modal  ModalClass      // populated only on EventKindPtyModal*
+	Entry  JSONLEntry      // populated only on EventKindJsonl*
+	Err    error           // populated only on EventKindError
+	Retry  ApiRetryAttempt // populated only on EventKindPtyApiRetry{Shown,Hidden}
 }
 
 // Events spawns a merge goroutine that emits PTY-state transitions
-// (idle / thinking / modal / mcp-failure / network-failure / stall)
+// (idle / thinking / modal / mcp-failure / network-failure / api-retry / stall)
 // and per-entry JSONL events on a single unified channel in arrival
 // order. Internally tails the JSONL file at jsonlPath from
 // startOffset (composes with WaitForSessionJSONL +
@@ -168,10 +196,12 @@ type Event struct {
 // channel — at most one Event is emitted per select iteration; the
 // consumer sees a fully ordered stream. PTY-state polling cadence is
 // DefaultPollInterval (50 ms); idle/thinking events are suppressed
-// while a modal is active (the modal axis dominates). The mcp-failure
-// and network-failure banner axes are independent: their Shown/Hidden
-// events fire regardless of modal state because the banners coexist
-// with modal/idle/thinking UI in the lower status area.
+// while a modal is active (the modal axis dominates). The mcp-failure,
+// network-failure, and api-retry banner axes are independent: their
+// Shown/Hidden events fire regardless of modal state because the banners
+// coexist with modal/idle/thinking UI in the lower status area. The
+// api-retry Shown also re-fires on an attempt-count change while the
+// retry state persists, carrying the new count in Event.Retry.
 //
 // tr is required (non-nil). The stall arm reuses tr's configured
 // PTYQuietLimit — the same value Tracker.CheckWatchdog reads — so a
@@ -197,8 +227,8 @@ func (s *Session) Events(ctx context.Context, jsonlPath string, startOffset int6
 
 // ScreenEvents is Events without a JSONL transcript: it spawns the same merge
 // loop but tails no file, so it emits ONLY the screen-derived axes
-// (idle / thinking / modal / mcp-failure / network-failure) and never a JSONL
-// entry, an end-of-turn, or a stall event. Because it opens no file it cannot
+// (idle / thinking / modal / mcp-failure / network-failure / api-retry) and
+// never a JSONL entry, an end-of-turn, or a stall event. Because it opens no file it cannot
 // fail, so it returns the channel directly with no error.
 //
 // Use it for consumers that need screen/modal events BEFORE (or without) a
@@ -223,7 +253,7 @@ func (s *Session) ScreenEvents(ctx context.Context) <-chan Event {
 
 // mergeEvents owns the unified merge loop. Polls snapshot at
 // pollInterval for PTY-state transitions (idle / thinking / modal /
-// mcp-failure / network-failure / stall), drains entries from jsonlCh,
+// mcp-failure / network-failure / api-retry / stall), drains entries from jsonlCh,
 // and writes typed Event values to out in arrival order. Closes out on
 // every return path.
 //
@@ -239,9 +269,10 @@ func (s *Session) ScreenEvents(ctx context.Context) <-chan Event {
 // tick emits whichever rising edges hold relative to that — a buffer
 // already idle at subscription fires EventKindPtyIdle on tick one. A
 // buffer already showing a modal fires EventKindPtyModalShown. The
-// mcp-failure, network-failure, and stall axes follow the same
-// rising-edge rule; mcp-failure and network-failure are not suppressed
-// by modal state.
+// mcp-failure, network-failure, api-retry, and stall axes follow the
+// same rising-edge rule; mcp-failure, network-failure, and api-retry are
+// not suppressed by modal state. (A snapshot already showing a retry row
+// fires EventKindPtyApiRetryShown on tick one, carrying its attempt count.)
 func mergeEvents(
 	ctx context.Context,
 	snapshot func() []byte,
@@ -416,6 +447,42 @@ func mergeEvents(
 					return
 				}
 			}
+			// API-error retry is a banner axis too (independent of modal
+			// state), but with a payload that can change while the state
+			// persists: unlike the boolean banners above it re-emits Shown
+			// when the parsed attempt count climbs (3/10 → 4/10) — the
+			// consumer needs to watch the count. The three branches are
+			// mutually exclusive per tick. Hidden carries prev's last-known
+			// count; the count-change branch compares the whole struct, so a
+			// malformed counter (stuck at {0,0} across ticks) never re-emits.
+			if cur.apiRetry && !prev.apiRetry {
+				if !send(Event{
+					Kind:   EventKindPtyApiRetryShown,
+					Source: EventSourcePty,
+					Time:   now,
+					Retry:  cur.apiRetryAttempt,
+				}) {
+					return
+				}
+			} else if cur.apiRetry && prev.apiRetry && cur.apiRetryAttempt != prev.apiRetryAttempt {
+				if !send(Event{
+					Kind:   EventKindPtyApiRetryShown,
+					Source: EventSourcePty,
+					Time:   now,
+					Retry:  cur.apiRetryAttempt,
+				}) {
+					return
+				}
+			} else if !cur.apiRetry && prev.apiRetry {
+				if !send(Event{
+					Kind:   EventKindPtyApiRetryHidden,
+					Source: EventSourcePty,
+					Time:   now,
+					Retry:  prev.apiRetryAttempt,
+				}) {
+					return
+				}
+			}
 			// Stall is a rising-edge degrade marker: fires once on entry
 			// into the stalled condition and re-arms only after it clears
 			// (a PTY byte, a JSONL entry, or a return to idle).
@@ -455,6 +522,12 @@ type ptyState struct {
 	modal          ModalClass
 	mcpFailure     bool
 	networkFailure bool
+	// apiRetry is whether claude's API-error retry status row is present
+	// this tick; apiRetryAttempt is its parsed attempt N/M, zero-value when
+	// the row is absent or its counter did not parse. Both are set by
+	// classify from the one shared grid.
+	apiRetry        bool
+	apiRetryAttempt ApiRetryAttempt
 	// stalled is the ADR 025 safe-degrade marker. Unlike the other
 	// axes it is NOT set by classify (which sees only the snapshot) —
 	// the merge loop computes it from the quiet-timing inputs after
@@ -487,11 +560,14 @@ var gridForClassify = NewGrid
 // default-size case get.
 func classify(snap []byte, cols, rows int) ptyState {
 	g := gridForClassify(snap, cols, rows)
+	apiRetry, apiRetryAttempt, _ := apiRetryInRegion(g)
 	return ptyState{
-		idle:           isIdleGrid(g),
-		thinking:       busyInRegion(g),
-		modal:          detectModalClassWithGrid(g, snap),
-		mcpFailure:     mcpBannerMatchInRegion(g) != nil,
-		networkFailure: hasNetworkFailureGrid(g),
+		idle:            isIdleGrid(g),
+		thinking:        busyInRegion(g),
+		modal:           detectModalClassWithGrid(g, snap),
+		mcpFailure:      mcpBannerMatchInRegion(g) != nil,
+		networkFailure:  hasNetworkFailureGrid(g),
+		apiRetry:        apiRetry,
+		apiRetryAttempt: apiRetryAttempt,
 	}
 }

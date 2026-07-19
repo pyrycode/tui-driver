@@ -34,6 +34,7 @@ import (
 //   - permission.go  anchorTrustHeaderSpaced.
 //   - network.go     networkFailureAnchors.
 //   - mcp_banner.go  mcpFailureBannerRe.
+//   - apiretry.go    apiRetryRowRe (the "API error" + "Retrying in" two-token anchor).
 //   - state.go       spinnerGlyphs, InterruptHint, IdleGlyph.
 //
 // Two protection tiers exist today, so the suite asserts different outcomes:
@@ -138,6 +139,12 @@ func TestBannerAnchorsRejectBodyForgery(t *testing.T) {
 			"2 MCP servers failed · /mcp",
 			func(b []byte) bool { return HasMcpFailureBanner(b) || FailedMcpCount(b) != 0 },
 		},
+		// #303: the api-error retry line as transcript-body content. The phrase
+		// carries the full two-token structure (API error … Retrying in) plus a
+		// counter, so the forgery is non-vacuous — a bare "API error" with no
+		// "Retrying in" would trivially not fire for the wrong reason. Region
+		// scoping (bannerRegionRows) is the guard.
+		{"api-error retry (#303)", "API error · Retrying in 1s · attempt 3/10", HasApiRetry},
 	}
 	for _, tc := range cases {
 		for _, f := range forgedBodyForms(tc.anchor) {

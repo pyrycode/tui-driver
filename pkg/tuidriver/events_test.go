@@ -687,6 +687,101 @@ func TestMergeEvents_BannerCoexistsWithIdleAndModal(t *testing.T) {
 	assertEventChClosed(t, out, 500*time.Millisecond)
 }
 
+func TestMergeEvents_ApiRetryTransitions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	snap := &testSnap{}
+	jsonlCh := make(chan JSONLEntry)
+	out := make(chan Event, defaultEventBuffer)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+
+	// Phase 1: empty snap → no event within two ticks.
+	select {
+	case ev, ok := <-out:
+		if ok {
+			t.Fatalf("phase 1 got unexpected event %+v on empty snap", ev)
+		}
+		t.Fatalf("phase 1 channel closed unexpectedly")
+	case <-time.After(2 * DefaultPollInterval):
+	}
+
+	// Phase 2: retry row appears → ApiRetryShown fires once, carrying the parsed
+	// attempt 3/10. The fixture omits the ✻ glyph so only the api-retry axis fires
+	// (no spurious PtyThinking), isolating the payload assertion — the detector
+	// anchors on "API error" + "Retrying in", not the spinner.
+	snap.Set([]byte("API error · Retrying in 1s · attempt 3/10"))
+	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyApiRetryShown {
+		t.Errorf("phase 2 Kind = %v, want EventKindPtyApiRetryShown", ev.Kind)
+	}
+	if ev.Source != EventSourcePty {
+		t.Errorf("phase 2 Source = %v, want EventSourcePty", ev.Source)
+	}
+	if ev.Time.IsZero() {
+		t.Errorf("phase 2 Time is zero, want non-zero wall-clock")
+	}
+	if ev.Modal != ModalClassUnknown {
+		t.Errorf("phase 2 Modal = %q, want unset (zero)", ev.Modal)
+	}
+	if ev.Retry != (ApiRetryAttempt{Current: 3, Total: 10}) {
+		t.Errorf("phase 2 Retry = %+v, want {Current:3 Total:10}", ev.Retry)
+	}
+
+	// Phase 3: same retry row, counter climbs 3/10 → 4/10 (state persists). The
+	// payload change re-emits ApiRetryShown — the #303 divergence from the
+	// boolean banner axes, which only fire on the appear/clear edges.
+	snap.Set([]byte("API error · Retrying in 1s · attempt 4/10"))
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyApiRetryShown {
+		t.Errorf("phase 3 Kind = %v, want EventKindPtyApiRetryShown (re-emit on count change)", ev.Kind)
+	}
+	if ev.Retry != (ApiRetryAttempt{Current: 4, Total: 10}) {
+		t.Errorf("phase 3 Retry = %+v, want {Current:4 Total:10}", ev.Retry)
+	}
+
+	// Phase 4: retry row clears (non-idle content, so ONLY the api-retry axis
+	// flips) → ApiRetryHidden fires carrying the last-known 4/10.
+	snap.Set([]byte("recovered"))
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyApiRetryHidden {
+		t.Errorf("phase 4 Kind = %v, want EventKindPtyApiRetryHidden", ev.Kind)
+	}
+	if ev.Retry != (ApiRetryAttempt{Current: 4, Total: 10}) {
+		t.Errorf("phase 4 Retry = %+v, want {Current:4 Total:10} (last-known)", ev.Retry)
+	}
+
+	// Phase 5: a permission modal AND the retry row in one snapshot. The modal
+	// axis flips Unknown → Permission (ModalShown) and the retry axis rises
+	// (ApiRetryShown) in the SAME tick — proving the api-retry banner axis fires
+	// independently of modal state (it is not suppressed like idle/thinking).
+	// Internal emission order is not contract, so collect both into a set.
+	snap.Set([]byte("Do you want to proceed\r\n\xe2\x9d\xaf 1. Yes\r\nAPI error · Retrying in 1s · attempt 5/10"))
+	got := map[EventKind]bool{}
+	var retryEv Event
+	for i := 0; i < 2; i++ {
+		e := mustReceiveEvent(t, out, 500*time.Millisecond)
+		if e.Source != EventSourcePty {
+			t.Errorf("phase 5 event %d Source = %v, want EventSourcePty", i, e.Source)
+		}
+		got[e.Kind] = true
+		if e.Kind == EventKindPtyApiRetryShown {
+			retryEv = e
+		}
+	}
+	if !got[EventKindPtyModalShown] {
+		t.Errorf("phase 5 missing EventKindPtyModalShown, got %v", got)
+	}
+	if !got[EventKindPtyApiRetryShown] {
+		t.Errorf("phase 5 missing EventKindPtyApiRetryShown (banner axis must fire under a modal), got %v", got)
+	}
+	if retryEv.Retry != (ApiRetryAttempt{Current: 5, Total: 10}) {
+		t.Errorf("phase 5 Retry = %+v, want {Current:5 Total:10}", retryEv.Retry)
+	}
+
+	cancel()
+	assertEventChClosed(t, out, 500*time.Millisecond)
+}
+
 func TestEvents_TailJSONLErrorBubbles(t *testing.T) {
 	s := &Session{buffer: NewBuffer(0)}
 	missing := filepath.Join(t.TempDir(), "nonexistent", "x.jsonl")
