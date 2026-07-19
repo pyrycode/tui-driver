@@ -4,10 +4,16 @@ import "strings"
 
 // trustDialogLookahead bounds how many rows below the "Quick safety check"
 // header the pointer-marked option row may sit and still count as the real
-// dialog. Claude renders the selected option on the very next row
-// (trust-folder-snapshot.bin); the slack tolerates a blank or wrapped prompt
-// line between them.
-const trustDialogLookahead = 3
+// dialog. Claude 2.1.199 renders the header, a wrapped second header line, an
+// explanatory line, a "Security guide" link, and blank separators before the
+// "❯ 1. Yes, I trust this folder" option row — 7 rows below the header at 120
+// cols (trust-folder-2.1.199-snapshot.bin). #300 raised this from 3, which was
+// sized for the compact pre-2.1.199 layout (trust-folder-snapshot.bin, option
+// on the next row) and silently missed the current dialog, so the startup
+// safety net never fired. 8 covers the measured gap of 7 with one row of slack;
+// it stays far tighter than a whole-panel match, so the header-plus-nearby-
+// option-row co-signal that rejects a bare header quotation (#219) still holds.
+const trustDialogLookahead = 8
 
 // gridHasTrustDialog reports whether g renders claude's real trust-folder
 // dialog: the "Quick safety check" header AND, within the next
