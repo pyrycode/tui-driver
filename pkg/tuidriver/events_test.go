@@ -626,6 +626,64 @@ func TestMergeEvents_NetworkFailureTransitions(t *testing.T) {
 	assertEventChClosed(t, out, 500*time.Millisecond)
 }
 
+// TestMergeEvents_MidResponseErrorTransitions mirrors
+// TestMergeEvents_NetworkFailureTransitions with the mid-response anchor: both
+// are payload-free banner axes with the same appear/clear boolean-flip shape (no
+// count, no count-change re-emit — that is #303's api-retry wrinkle).
+func TestMergeEvents_MidResponseErrorTransitions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	snap := &testSnap{}
+	jsonlCh := make(chan JSONLEntry)
+	out := make(chan Event, defaultEventBuffer)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+
+	const line = "API Error: Connection closed mid-response. The response above may be incomplete."
+
+	// Phase 1: empty snap → no event.
+	select {
+	case ev, ok := <-out:
+		if ok {
+			t.Fatalf("phase 1 got unexpected event %+v on empty snap", ev)
+		}
+		t.Fatalf("phase 1 channel closed unexpectedly")
+	case <-time.After(2 * DefaultPollInterval):
+	}
+
+	// Phase 2: the mid-response error line appears → MidResponseErrorShown fires
+	// once. Payload-free: the kind is the whole signal (the turn's output is
+	// partial). The line omits any spinner glyph or ❯, so only this axis flips.
+	snap.Set([]byte(line))
+	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyMidResponseErrorShown {
+		t.Errorf("phase 2 Kind = %v, want EventKindPtyMidResponseErrorShown", ev.Kind)
+	}
+	if ev.Source != EventSourcePty {
+		t.Errorf("phase 2 Source = %v, want EventSourcePty", ev.Source)
+	}
+	if ev.Time.IsZero() {
+		t.Errorf("phase 2 Time is zero, want non-zero wall-clock")
+	}
+
+	// Phase 3: line clears → MidResponseErrorHidden fires.
+	snap.Set([]byte("recovered"))
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyMidResponseErrorHidden {
+		t.Errorf("phase 3 Kind = %v, want EventKindPtyMidResponseErrorHidden", ev.Kind)
+	}
+
+	// Phase 4: ANSI-wrapped reappearance → MidResponseErrorShown again. The grid
+	// render consumes the CSI and preserves the on-screen phrase.
+	snap.Set([]byte("\x1b[31m" + line + "\x1b[0m"))
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyMidResponseErrorShown {
+		t.Errorf("phase 4 Kind = %v, want EventKindPtyMidResponseErrorShown", ev.Kind)
+	}
+
+	cancel()
+	assertEventChClosed(t, out, 500*time.Millisecond)
+}
+
 func TestMergeEvents_BannerCoexistsWithIdleAndModal(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

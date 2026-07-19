@@ -91,6 +91,23 @@ const (
 	// consumer keying only on the kind ignores it.
 	EventKindPtyApiRetryHidden
 
+	// EventKindPtyMidResponseErrorShown fires on the rising edge of claude's
+	// mid-response partial-output error state — the "API Error: Connection closed
+	// mid-response …" line appears in the status region. It means the turn's
+	// output is PARTIAL: the API connection dropped mid-turn and the visible
+	// output above the line is truncated, so a remote head marks the response
+	// incomplete instead of treating it as a normally finished turn.
+	//
+	// Payload-free, like the mcp-failure and network-failure banners (contrast
+	// EventKindPtyApiRetry*, which carries a count): the kind itself is the whole
+	// signal. Independent of the modal/idle/thinking axes — it fires while a modal
+	// is up or the spinner runs, as the banner sits in the lower status area.
+	EventKindPtyMidResponseErrorShown
+
+	// EventKindPtyMidResponseErrorHidden is the paired falling edge — the
+	// mid-response error line clears. Same payload-free shape.
+	EventKindPtyMidResponseErrorHidden
+
 	// EventKindJsonlEntry carries one parsed JSONL line forwarded from
 	// the internal tail. Entry carries the JSONLEntry.
 	EventKindJsonlEntry
@@ -147,7 +164,8 @@ const (
 //     the class (the appearing class on Shown; the just-hidden class
 //     on Hidden).
 //   - EventKindPtyMcpFailureShown, EventKindPtyMcpFailureHidden,
-//     EventKindPtyNetworkFailureShown, EventKindPtyNetworkFailureHidden:
+//     EventKindPtyNetworkFailureShown, EventKindPtyNetworkFailureHidden,
+//     EventKindPtyMidResponseErrorShown, EventKindPtyMidResponseErrorHidden:
 //     no payload fields. The kind itself is the signal; the predicate
 //     identity is implicit.
 //   - EventKindPtyApiRetryShown, EventKindPtyApiRetryHidden: Retry carries
@@ -178,7 +196,8 @@ type Event struct {
 }
 
 // Events spawns a merge goroutine that emits PTY-state transitions
-// (idle / thinking / modal / mcp-failure / network-failure / api-retry / stall)
+// (idle / thinking / modal / mcp-failure / network-failure / api-retry /
+// mid-response-error / stall)
 // and per-entry JSONL events on a single unified channel in arrival
 // order. Internally tails the JSONL file at jsonlPath from
 // startOffset (composes with WaitForSessionJSONL +
@@ -197,9 +216,9 @@ type Event struct {
 // consumer sees a fully ordered stream. PTY-state polling cadence is
 // DefaultPollInterval (50 ms); idle/thinking events are suppressed
 // while a modal is active (the modal axis dominates). The mcp-failure,
-// network-failure, and api-retry banner axes are independent: their
-// Shown/Hidden events fire regardless of modal state because the banners
-// coexist with modal/idle/thinking UI in the lower status area. The
+// network-failure, api-retry, and mid-response-error banner axes are
+// independent: their Shown/Hidden events fire regardless of modal state because
+// the banners coexist with modal/idle/thinking UI in the lower status area. The
 // api-retry Shown also re-fires on an attempt-count change while the
 // retry state persists, carrying the new count in Event.Retry.
 //
@@ -227,7 +246,8 @@ func (s *Session) Events(ctx context.Context, jsonlPath string, startOffset int6
 
 // ScreenEvents is Events without a JSONL transcript: it spawns the same merge
 // loop but tails no file, so it emits ONLY the screen-derived axes
-// (idle / thinking / modal / mcp-failure / network-failure / api-retry) and
+// (idle / thinking / modal / mcp-failure / network-failure / api-retry /
+// mid-response-error) and
 // never a JSONL entry, an end-of-turn, or a stall event. Because it opens no file it cannot
 // fail, so it returns the channel directly with no error.
 //
@@ -253,7 +273,8 @@ func (s *Session) ScreenEvents(ctx context.Context) <-chan Event {
 
 // mergeEvents owns the unified merge loop. Polls snapshot at
 // pollInterval for PTY-state transitions (idle / thinking / modal /
-// mcp-failure / network-failure / api-retry / stall), drains entries from jsonlCh,
+// mcp-failure / network-failure / api-retry / mid-response-error / stall),
+// drains entries from jsonlCh,
 // and writes typed Event values to out in arrival order. Closes out on
 // every return path.
 //
@@ -269,10 +290,12 @@ func (s *Session) ScreenEvents(ctx context.Context) <-chan Event {
 // tick emits whichever rising edges hold relative to that — a buffer
 // already idle at subscription fires EventKindPtyIdle on tick one. A
 // buffer already showing a modal fires EventKindPtyModalShown. The
-// mcp-failure, network-failure, api-retry, and stall axes follow the
-// same rising-edge rule; mcp-failure, network-failure, and api-retry are
-// not suppressed by modal state. (A snapshot already showing a retry row
-// fires EventKindPtyApiRetryShown on tick one, carrying its attempt count.)
+// mcp-failure, network-failure, api-retry, mid-response-error, and stall
+// axes follow the same rising-edge rule; mcp-failure, network-failure,
+// api-retry, and mid-response-error are not suppressed by modal state. (A
+// snapshot already showing a retry row fires EventKindPtyApiRetryShown on
+// tick one, carrying its attempt count; one already showing the mid-response
+// error line fires EventKindPtyMidResponseErrorShown.)
 func mergeEvents(
 	ctx context.Context,
 	snapshot func() []byte,
@@ -447,6 +470,28 @@ func mergeEvents(
 					return
 				}
 			}
+			// Mid-response partial-output error is a payload-free banner axis too
+			// (independent of modal state), with the same appear/clear boolean-flip
+			// shape as the network banner — no count and no re-emit-on-change middle
+			// branch (that is #303's api-retry wrinkle). The kind is the whole
+			// signal: the turn's output is partial.
+			if cur.midResponseError && !prev.midResponseError {
+				if !send(Event{
+					Kind:   EventKindPtyMidResponseErrorShown,
+					Source: EventSourcePty,
+					Time:   now,
+				}) {
+					return
+				}
+			} else if !cur.midResponseError && prev.midResponseError {
+				if !send(Event{
+					Kind:   EventKindPtyMidResponseErrorHidden,
+					Source: EventSourcePty,
+					Time:   now,
+				}) {
+					return
+				}
+			}
 			// API-error retry is a banner axis too (independent of modal
 			// state), but with a payload that can change while the state
 			// persists: unlike the boolean banners above it re-emits Shown
@@ -522,6 +567,10 @@ type ptyState struct {
 	modal          ModalClass
 	mcpFailure     bool
 	networkFailure bool
+	// midResponseError is whether claude's mid-response partial-output error
+	// line is present in the status region this tick (hasMidResponseErrorGrid).
+	// Payload-free — no counterpart field, unlike apiRetry.
+	midResponseError bool
 	// apiRetry is whether claude's API-error retry status row is present
 	// this tick; apiRetryAttempt is its parsed attempt N/M, zero-value when
 	// the row is absent or its counter did not parse. Both are set by
@@ -562,12 +611,13 @@ func classify(snap []byte, cols, rows int) ptyState {
 	g := gridForClassify(snap, cols, rows)
 	apiRetry, apiRetryAttempt, _ := apiRetryInRegion(g)
 	return ptyState{
-		idle:            isIdleGrid(g),
-		thinking:        busyInRegion(g),
-		modal:           detectModalClassWithGrid(g, snap),
-		mcpFailure:      mcpBannerMatchInRegion(g) != nil,
-		networkFailure:  hasNetworkFailureGrid(g),
-		apiRetry:        apiRetry,
-		apiRetryAttempt: apiRetryAttempt,
+		idle:             isIdleGrid(g),
+		thinking:         busyInRegion(g),
+		modal:            detectModalClassWithGrid(g, snap),
+		mcpFailure:       mcpBannerMatchInRegion(g) != nil,
+		networkFailure:   hasNetworkFailureGrid(g),
+		midResponseError: hasMidResponseErrorGrid(g),
+		apiRetry:         apiRetry,
+		apiRetryAttempt:  apiRetryAttempt,
 	}
 }
