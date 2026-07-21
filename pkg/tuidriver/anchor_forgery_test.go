@@ -37,6 +37,8 @@ import (
 //   - apiretry.go    apiRetryRowRe (the "API error" + "Retrying in" two-token anchor).
 //   - midresponse.go midResponseErrorAnchors (the "Connection closed
 //                    mid-response" partial-output token).
+//   - compacting.go  compactingPhraseRe + compactingBarRe (the "Compacting
+//                    conversation" phrase paired with the ▱▰ progress-bar run).
 //   - state.go       spinnerGlyphs, InterruptHint, IdleGlyph.
 //
 // Two protection tiers exist today, so the suite asserts different outcomes:
@@ -153,6 +155,14 @@ func TestBannerAnchorsRejectBodyForgery(t *testing.T) {
 		// with no partial-output token would trivially not fire for the wrong
 		// reason. Region scoping (bannerRegionRows) is the guard.
 		{"mid-response error (#304)", "API Error: Connection closed mid-response. The response above may be incomplete.", HasMidResponseError},
+		// #298: the auto-compaction banner as transcript-body content. The forged
+		// string carries the FULL banner — the phrase AND the ▱ progress-bar run —
+		// so the forgery is non-vacuous: the bar co-signal is present, and only
+		// region scoping (bannerRegionRows) rejects it. This anchor matters more
+		// than the others because the phrase "Compacting conversation" is KNOWN to
+		// appear in real agent transcripts (this very ticket's body did), which is
+		// exactly why the detector pairs the phrase with the bar co-signal.
+		{"compaction banner (#298)", "Compacting conversation… ▱▱▱▱▱▱▱▱▱▱ 0%", HasCompacting},
 	}
 	for _, tc := range cases {
 		for _, f := range forgedBodyForms(tc.anchor) {

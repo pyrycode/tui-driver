@@ -684,6 +684,75 @@ func TestMergeEvents_MidResponseErrorTransitions(t *testing.T) {
 	assertEventChClosed(t, out, 500*time.Millisecond)
 }
 
+// TestMergeEvents_CompactingTransitions mirrors
+// TestMergeEvents_MidResponseErrorTransitions with the compaction banner: a
+// payload-free banner axis with the same appear/clear boolean-flip shape (no
+// count, and — unlike #303's api-retry — no re-emit as the progress % climbs; the
+// percentage is polled via ParseCompacting, not streamed).
+func TestMergeEvents_CompactingTransitions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	snap := &testSnap{}
+	jsonlCh := make(chan JSONLEntry)
+	out := make(chan Event, defaultEventBuffer)
+	go mergeEvents(ctx, snap.Snapshot, zeroDims, neverQuiet, DefaultPTYQuietLimit, jsonlCh, out, DefaultPollInterval)
+
+	// The banner needs both the phrase and a bar run; one-row form here. No
+	// leading spinner glyph, so only the compacting axis flips (the real banner
+	// carries the animating glyph, but that would also flip the thinking axis;
+	// coexistence is covered by TestMergeEvents_BannerCoexistsWithIdleAndModal).
+	const banner = "Compacting conversation…▱▱▱▱▱▱▱▱▱▱ 0%"
+
+	// Phase 1: empty snap → no event.
+	select {
+	case ev, ok := <-out:
+		if ok {
+			t.Fatalf("phase 1 got unexpected event %+v on empty snap", ev)
+		}
+		t.Fatalf("phase 1 channel closed unexpectedly")
+	case <-time.After(2 * DefaultPollInterval):
+	}
+
+	// Phase 2: the banner appears → CompactingShown fires once. Payload-free: the
+	// kind is the whole signal (claude is summarizing its context).
+	snap.Set([]byte(banner))
+	ev := mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyCompactingShown {
+		t.Errorf("phase 2 Kind = %v, want EventKindPtyCompactingShown", ev.Kind)
+	}
+	if ev.Source != EventSourcePty {
+		t.Errorf("phase 2 Source = %v, want EventSourcePty", ev.Source)
+	}
+	if ev.Time.IsZero() {
+		t.Errorf("phase 2 Time is zero, want non-zero wall-clock")
+	}
+
+	// Phase 3: banner clears → CompactingHidden fires.
+	snap.Set([]byte("recovered"))
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyCompactingHidden {
+		t.Errorf("phase 3 Kind = %v, want EventKindPtyCompactingHidden", ev.Kind)
+	}
+
+	// Phase 4: reappear, then the progress climbs (bar fills, % rises) while the
+	// banner stays up. Only ONE Shown fires; the count change is NOT re-emitted —
+	// this is the payload-free contract that distinguishes it from api-retry.
+	snap.Set([]byte("Compacting conversation…▱▱▱▱▱▱▱▱▱▱ 0%"))
+	ev = mustReceiveEvent(t, out, 500*time.Millisecond)
+	if ev.Kind != EventKindPtyCompactingShown {
+		t.Errorf("phase 4 reappear Kind = %v, want EventKindPtyCompactingShown", ev.Kind)
+	}
+	snap.Set([]byte("Compacting conversation…▰▰▰▰▰▱▱▱▱▱ 50%"))
+	select {
+	case ev := <-out:
+		t.Errorf("phase 4 progress change emitted %v, want no re-emit", ev.Kind)
+	case <-time.After(3 * DefaultPollInterval):
+	}
+
+	cancel()
+	assertEventChClosed(t, out, 500*time.Millisecond)
+}
+
 func TestMergeEvents_BannerCoexistsWithIdleAndModal(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -75,6 +75,7 @@ var flatDetectors = []detector{
 	{"mcp-failure", tuidriver.HasMcpFailureBanner},
 	{"network-failure", tuidriver.HasNetworkFailure},
 	{"unknown-dialog", tuidriver.HasUnknownDialog},
+	{"compacting", tuidriver.HasCompacting},
 }
 
 // contentAnchors are detection-relevant literals the tool scans for in each
@@ -94,6 +95,11 @@ var contentAnchors = []struct {
 	{"network-current", "Unable to connect to API", false},
 	{"network-retired", "FailedToOpenSocket", true},
 	{"permission-prompt", "Do you want to proceed", false},
+	// The compaction phrase appears in ordinary agent transcripts (ticket bodies,
+	// this detector's own source), so a large phrase-present count against a
+	// ~zero "compacting" detector count is the forgery-resistance proof: the ▱▰
+	// bar co-signal + region scoping suppress every quotation.
+	{"compacting-phrase", "Compacting conversation", false},
 }
 
 // castResult is one replayed recording's outcome.
