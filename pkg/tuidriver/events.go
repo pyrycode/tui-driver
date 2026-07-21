@@ -108,6 +108,27 @@ const (
 	// mid-response error line clears. Same payload-free shape.
 	EventKindPtyMidResponseErrorHidden
 
+	// EventKindPtyCompactingShown fires on the rising edge of claude's
+	// auto-compaction state — the "Compacting conversation" banner with its
+	// progress bar appears in the status region. Claude is summarizing its
+	// context to reclaim room and is silent on the content channel meanwhile, so
+	// a remote head renders a distinct "Compacting conversation" status instead
+	// of looking frozen, and the runner does not mis-read the quiet as a wedge.
+	//
+	// Payload-free, like the mcp-failure, network-failure and mid-response
+	// banners (contrast EventKindPtyApiRetry*, which carries a count): the kind
+	// itself is the whole signal. The animating progress percentage is available
+	// via ParseCompacting for a consumer that polls; it is deliberately NOT
+	// re-emitted per tick, which would flood the stream as the bar climbs 0→100.
+	// Independent of the modal/idle/thinking axes — the banner sits in the lower
+	// status area and coexists with the dominant axis.
+	EventKindPtyCompactingShown
+
+	// EventKindPtyCompactingHidden is the paired falling edge — the compaction
+	// banner clears (the summary completes and claude resumes). Same payload-free
+	// shape.
+	EventKindPtyCompactingHidden
+
 	// EventKindJsonlEntry carries one parsed JSONL line forwarded from
 	// the internal tail. Entry carries the JSONLEntry.
 	EventKindJsonlEntry
@@ -197,7 +218,7 @@ type Event struct {
 
 // Events spawns a merge goroutine that emits PTY-state transitions
 // (idle / thinking / modal / mcp-failure / network-failure / api-retry /
-// mid-response-error / stall)
+// mid-response-error / compacting / stall)
 // and per-entry JSONL events on a single unified channel in arrival
 // order. Internally tails the JSONL file at jsonlPath from
 // startOffset (composes with WaitForSessionJSONL +
@@ -492,6 +513,29 @@ func mergeEvents(
 					return
 				}
 			}
+			// Auto-compaction is a payload-free banner axis too, with the same
+			// appear/clear boolean-flip shape as the network and mid-response
+			// banners — no count and no re-emit-on-change middle branch. The kind
+			// is the whole signal (claude is summarizing its context and is quiet
+			// on the content channel); the animating progress percentage is polled
+			// via ParseCompacting, not streamed per tick.
+			if cur.compacting && !prev.compacting {
+				if !send(Event{
+					Kind:   EventKindPtyCompactingShown,
+					Source: EventSourcePty,
+					Time:   now,
+				}) {
+					return
+				}
+			} else if !cur.compacting && prev.compacting {
+				if !send(Event{
+					Kind:   EventKindPtyCompactingHidden,
+					Source: EventSourcePty,
+					Time:   now,
+				}) {
+					return
+				}
+			}
 			// API-error retry is a banner axis too (independent of modal
 			// state), but with a payload that can change while the state
 			// persists: unlike the boolean banners above it re-emits Shown
@@ -577,6 +621,11 @@ type ptyState struct {
 	// classify from the one shared grid.
 	apiRetry        bool
 	apiRetryAttempt ApiRetryAttempt
+	// compacting is whether claude's auto-compaction banner ("Compacting
+	// conversation" + a progress-bar run) is present in the status region this
+	// tick (compactingInRegion). Payload-free — the animating percentage is not
+	// tracked as event payload, unlike apiRetry; see EventKindPtyCompactingShown.
+	compacting bool
 	// stalled is the ADR 025 safe-degrade marker. Unlike the other
 	// axes it is NOT set by classify (which sees only the snapshot) —
 	// the merge loop computes it from the quiet-timing inputs after
@@ -610,6 +659,7 @@ var gridForClassify = NewGrid
 func classify(snap []byte, cols, rows int) ptyState {
 	g := gridForClassify(snap, cols, rows)
 	apiRetry, apiRetryAttempt, _ := apiRetryInRegion(g)
+	compacting, _, _ := compactingInRegion(g)
 	return ptyState{
 		idle:             isIdleGrid(g),
 		thinking:         busyInRegion(g),
@@ -619,5 +669,6 @@ func classify(snap []byte, cols, rows int) ptyState {
 		midResponseError: hasMidResponseErrorGrid(g),
 		apiRetry:         apiRetry,
 		apiRetryAttempt:  apiRetryAttempt,
+		compacting:       compacting,
 	}
 }
