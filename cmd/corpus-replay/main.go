@@ -123,6 +123,8 @@ func main() {
 	workers := flag.Int("workers", runtime.NumCPU(), "number of concurrent cast-replay workers")
 	noCache := flag.Bool("no-cache", false, "bypass the result cache entirely (always replay; never read or write the cache)")
 	cacheDir := flag.String("cache-dir", "", "override the cache directory (default: a corpus-replay subdirectory under the user cache dir)")
+	assert := flag.Bool("assert", false, "assert mode: evaluate detection-health invariants over production ok-tagged casts and exit non-zero on any violation (forces -stride 1)")
+	edgeCeiling := flag.Int("assert-edge-ceiling", defaultEdgeCeiling, "per-key transition-edge ceiling for -assert invariant (c); a baseline-derived tunable")
 	flag.Parse()
 
 	if *dir == "" {
@@ -131,6 +133,12 @@ func main() {
 		os.Exit(2)
 	}
 	if *stride < 1 {
+		*stride = 1
+	}
+	// Assert mode must sample every event. Event-stride sampling counts events, not
+	// seconds, so a dialog on an otherwise-quiet screen emits almost no events and
+	// can drop out of the sample entirely (#259). Force stride 1 whatever -stride said.
+	if *assert {
 		*stride = 1
 	}
 	if *workers < 1 {
@@ -167,6 +175,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "corpus-replay: cache %d hit(s), %d miss(es)\n", stats.hits, stats.misses)
 	}
 	report(os.Stdout, results, *dir, *stride, *perCast)
+
+	// Assert mode adds the pass-fail gate on top of the same report: evaluate the
+	// detection-health invariants and exit non-zero on any violation, so a detection
+	// regression reddens a gate instead of relying on a human reading the aggregate.
+	if *assert {
+		os.Exit(runAssert(os.Stdout, results, assertAllowlist, *edgeCeiling))
+	}
 }
 
 // replayOutcome carries one cast's replay result or its error from a worker to

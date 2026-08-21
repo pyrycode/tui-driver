@@ -38,6 +38,12 @@ Flags:
   write the cache).
 - `-cache-dir DIR`: override the cache directory (default: a `corpus-replay`
   subdirectory under the user cache dir).
+- `-assert`: assert mode — evaluate the detection-health invariants and exit
+  non-zero on any violation. Forces `-stride 1` (see below). This is the gate
+  behind `make corpus-assert`.
+- `-assert-edge-ceiling N`: the per-key transition-edge ceiling for the flapping
+  invariant (default is a documented placeholder; it is a baseline-derived
+  tunable, see below).
 
 ## Caching
 
@@ -94,6 +100,62 @@ How to read it:
   still appears in content, is a **drift suspect**.
 
 Local audit tool only — no CI workflow (org rule).
+
+## Assert mode — the detection gate (#259)
+
+The report above is read by a human. Assert mode turns the same replay into a
+pass-fail gate, so a detection regression fails automatically instead of
+depending on someone reading the aggregate correctly.
+
+```sh
+# The operator-run gate: replay the corpus and exit non-zero on any violation.
+make corpus-assert
+
+# Tune the flapping ceiling for a run.
+make corpus-assert EDGE_CEILING=20
+```
+
+`-assert` runs the normal replay and report, then evaluates three invariants over
+the **production `-ok`** casts and exits `0` when all hold, non-zero on any
+violation. Each violation line names only the cast short-name, the detector key,
+and a category label — never the matched content — so the gate output cannot
+itself forge live detection.
+
+The invariants:
+
+- **(a) no stray modal or banner fire.** No modal-class, mcp-failure,
+  network-failure, or unknown-dialog detector may fire in a production `-ok`
+  run, unless the cast is named in the committed allowlist.
+- **(b) idle must fire.** Every production `-ok` cast must reach the idle prompt
+  at least once. A run that never does means the idle detector went blind.
+- **(c) no flapping past the ceiling.** Every detector key's transition-edge
+  count must stay at or below `-assert-edge-ceiling`, so a class shown/hidden
+  repeatedly or a busy axis toggling fails loudly.
+
+**Assert always runs at stride 1.** Event-stride sampling counts events, not
+seconds, so a dialog on an otherwise-quiet screen emits almost no events and can
+drop out of a strided sample. The gate forces stride 1 whatever `-stride` said,
+which is why it is the tens-of-minutes full-fidelity pass, run by hand and not in
+`make check`.
+
+### Tunables the operator owns
+
+Two values are **baseline-derived** and out of a claude-free change's scope. The
+mechanism ships with safe placeholders; the real values come from a baseline
+`make corpus-assert` run over the operator's external corpus.
+
+- **The allowlist** (`assertAllowlist` in `assert.go`) names production `-ok`
+  casts whose modal or banner fire is a known, accepted exception, each with the
+  reason. It ships **empty**. Add an entry only once a baseline run shows a
+  genuinely benign fire.
+- **The edge ceiling** (`defaultEdgeCeiling` in `assert.go`, overridable with
+  `-assert-edge-ceiling`) ships as a documented placeholder. Set it from the
+  edge-count distribution a baseline run reports, high enough to clear healthy
+  runs and low enough to catch a real flapping regression.
+
+The synthetic fixtures under `testdata/assert/` prove the gate mechanism under
+`make check` — a clean corpus, one fixture per violation kind, and an
+allowlisted-exception corpus — not any empirical constant.
 
 ## ⚠️ Self-reference
 
