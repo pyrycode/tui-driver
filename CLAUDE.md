@@ -22,6 +22,16 @@ PTY allocation → spawn target binary → continuous read into rolling buffer �
 
 **Spinner caveat (claude 2.1.158):** the class-A `✻ <verb> for Ns` spinner format matches **0/667 frames** (tui-driver#124), so the spinner-freeze watchdog arm was **retired** in #164 — the PTY-quiet arm and `Events()`'s `EventKindStallDetected` cover the freeze case. `ParseSpinner` is retained for verb telemetry (its seconds-counter now has no in-library consumer), and `SpinnerFreezeLimit` is a retained no-op. `IsThinking` (bare `✻` glyph presence) still works as a "claude has started processing" signal. Prefer the `"esc to interrupt"` hint as the reliable in-flight anchor.
 
+## Use codegraph for symbol lookups
+
+This repo is indexed for codegraph (`.codegraph/`, gitignored). Prefer `mcp__codegraph__codegraph_*` MCP tools over grep for symbol-level questions — where something is defined, what calls it, what breaks if it changes.
+
+- **Before changing or removing an exported function** — run `codegraph_callers` first to find every call site.
+- **"Where is X defined" / "what does X call"** — `codegraph_search`, `codegraph_node`, and `codegraph_callees` beat reading files end to end.
+- **For a broader "how does this area work"** — `codegraph_context` or `codegraph_impact` before a cross-cutting change.
+- Fall back to grep/Read for comments, string literals, and pending edits the index hasn't picked up yet.
+- In Claude Code these are deferred tools: load them once with `ToolSearch` (e.g. `select:mcp__codegraph__codegraph_search`) before first use. Codex sees the same `mcp__codegraph__<tool>` names directly.
+
 ## Library choices
 
 - PTY: `github.com/creack/pty`
