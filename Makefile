@@ -11,9 +11,8 @@ GO         ?= go
 SPIKES     := spike-one-turn spike-multi-turn spike-cancel spike-permission spike-multiselect spike-ask-user spike-long-prompt spike-short-prompt spike-queued-modals
 PROBES     := probe-first-prompt-hang probe-cwd-encoding
 RUNNER     := e2e-runner
-TOOLS      := corpus-replay repro-permission-flake
 
-ALL_BINS   := $(SPIKES) $(PROBES) $(RUNNER) $(TOOLS)
+ALL_BINS   := $(SPIKES) $(PROBES) $(RUNNER)
 BIN_PATHS  := $(addprefix $(BIN_DIR)/,$(ALL_BINS))
 
 # Directory of .cast recordings for `make corpus-replay`, defaulting to the
@@ -49,8 +48,8 @@ e2e: build-bin
 # Replay the recording corpus through the detectors and print the fire report.
 # Offline audit tool, claude-free, NOT a CI gate (org rule). See
 # cmd/corpus-replay/README.md. Override CORPUS_DIR / STRIDE as needed.
-corpus-replay: $(BIN_DIR)/corpus-replay
-	$(BIN_DIR)/corpus-replay -dir $(CORPUS_DIR) $(if $(STRIDE),-stride $(STRIDE))
+corpus-replay:
+	./scripts/agent-tool.sh corpus-replay -dir $(CORPUS_DIR) $(if $(STRIDE),-stride $(STRIDE))
 
 # Reproduce + diagnose spike-permission's "modal not detected within 30s" load
 # flake (#253 slice A). Hand-run diagnostic, live-claude, minutes-long — builds
@@ -58,8 +57,8 @@ corpus-replay: $(BIN_DIR)/corpus-replay
 # a durable diagnosis artifact. NOT a make-e2e check (would spawn PxW live
 # claude). See cmd/repro-permission-flake/README.md. Override CONCURRENCY /
 # WAVES / CPU_BURN as needed.
-repro-permission-flake: $(BIN_DIR)/repro-permission-flake $(BIN_DIR)/spike-permission
-	$(BIN_DIR)/repro-permission-flake -bin $(BIN_DIR)/spike-permission \
+repro-permission-flake: $(BIN_DIR)/spike-permission
+	./scripts/agent-tool.sh repro-permission-flake -bin $(BIN_DIR)/spike-permission \
 		$(if $(CONCURRENCY),-concurrency $(CONCURRENCY)) \
 		$(if $(WAVES),-waves $(WAVES)) \
 		$(if $(CPU_BURN),-cpu-burn $(CPU_BURN))

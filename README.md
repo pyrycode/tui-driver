@@ -159,3 +159,11 @@ See [Drop-In Contract](../../obsidian-vault/Second%20Brain/📋%20Projects/2026-
 ## License
 
 Private repository. No license declared.
+
+## Corpus maintenance
+
+Corpus labeling, sampling, replay and the permission-flake diagnostic live in
+`tui-driver-agents/tools/tui-driver`. Their tests are opt-in through the agents
+repo's `bin/tui-tool test`. The product's normal `make check` covers the library,
+spikes, probes and e2e runner. `make e2e` builds only binaries its runner uses.
+`make corpus-replay` and `make repro-permission-flake` delegate to the agents repo.
