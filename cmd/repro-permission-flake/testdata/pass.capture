@@ -1,4 +1,0 @@
-0	probe=1 probe-start kind="observe" prompt="run ls in the repo"
-500	probe=1 prompt-written
-5000	streaming response bytes from claude
-30200	OBSERVED: spike-permission post-approve modal_cleared=true end_turn=false idle_present=true pty_quiet=true approve_keystroke=0x0d snapshot=/tmp/spike-permission-snap.txt

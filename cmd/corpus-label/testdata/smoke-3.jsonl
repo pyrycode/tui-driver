@@ -1,3 +1,0 @@
-{"hash":"smoke000000000001","grid":"synthetic screen one\n  a placeholder terminal capture\n  no real detection anchors here\n","cast":"smoke-ok.cast","tag":"ok","source":["gap"]}
-{"hash":"smoke000000000002","grid":"synthetic screen two\n  another inert placeholder grid\n  purely for the real-pyry smoke run\n","cast":"smoke-ok.cast","tag":"ok","source":["gap"]}
-{"hash":"smoke000000000003","grid":"synthetic screen three\n  third and last placeholder screen\n  nothing here fires any detector\n","cast":"smoke-err.cast","tag":"err","source":["gap"]}
